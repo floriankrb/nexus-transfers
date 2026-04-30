@@ -16,6 +16,11 @@ def _trunc(s, limit=200):
     s = str(s)
     return s[:limit] + "..." if len(s) > limit else s
 
+
+def _write_file(path, data):
+    with open(path, "wb") as fh:
+        fh.write(data)
+
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -205,12 +210,13 @@ class Client:
             f"[cyan]Copying {remote_path}[/cyan]", total=len(file_list)
         )
 
+        loop = asyncio.get_running_loop()
+
         async def _transfer_one(remote_file, local_file):
             async with sem:
                 data = await self.send(f"{target}.get_file", remote_file)
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
-                with open(local_file, "wb") as f:
-                    f.write(data)
+                await loop.run_in_executor(None, _write_file, local_file, data)
                 self._progress.advance(copy_task)
 
         await asyncio.gather(*[
@@ -294,6 +300,7 @@ class Client:
                 frame = len(header).to_bytes(2, "big") + header + chunk
                 await self._ws.send(frame)
                 self._progress.advance(task_id, len(chunk))
+                await asyncio.sleep(0)  # yield so concurrent transfers share the event loop
         self._progress.remove_task(task_id)
 
     def _receive_binary_chunk(self, raw):
