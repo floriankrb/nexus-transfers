@@ -235,7 +235,7 @@ class Client:
         os.makedirs(local_path, exist_ok=True)
         entries = []
         offset = 0
-        limit = 1000
+        limit = 10000
         while True:
             _logger.debug("list_dir: %s.list_dir(%r, offset=%d)", target, remote_path, offset)
             page = await self.send(f"{target}.list_dir", remote_path, include_size=False, offset=offset, limit=limit)
