@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "transfer"
+version = "0.1.0"
+description = "WebSocket relay server and RPC client"
+requires-python = ">=3.12"
+dependencies = ["websockets>=16.0"]
+
+[project.scripts]
+transfer-server = "transfer.server:main"
+transfer-client = "transfer.client:main"
