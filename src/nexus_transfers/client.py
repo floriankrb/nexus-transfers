@@ -281,10 +281,11 @@ class Client:
         """
         fname = os.path.basename(file_transfer.path)
         task_id = self._progress.add_task(f"↑ {fname}", total=file_transfer.size)
+        loop = asyncio.get_running_loop()
         hasher = hashlib.sha256()
         with open(file_transfer.path, "rb") as f:
             for i in range(file_transfer.total_chunks):
-                chunk = f.read(file_transfer.chunk_size)
+                chunk = await loop.run_in_executor(None, f.read, file_transfer.chunk_size)
                 hasher.update(chunk)
                 hdr = {
                     "to": target,
