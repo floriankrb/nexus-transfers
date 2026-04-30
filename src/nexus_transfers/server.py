@@ -45,6 +45,32 @@ async def relay_handler(websocket):
 
     try:
         async for raw_message in websocket:
+            # --- Binary frame: route based on embedded header ---
+            if isinstance(raw_message, bytes):
+                if len(raw_message) < 2:
+                    continue
+                header_len = int.from_bytes(raw_message[:2], "big")
+                if len(raw_message) < 2 + header_len:
+                    continue
+                try:
+                    header = json.loads(raw_message[2:2 + header_len])
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                target = header.get("to")
+                if not target:
+                    continue
+                with clients_lock:
+                    target_ws = clients.get(target)
+                if target_ws is None:
+                    continue
+                await target_ws.send(raw_message)
+                chunk = header.get("chunk", "?")
+                total = header.get("total_chunks", "?")
+                data_len = len(raw_message) - 2 - header_len
+                print(f"    binary {client_name} -> {target}: chunk {chunk}/{total} ({data_len} bytes)")
+                continue
+
+            # --- Text frame: JSON protocol ---
             try:
                 message = json.loads(raw_message)
             except (json.JSONDecodeError, TypeError):
@@ -124,6 +150,18 @@ async def relay_handler(websocket):
                 print(f"    reply {client_name} -> {target}: {payload}")
                 continue
 
+            # --- List connected clients ---
+            if action == "list_clients":
+                with clients_lock:
+                    names = sorted(clients.keys())
+                await websocket.send(json.dumps({
+                    "status": "ok",
+                    "action": "list_clients",
+                    "clients": names,
+                }))
+                print(f"    list_clients -> {client_name}: {names}")
+                continue
+
             # --- Shared-memory commands ---
             if action == "memory":
                 cmd = message.get("cmd")
@@ -177,11 +215,18 @@ async def run_server(host="localhost", port=8766):
 def main():
     """CLI entry point for ``transfer-server``."""
     import argparse
+    import logging
 
     parser = argparse.ArgumentParser(description="Transfer relay server")
     parser.add_argument("--host", default="localhost", help="Bind address")
     parser.add_argument("--port", type=int, default=8766, help="Bind port")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+    from rich.logging import RichHandler
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        handlers=[RichHandler(rich_tracebacks=True)],
+    )
     asyncio.run(run_server(args.host, args.port))
 
 

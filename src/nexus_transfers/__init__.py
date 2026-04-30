@@ -1,0 +1,23 @@
+"""Nexus Transfers – WebSocket relay server and RPC client."""
+
+from nexus_transfers.client import Client
+from nexus_transfers.dispatch import (
+    DISPATCH,
+    FileTransfer,
+    adder,
+    echo,
+    make_get_file,
+    make_list_dir,
+    resolve_safe_path,
+)
+
+__all__ = [
+    "Client",
+    "DISPATCH",
+    "FileTransfer",
+    "adder",
+    "echo",
+    "make_get_file",
+    "make_list_dir",
+    "resolve_safe_path",
+]

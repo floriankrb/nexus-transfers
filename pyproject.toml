@@ -3,12 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "transfer"
+name = "nexus-transfers"
 version = "0.1.0"
 description = "WebSocket relay server and RPC client"
 requires-python = ">=3.12"
-dependencies = ["websockets>=16.0"]
+dependencies = ["websockets>=16.0", "tqdm>=4.60", "python-dotenv>=1.0", "rich>=13.0"]
 
 [project.scripts]
-transfer-server = "transfer.server:main"
-transfer-client = "transfer.client:main"
+nexus-server = "nexus_transfers.server:main"
+nexus-client = "nexus_transfers.client:main"
+nexus-copy = "nexus_transfers.copy:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
