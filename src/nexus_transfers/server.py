@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+import logging
 import threading
 
 from websockets.asyncio.server import serve
+
+logger = logging.getLogger(__name__)
 
 # Shared memory accessible by all client handler coroutines
 shared_memory = {}
@@ -64,10 +67,10 @@ async def relay_handler(websocket):
                 if target_ws is None:
                     continue
                 await target_ws.send(raw_message)
-                chunk = header.get("chunk", "?")
-                total = header.get("total_chunks", "?")
-                data_len = len(raw_message) - 2 - header_len
-                print(f"    binary {client_name} -> {target}: chunk {chunk}/{total} ({data_len} bytes)")
+                logger.debug("binary %s -> %s: chunk %s/%s (%d bytes)",
+                             client_name, target,
+                             header.get("chunk", "?"), header.get("total_chunks", "?"),
+                             len(raw_message) - 2 - header_len)
                 continue
 
             # --- Text frame: JSON protocol ---
@@ -96,7 +99,7 @@ async def relay_handler(websocket):
                     clients[name] = websocket
                 client_name = name
                 await websocket.send(json.dumps({"status": "ok", "action": "register", "name": name}))
-                print(f"[+] Registered: {name}  ({remote})")
+                logger.info("[+] Registered: %s  (%s)", name, remote)
                 continue
 
             # All subsequent actions require registration
@@ -124,7 +127,7 @@ async def relay_handler(websocket):
                     "payload": payload,
                 }
                 await target_ws.send(json.dumps(envelope))
-                print(f"    route {client_name} -> {target}: {payload}")
+                logger.debug("route %s -> %s: %s", client_name, target, payload)
                 continue
 
             # --- Reply to a message ---
@@ -147,7 +150,7 @@ async def relay_handler(websocket):
                     "payload": payload,
                 }
                 await target_ws.send(json.dumps(envelope))
-                print(f"    reply {client_name} -> {target}: {payload}")
+                logger.debug("reply %s -> %s: %s", client_name, target, payload)
                 continue
 
             # --- List connected clients ---
@@ -159,7 +162,7 @@ async def relay_handler(websocket):
                     "action": "list_clients",
                     "clients": names,
                 }))
-                print(f"    list_clients -> {client_name}: {names}")
+                logger.debug("list_clients -> %s: %s", client_name, names)
                 continue
 
             # --- Shared-memory commands ---
@@ -170,7 +173,7 @@ async def relay_handler(websocket):
                     with shared_memory_lock:
                         shared_memory[key] = value
                     await websocket.send(json.dumps({"status": "ok", "action": "memory", "cmd": "set", "key": key}))
-                    print(f"    memory set: {key}={value!r}")
+                    logger.debug("memory set: %s=%r", key, value)
                 elif cmd == "get":
                     key = message["key"]
                     with shared_memory_lock:
@@ -187,14 +190,14 @@ async def relay_handler(websocket):
             await _send_error(websocket, f"unknown action '{action}'")
 
     except Exception as exc:
-        print(f"[!] Error with {client_name or remote}: {exc}")
+        logger.error("[!] Error with %s: %s", client_name or remote, exc)
     finally:
         if client_name:
             with clients_lock:
                 clients.pop(client_name, None)
-            print(f"[-] Disconnected: {client_name}  ({remote})")
+            logger.info("[-] Disconnected: %s  (%s)", client_name, remote)
         else:
-            print(f"[-] Disconnected unregistered: {remote}")
+            logger.info("[-] Disconnected unregistered: %s", remote)
 
 
 async def run_server(host="localhost", port=8766):

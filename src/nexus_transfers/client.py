@@ -70,6 +70,7 @@ class Client:
         self._ws = None
         self._pending = {}
         self._binary_buffers = {}
+        self._binary_received = {}  # msg_id -> count of chunks received
         self._binary_hashes = {}
         self._binary_checksums = {}
         self._progress = Progress(
@@ -334,8 +335,10 @@ class Client:
 
         if msg_id not in self._binary_buffers:
             self._binary_buffers[msg_id] = [None] * total
+            self._binary_received[msg_id] = 0
             self._binary_hashes[msg_id] = hashlib.sha256()
         self._binary_buffers[msg_id][chunk_idx] = chunk_data
+        self._binary_received[msg_id] += 1
         self._binary_hashes[msg_id].update(chunk_data)
 
         # Store the sender's checksum from the last chunk
@@ -346,10 +349,11 @@ class Client:
         if task_id is not None:
             self._progress.advance(task_id, len(chunk_data))
 
-        if all(c is not None for c in self._binary_buffers[msg_id]):
+        if self._binary_received[msg_id] == total:
             task_id = self._progress_task_ids.pop(msg_id, None)
             if task_id is not None:
                 self._progress.remove_task(task_id)
+            self._binary_received.pop(msg_id)
             data = b"".join(self._binary_buffers.pop(msg_id))
             local_hash = self._binary_hashes.pop(msg_id).hexdigest()
             remote_hash = self._binary_checksums.pop(msg_id, None)
