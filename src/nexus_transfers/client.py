@@ -424,7 +424,11 @@ class Client:
                         else:
                             if isinstance(result, FileTransfer):
                                 result_payload = {
-                                    "result": {"size": result.size, "total_chunks": result.total_chunks},
+                                    "result": {
+                                        "size": result.size,
+                                        "total_chunks": result.total_chunks,
+                                        "name": os.path.basename(result.path),
+                                    },
                                     "binary_transfer": True,
                                 }
                                 reply = {
@@ -435,7 +439,7 @@ class Client:
                                 }
                                 _logger.debug("[send] %s", _trunc(json.dumps(reply)))
                                 await self._ws.send(json.dumps(reply))
-                                await self._send_file_chunks(sender, msg_id, result)
+                                asyncio.create_task(self._send_file_chunks(sender, msg_id, result))
                             else:
                                 result_payload = {"result": result}
                                 reply = {
@@ -455,11 +459,13 @@ class Client:
 
                     # Binary transfer: wait for chunks to arrive
                     if payload.get("binary_transfer"):
-                        total_size = payload.get("result", {}).get("size", 0)
-                        total = payload.get("result", {}).get("total_chunks", 0)
+                        result_info = payload.get("result", {})
+                        total_size = result_info.get("size", 0)
+                        total = result_info.get("total_chunks", 0)
+                        fname = result_info.get("name", "file")
                         if total > 0:
                             self._progress_task_ids[msg_id] = self._progress.add_task(
-                                "↓ file", total=total_size
+                                f"↓ {fname}", total=total_size
                             )
                         if total == 0:
                             future = self._pending.pop(msg_id, None)
@@ -719,7 +725,11 @@ async def _interactive_listener(client, console):
                     else:
                         if isinstance(result, FileTransfer):
                             result_payload = {
-                                "result": {"size": result.size, "total_chunks": result.total_chunks},
+                                "result": {
+                                    "size": result.size,
+                                    "total_chunks": result.total_chunks,
+                                    "name": os.path.basename(result.path),
+                                },
                                 "binary_transfer": True,
                             }
                             reply = {
@@ -729,7 +739,7 @@ async def _interactive_listener(client, console):
                                 "payload": result_payload,
                             }
                             await client._ws.send(json.dumps(reply))
-                            await client._send_file_chunks(sender, msg_id, result)
+                            asyncio.create_task(client._send_file_chunks(sender, msg_id, result))
                             console.print(f"  -> [success]sent file:[/success] {result.path} ({result.size} bytes, {result.total_chunks} chunks)")
                         else:
                             result_payload = {"result": result}

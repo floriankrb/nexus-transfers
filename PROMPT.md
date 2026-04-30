@@ -58,4 +58,4 @@ implement a copy from a client command cli (recursive): nexus-copy <remote-clien
 
 use rich for output (colors etc) and Cmd to manage commands in the promp in interactive mode.
 
-implement list_dir with pagination. (1000 files)
+implement list_dir with pagination. (1000 files)t 
