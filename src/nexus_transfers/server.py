@@ -1,4 +1,9 @@
-"""WebSocket relay server that routes JSON messages between named clients."""
+"""WebSocket relay server that routes binary frames between named clients.
+
+The server only decodes the JSON payload of frames addressed to itself
+(target == "").  All other frames are forwarded verbatim so the server
+never needs to inspect client-to-client message bodies.
+"""
 
 import asyncio
 import json
@@ -6,6 +11,8 @@ import logging
 import threading
 
 from websockets.asyncio.server import serve
+
+from nexus_transfers.protocol import decode_frame, encode_frame
 
 logger = logging.getLogger(__name__)
 
@@ -18,176 +25,118 @@ clients: dict[str, object] = {}
 clients_lock = threading.Lock()
 
 
-async def _send_error(websocket, error, **extra):
-    """Send an error response to a client.
+def _err(target: str, error: str, *, msg_id: str | None = None) -> bytes:
+    body: dict = {"error": error}
+    if msg_id is not None:
+        body["msg_id"] = msg_id
+    return encode_frame("", "error", target, "J", json.dumps(body).encode())
 
-    Parameters
-    ----------
-    websocket
-        The WebSocket connection.
-    error
-        Human-readable error description.
-    **extra
-        Additional fields to include in the response.
-    """
-    msg = {"status": "error", "error": error}
-    msg.update(extra)
-    await websocket.send(json.dumps(msg))
+
+def _ok(target: str, msg_name: str, body: dict | None = None) -> bytes:
+    return encode_frame("", msg_name, target, "J", json.dumps(body or {}).encode())
 
 
 async def relay_handler(websocket):
-    """Handle a single client connection.
-
-    Parameters
-    ----------
-    websocket
-        The WebSocket connection for this client.
-    """
+    """Handle a single client connection."""
     client_name = None
     remote = websocket.remote_address
 
     try:
-        async for raw_message in websocket:
-            # --- Binary frame: route based on embedded header ---
-            if isinstance(raw_message, bytes):
-                if len(raw_message) < 2:
-                    continue
-                header_len = int.from_bytes(raw_message[:2], "big")
-                if len(raw_message) < 2 + header_len:
-                    continue
-                try:
-                    header = json.loads(raw_message[2:2 + header_len])
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                target = header.get("to")
-                if not target:
-                    continue
-                with clients_lock:
-                    target_ws = clients.get(target)
-                if target_ws is None:
-                    continue
-                await target_ws.send(raw_message)
-                logger.debug("binary %s -> %s: chunk %s/%s (%d bytes)",
-                             client_name, target,
-                             header.get("chunk", "?"), header.get("total_chunks", "?"),
-                             len(raw_message) - 2 - header_len)
+        async for raw in websocket:
+            if not isinstance(raw, bytes):
                 continue
 
-            # --- Text frame: JSON protocol ---
             try:
-                message = json.loads(raw_message)
-            except (json.JSONDecodeError, TypeError):
-                await _send_error(websocket, "invalid JSON")
+                version, source, msg_name, target, encoding, payload = decode_frame(raw)
+            except ValueError:
                 continue
 
-            if not isinstance(message, dict) or "action" not in message:
-                await _send_error(websocket, "missing 'action' field")
+            if version != 1:
+                await websocket.send(_err(source or "", "unsupported protocol version"))
                 continue
 
-            action = message["action"]
-
-            # --- Register ---
-            if action == "register":
-                name = message.get("name")
-                if not name or not isinstance(name, str):
-                    await _send_error(websocket, "missing or invalid 'name'")
-                    continue
-                with clients_lock:
-                    if name in clients:
-                        await _send_error(websocket, f"name '{name}' already taken")
-                        continue
-                    clients[name] = websocket
-                client_name = name
-                await websocket.send(json.dumps({"status": "ok", "action": "register", "name": name}))
-                logger.info("[+] Registered: %s  (%s)", name, remote)
-                continue
-
-            # All subsequent actions require registration
+            # ----------------------------------------------------------------
+            # Not yet registered — first frame must be "register"
+            # ----------------------------------------------------------------
             if client_name is None:
-                await _send_error(websocket, "must register first")
+                if msg_name != "register" or not source:
+                    await websocket.send(_err(source or "", "must register first"))
+                    continue
+                with clients_lock:
+                    if source in clients:
+                        await websocket.send(_err(source, f"name '{source}' already taken"))
+                        continue
+                    clients[source] = websocket
+                client_name = source
+                await websocket.send(_ok(client_name, "register"))
+                logger.info("[+] Registered: %s (%s)", client_name, remote)
                 continue
 
-            # --- Send message to a target ---
-            if action == "send":
-                target = message.get("to")
-                msg_id = message.get("msg_id")
-                payload = message.get("payload", {})
-                if not target:
-                    await _send_error(websocket, "missing 'to' field")
-                    continue
+            # ----------------------------------------------------------------
+            # Route to another client without decoding the payload
+            # ----------------------------------------------------------------
+            if target:
                 with clients_lock:
                     target_ws = clients.get(target)
                 if target_ws is None:
-                    await _send_error(websocket, f"unknown target '{target}'", msg_id=msg_id)
+                    # Peek at msg_id only when the payload is JSON so callers
+                    # can correlate the error with their pending future.
+                    msg_id = None
+                    if encoding == "J":
+                        try:
+                            msg_id = json.loads(payload).get("msg_id")
+                        except Exception:
+                            pass
+                    await websocket.send(_err(client_name, f"unknown target '{target}'", msg_id=msg_id))
                     continue
-                envelope = {
-                    "action": "message",
-                    "from": client_name,
-                    "msg_id": msg_id,
-                    "payload": payload,
-                }
-                await target_ws.send(json.dumps(envelope))
-                logger.debug("route %s -> %s: %s", client_name, target, payload)
+                await target_ws.send(raw)
+                logger.debug("relay %s -> %s: %s (%d bytes)",
+                             client_name, target, msg_name, len(raw))
                 continue
 
-            # --- Reply to a message ---
-            if action == "reply":
-                target = message.get("to")
-                msg_id = message.get("msg_id")
-                payload = message.get("payload", {})
-                if not target:
-                    await _send_error(websocket, "missing 'to' field")
-                    continue
-                with clients_lock:
-                    target_ws = clients.get(target)
-                if target_ws is None:
-                    await _send_error(websocket, f"unknown target '{target}'", msg_id=msg_id)
-                    continue
-                envelope = {
-                    "action": "reply",
-                    "from": client_name,
-                    "msg_id": msg_id,
-                    "payload": payload,
-                }
-                await target_ws.send(json.dumps(envelope))
-                logger.debug("reply %s -> %s: %s", client_name, target, payload)
-                continue
+            # ----------------------------------------------------------------
+            # Frame addressed to the server — decode JSON and dispatch
+            # ----------------------------------------------------------------
+            match msg_name:
+                case "register":
+                    # Re-registration from an already-registered client
+                    await websocket.send(_ok(client_name, "register"))
 
-            # --- List connected clients ---
-            if action == "list_clients":
-                with clients_lock:
-                    names = sorted(clients.keys())
-                await websocket.send(json.dumps({
-                    "status": "ok",
-                    "action": "list_clients",
-                    "clients": names,
-                }))
-                logger.debug("list_clients -> %s: %s", client_name, names)
-                continue
+                case "list_clients":
+                    with clients_lock:
+                        names = sorted(clients.keys())
+                    await websocket.send(_ok(client_name, "list_clients", {"clients": names}))
+                    logger.debug("list_clients -> %s: %s", client_name, names)
 
-            # --- Shared-memory commands ---
-            if action == "memory":
-                cmd = message.get("cmd")
-                if cmd == "set":
-                    key, value = message["key"], message["value"]
-                    with shared_memory_lock:
-                        shared_memory[key] = value
-                    await websocket.send(json.dumps({"status": "ok", "action": "memory", "cmd": "set", "key": key}))
-                    logger.debug("memory set: %s=%r", key, value)
-                elif cmd == "get":
-                    key = message["key"]
-                    with shared_memory_lock:
-                        value = shared_memory.get(key)
-                    await websocket.send(json.dumps({"status": "ok", "action": "memory", "cmd": "get", "key": key, "value": value}))
-                elif cmd == "dump":
-                    with shared_memory_lock:
-                        snapshot = dict(shared_memory)
-                    await websocket.send(json.dumps({"status": "ok", "action": "memory", "cmd": "dump", "memory": snapshot}))
-                else:
-                    await _send_error(websocket, f"unknown memory cmd '{cmd}'")
-                continue
+                case "memory":
+                    try:
+                        data = json.loads(payload)
+                    except json.JSONDecodeError:
+                        await websocket.send(_err(client_name, "invalid JSON in memory payload"))
+                        continue
+                    match data.get("cmd"):
+                        case "set":
+                            key, value = data["key"], data["value"]
+                            with shared_memory_lock:
+                                shared_memory[key] = value
+                            await websocket.send(_ok(client_name, "memory", {"cmd": "set", "key": key}))
+                            logger.debug("memory set: %s=%r", key, value)
+                        case "get":
+                            key = data["key"]
+                            with shared_memory_lock:
+                                value = shared_memory.get(key)
+                            await websocket.send(_ok(client_name, "memory",
+                                                     {"cmd": "get", "key": key, "value": value}))
+                        case "dump":
+                            with shared_memory_lock:
+                                snapshot = dict(shared_memory)
+                            await websocket.send(_ok(client_name, "memory",
+                                                     {"cmd": "dump", "memory": snapshot}))
+                        case cmd:
+                            await websocket.send(_err(client_name, f"unknown memory cmd '{cmd}'"))
 
-            await _send_error(websocket, f"unknown action '{action}'")
+                case msg:
+                    await websocket.send(_err(client_name, f"unknown message '{msg}'"))
 
     except Exception as exc:
         logger.error("[!] Error with %s: %s", client_name or remote, exc)
@@ -195,30 +144,21 @@ async def relay_handler(websocket):
         if client_name:
             with clients_lock:
                 clients.pop(client_name, None)
-            logger.info("[-] Disconnected: %s  (%s)", client_name, remote)
+            logger.info("[-] Disconnected: %s (%s)", client_name, remote)
         else:
             logger.info("[-] Disconnected unregistered: %s", remote)
 
 
 async def run_server(host="localhost", port=8766):
-    """Start the relay server.
-
-    Parameters
-    ----------
-    host
-        Bind address.
-    port
-        Bind port.
-    """
+    """Start the relay server."""
     async with serve(relay_handler, host, port):
         print(f"Relay server listening on ws://{host}:{port}")
         await asyncio.get_running_loop().create_future()
 
 
 def main():
-    """CLI entry point for ``transfer-server``."""
+    """CLI entry point for ``nexus-server``."""
     import argparse
-    import logging
 
     parser = argparse.ArgumentParser(description="Transfer relay server")
     parser.add_argument("--host", default="localhost", help="Bind address")
