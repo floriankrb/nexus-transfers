@@ -11,8 +11,9 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from rich.progress import (BarColumn, DownloadColumn, Progress, SpinnerColumn,
-                           TextColumn, TimeRemainingColumn, TransferSpeedColumn)
+from rich.progress import (BarColumn, DownloadColumn, Progress, ProgressColumn,
+                           SpinnerColumn, TextColumn, TimeRemainingColumn)
+from rich.text import Text
 from websockets.asyncio.client import connect
 
 from nexus_transfers.dispatch import DISPATCH, FileTransfer, make_get_file, make_list_dir
@@ -32,6 +33,25 @@ def _trunc(s, limit=200):
 def _write_file(path, data):
     with open(path, "wb") as fh:
         fh.write(data)
+
+
+def _fmt_binary(n: float) -> str:
+    """Format a byte count using binary prefixes (KiB, MiB, GiB, TiB, PiB)."""
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if n < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} PiB"
+
+
+class _BinarySpeedColumn(ProgressColumn):
+    """Renders transfer speed using binary prefixes (KiB/s, MiB/s, …)."""
+
+    def render(self, task) -> Text:
+        speed = task.finished_speed or task.speed
+        if speed is None:
+            return Text("? /s", style="progress.data.speed")
+        return Text(_fmt_binary(speed) + "/s", style="progress.data.speed")
 
 
 class RemoteError(Exception):
@@ -77,8 +97,8 @@ class Client:
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
+            DownloadColumn(binary_units=True),
+            _BinarySpeedColumn(),
             TimeRemainingColumn(),
             transient=True,
         )
@@ -184,7 +204,8 @@ class Client:
     # Directory / file transfer helpers
     # ------------------------------------------------------------------
 
-    async def get_directory(self, target, remote_path, local_path, max_concurrent=4):
+    async def get_directory(self, target, remote_path, local_path,
+                            max_concurrent=4, chunk_size=65536):
         """Recursively copy a remote directory to a local path.
 
         Resumes interrupted transfers by skipping files whose local size
@@ -200,6 +221,8 @@ class Client:
             Local destination directory.
         max_concurrent:
             Maximum number of parallel file transfers.
+        chunk_size:
+            Binary chunk size in bytes sent to the remote ``get_file``.
         """
         file_list = []
         await self._walk_remote(target, remote_path, local_path, file_list)
@@ -211,16 +234,29 @@ class Client:
             f"[cyan]Copying {remote_path}[/cyan]", total=len(file_list)
         )
         loop = asyncio.get_running_loop()
+        total_bytes = 0
+        start = loop.time()
 
         async def _transfer_one(remote_file, local_file):
+            nonlocal total_bytes
             async with sem:
-                data = await self.send(f"{target}.get_file", remote_file)
+                data = await self.send(f"{target}.get_file", remote_file,
+                                       chunk_size=chunk_size)
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
+                total_bytes += len(data)
                 self._progress.advance(copy_task)
 
         await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in file_list])
         self._progress.remove_task(copy_task)
+
+        elapsed = loop.time() - start
+        rate = total_bytes / elapsed if elapsed > 0 else 0
+        self._progress.console.print(
+            f"Transferred [bold]{_fmt_binary(total_bytes)}[/bold] "
+            f"in [bold]{elapsed:.1f}s[/bold] "
+            f"([bold]{_fmt_binary(rate)}/s[/bold])"
+        )
 
     async def _walk_remote(self, target, remote_path, local_path, file_list):
         os.makedirs(local_path, exist_ok=True)
@@ -549,27 +585,6 @@ async def _interactive(name, url, allowed_paths=None):
                 frame = encode_frame(client.name, "list_clients", "", "J", b"{}")
                 asyncio.run_coroutine_threadsafe(client._ws.send(frame), loop)
 
-            def do_mem(self, arg):
-                """mem set <key> <val> | mem get <key> | mem dump"""
-                parts = arg.split(None, 2)
-                cmd = parts[0] if parts else ""
-                match cmd:
-                    case "set" if len(parts) >= 3:
-                        body = {"cmd": "set", "key": parts[1], "value": parts[2]}
-                    case "get" if len(parts) >= 2:
-                        body = {"cmd": "get", "key": parts[1]}
-                    case "dump":
-                        body = {"cmd": "dump"}
-                    case _:
-                        console.print(
-                            "  Usage: mem set <key> <val> | mem get <key> | mem dump",
-                            style="warning",
-                        )
-                        return
-                frame = encode_frame(client.name, "memory", "", "J",
-                                     json.dumps(body).encode())
-                asyncio.run_coroutine_threadsafe(client._ws.send(frame), loop)
-
             def do_quit(self, _arg):
                 """Disconnect and exit."""
                 stop_event.set()
@@ -651,20 +666,6 @@ async def _interactive_listener(client, console):
                 case "list_clients":
                     names = json.loads(payload).get("clients", [])
                     console.print(f"\n  [info]\\[clients][/info] {', '.join(names)}")
-
-                case "memory":
-                    data = json.loads(payload)
-                    match data.get("cmd"):
-                        case "get":
-                            console.print(f"\n  [info]\\[memory][/info] "
-                                          f"{data['key']} = {data['value']!r}")
-                        case "dump":
-                            console.print("\n  [info]\\[memory][/info]")
-                            console.print_json(json.dumps(data["memory"]))
-                        case "set":
-                            console.print(f"\n  [info]\\[memory][/info] stored {data['key']}")
-                        case _:
-                            console.print(f"\n  [dim]<< {raw!r}[/dim]")
 
                 case "error":
                     data = json.loads(payload)

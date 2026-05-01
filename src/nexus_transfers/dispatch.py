@@ -88,16 +88,18 @@ def make_get_file(allowed_paths):
     allowed_paths
         List of allowed base directories.
     """
-    def get_file(path):
+    def get_file(path, chunk_size=65536):
         """Read a file and return it for binary transfer.
 
         Parameters
         ----------
         path
             Path to the file to read.
+        chunk_size
+            Size of each binary chunk in bytes (chosen by the caller).
         """
         resolved = resolve_safe_path(path, allowed_paths)
-        return FileTransfer(resolved)
+        return FileTransfer(resolved, chunk_size=chunk_size)
 
     return get_file
 

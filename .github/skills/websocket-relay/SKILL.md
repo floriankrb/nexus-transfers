@@ -67,7 +67,7 @@ Every client exposes these functions by default:
 |------------|------------------------------|
 | `adder`    | Returns `value + 1`          |
 | `echo`     | Returns arguments unchanged  |
-| `get_file` | Returns file as binary transfer (requires `--allow-path`) |
+| `get_file(path, chunk_size=65536)` | Returns file as binary transfer (requires `--allow-path`); chunk size chosen by caller |
 | `list_dir` | Returns paginated directory listing (requires `--allow-path`) |
 
 ## Running
@@ -81,6 +81,9 @@ nexus-client --name a [--allow-path /data]
 
 # Client (interactive shell)
 nexus-client --name a --interactive
+
+# Recursive directory copy
+nexus-copy --from <remote> <src> <local> [--chunk-size BYTES] [--max-concurrent N]
 ```
 
 ### Interactive shell commands
@@ -89,9 +92,6 @@ nexus-client --name a --interactive
 |--------------------------------|------------------------------------|
 | `send <target>.<func> [args]`  | Call a remote function             |
 | `clients`                      | List connected clients             |
-| `mem set <key> <val>`          | Store in shared memory             |
-| `mem get <key>`                | Retrieve from shared memory        |
-| `mem dump`                     | Show all shared memory             |
 | `quit`                         | Disconnect                         |
 
 ## Key helpers

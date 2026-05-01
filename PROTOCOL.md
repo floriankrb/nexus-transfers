@@ -20,3 +20,10 @@ assert that client names are between 1 and 255
 
 
 Please use the 'match' contruct, not if/elif/else block when appropritae
+
+
+Add a progress bar in the dowload part of get_file. At the end of a get_directory, print the overall throughpout: elapsed, volume and rate. Always use binary sizes (TiB, not TB)
+
+Remove the support for the "memory" message.
+
+Make the chunking size of transfer configurable. The size is selected by the client that calls get_size, and passed to the remote client. Add a parameter to the nexus-copy cli

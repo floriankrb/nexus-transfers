@@ -16,13 +16,9 @@ from nexus_transfers.protocol import decode_frame, encode_frame
 
 logger = logging.getLogger(__name__)
 
-# Shared memory accessible by all client handler coroutines
-shared_memory = {}
-shared_memory_lock = threading.Lock()
-
 # name -> websocket mapping
 clients: dict[str, object] = {}
-clients_lock = threading.Lock()
+clients_lock = threading.Lock()  # kept; conftest.py uses it to clear state between tests
 
 
 def _err(target: str, error: str, *, msg_id: str | None = None) -> bytes:
@@ -107,33 +103,6 @@ async def relay_handler(websocket):
                         names = sorted(clients.keys())
                     await websocket.send(_ok(client_name, "list_clients", {"clients": names}))
                     logger.debug("list_clients -> %s: %s", client_name, names)
-
-                case "memory":
-                    try:
-                        data = json.loads(payload)
-                    except json.JSONDecodeError:
-                        await websocket.send(_err(client_name, "invalid JSON in memory payload"))
-                        continue
-                    match data.get("cmd"):
-                        case "set":
-                            key, value = data["key"], data["value"]
-                            with shared_memory_lock:
-                                shared_memory[key] = value
-                            await websocket.send(_ok(client_name, "memory", {"cmd": "set", "key": key}))
-                            logger.debug("memory set: %s=%r", key, value)
-                        case "get":
-                            key = data["key"]
-                            with shared_memory_lock:
-                                value = shared_memory.get(key)
-                            await websocket.send(_ok(client_name, "memory",
-                                                     {"cmd": "get", "key": key, "value": value}))
-                        case "dump":
-                            with shared_memory_lock:
-                                snapshot = dict(shared_memory)
-                            await websocket.send(_ok(client_name, "memory",
-                                                     {"cmd": "dump", "memory": snapshot}))
-                        case cmd:
-                            await websocket.send(_err(client_name, f"unknown memory cmd '{cmd}'"))
 
                 case msg:
                     await websocket.send(_err(client_name, f"unknown message '{msg}'"))
