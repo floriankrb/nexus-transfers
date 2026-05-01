@@ -56,12 +56,14 @@ class _CountOrBytesColumn(ProgressColumn):
 
 
 class _BinarySpeedColumn(ProgressColumn):
-    """Renders transfer speed using binary prefixes (KiB/s, MiB/s, …)."""
+    """Renders transfer speed; files/s for unit='files' tasks, binary bytes/s otherwise."""
 
     def render(self, task) -> Text:
         speed = task.finished_speed or task.speed
         if speed is None:
             return Text("? /s", style="progress.data.speed")
+        if task.fields.get("unit") == "files":
+            return Text(f"{speed:.1f} files/s", style="progress.data.speed")
         return Text(_fmt_binary(speed) + "/s", style="progress.data.speed")
 
 
