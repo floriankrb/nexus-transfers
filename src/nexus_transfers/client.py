@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from rich.progress import (BarColumn, DownloadColumn, Progress, ProgressColumn,
+from rich.progress import (BarColumn, Progress, ProgressColumn,
                            SpinnerColumn, TextColumn, TimeRemainingColumn)
 from rich.text import Text
 from websockets.asyncio.client import connect
@@ -42,6 +42,17 @@ def _fmt_binary(n: float) -> str:
             return f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} PiB"
+
+
+class _CountOrBytesColumn(ProgressColumn):
+    """Shows 'X / N files' when task has unit='files', otherwise 'X.x MiB / Y.y MiB'."""
+
+    def render(self, task) -> Text:
+        completed = int(task.completed)
+        total = int(task.total) if task.total is not None else 0
+        if task.fields.get("unit") == "files":
+            return Text(f"{completed} / {total} files")
+        return Text(f"{_fmt_binary(completed)} / {_fmt_binary(total)}")
 
 
 class _BinarySpeedColumn(ProgressColumn):
@@ -97,7 +108,7 @@ class Client:
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            DownloadColumn(binary_units=True),
+            _CountOrBytesColumn(),
             _BinarySpeedColumn(),
             TimeRemainingColumn(),
             transient=True,
@@ -229,10 +240,9 @@ class Client:
         if not file_list:
             return
 
-        total_to_copy = sum(size for _, _, size in file_list)
         sem = asyncio.Semaphore(max_concurrent)
         copy_task = self._progress.add_task(
-            f"[cyan]Copying {remote_path}[/cyan]", total=total_to_copy
+            f"[cyan]Copying {remote_path}[/cyan]", total=len(file_list), unit="files"
         )
         loop = asyncio.get_running_loop()
         total_bytes = 0
@@ -246,9 +256,9 @@ class Client:
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
                 total_bytes += len(data)
-                self._progress.advance(copy_task, len(data))
+                self._progress.advance(copy_task)
 
-        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf, _ in file_list])
+        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in file_list])
         self._progress.remove_task(copy_task)
 
         elapsed = loop.time() - start
@@ -266,7 +276,7 @@ class Client:
         limit = 10000
         while True:
             page = await self.send(f"{target}.list_dir", remote_path,
-                                   include_size=True, offset=offset, limit=limit)
+                                   include_size=False, offset=offset, limit=limit)
             entries.extend(page)
             if len(page) < limit:
                 break
@@ -278,11 +288,7 @@ class Client:
             if entry["type"] == "dir":
                 await self._walk_remote(target, remote_child, local_child, file_list)
             else:
-                remote_size = entry.get("size", 0)
-                if remote_size and os.path.isfile(local_child):
-                    if os.path.getsize(local_child) == remote_size:
-                        continue
-                file_list.append((remote_child, local_child, remote_size))
+                file_list.append((remote_child, local_child))
 
     # ------------------------------------------------------------------
     # Binary chunk transfer (sending side)
