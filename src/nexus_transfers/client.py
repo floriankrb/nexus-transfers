@@ -229,9 +229,10 @@ class Client:
         if not file_list:
             return
 
+        total_to_copy = sum(size for _, _, size in file_list)
         sem = asyncio.Semaphore(max_concurrent)
         copy_task = self._progress.add_task(
-            f"[cyan]Copying {remote_path}[/cyan]", total=len(file_list)
+            f"[cyan]Copying {remote_path}[/cyan]", total=total_to_copy
         )
         loop = asyncio.get_running_loop()
         total_bytes = 0
@@ -245,9 +246,9 @@ class Client:
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
                 total_bytes += len(data)
-                self._progress.advance(copy_task)
+                self._progress.advance(copy_task, len(data))
 
-        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in file_list])
+        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf, _ in file_list])
         self._progress.remove_task(copy_task)
 
         elapsed = loop.time() - start
@@ -265,7 +266,7 @@ class Client:
         limit = 10000
         while True:
             page = await self.send(f"{target}.list_dir", remote_path,
-                                   include_size=False, offset=offset, limit=limit)
+                                   include_size=True, offset=offset, limit=limit)
             entries.extend(page)
             if len(page) < limit:
                 break
@@ -277,11 +278,11 @@ class Client:
             if entry["type"] == "dir":
                 await self._walk_remote(target, remote_child, local_child, file_list)
             else:
-                remote_size = entry.get("size")
-                if remote_size is not None and os.path.isfile(local_child):
+                remote_size = entry.get("size", 0)
+                if remote_size and os.path.isfile(local_child):
                     if os.path.getsize(local_child) == remote_size:
                         continue
-                file_list.append((remote_child, local_child))
+                file_list.append((remote_child, local_child, remote_size))
 
     # ------------------------------------------------------------------
     # Binary chunk transfer (sending side)
