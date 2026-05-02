@@ -45,6 +45,12 @@ def main():
         help="Maximum parallel file transfers (default: 4)",
     )
     parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=65536,
+        help="Binary chunk size in bytes for file transfers (default: 65536)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -67,18 +73,20 @@ def main():
             source=args.source,
             target=args.target,
             max_concurrent=args.max_concurrent,
+            chunk_size=args.chunk_size,
         )
     )
 
 
-async def _copy(name, url, remote_client, source, target, max_concurrent):
+async def _copy(name, url, remote_client, source, target, max_concurrent, chunk_size):
     """Connect to the relay and copy a remote directory."""
     target = os.path.expanduser(target)
     console = Console()
     async with Client(name, url) as client:
         console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
         console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{target}[/yellow]")
-        await client.get_directory(remote_client, source, target, max_concurrent=max_concurrent)
+        await client.get_directory(remote_client, source, target,
+                                   max_concurrent=max_concurrent, chunk_size=chunk_size)
         console.print("[bold green]Done.[/bold green]")
 
 if __name__ == "__main__":
