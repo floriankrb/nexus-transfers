@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "transfers"
+version = "0.1.0"
+description = "Relay-based zero-overhead file transfer client"
+requires-python = ">=3.10"
+
+[project.scripts]
+transfers = "transfers.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
