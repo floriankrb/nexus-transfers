@@ -35,6 +35,8 @@ resume automatically from the last 4 MiB checkpoint.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import socket
 import ssl
@@ -46,6 +48,14 @@ from ._proto import _Conn
 from ._transfer import run_receiver, run_sender
 
 __all__ = ["copy", "copy_many", "serve", "serve_loop"]
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept(key: str) -> str:
+    return base64.b64encode(
+        hashlib.sha1((key + _WS_GUID).encode()).digest()
+    ).decode()
 
 
 # ── relay handshake ───────────────────────────────────────────────────────────
@@ -64,6 +74,38 @@ def _connect(
     raw = socket.create_connection((relay, port))
     sock = ctx.wrap_socket(raw, server_hostname=relay)
     c = _Conn(sock)
+
+    # HTTP/1.1 upgrade — looks like WebSocket to DPI; after 101 it's raw bytes,
+    # no WebSocket framing and no XOR masking ever happens.
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (
+        f"GET /relay HTTP/1.1\r\n"
+        f"Host: {relay}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"\r\n"
+    )
+    c.sock.sendall(request.encode())
+
+    # Read HTTP response — headers use CRLF; strip both \r and \n.
+    status = c.recv_line().strip()
+    if "101" not in status:
+        sock.close()
+        raise RuntimeError(f"HTTP upgrade failed: {status!r}")
+    want = _ws_accept(key)
+    got = ""
+    while True:
+        line = c.recv_line().strip()  # strip \r left over from CRLF
+        if not line:
+            break
+        if line.lower().startswith("sec-websocket-accept:"):
+            got = line.split(":", 1)[1].strip()
+    if got != want:
+        sock.close()
+        raise RuntimeError(f"Sec-WebSocket-Accept mismatch (got {got!r} want {want!r})")
+
     c.send_line(f"HELLO {name}")
     resp = c.recv_line()
     if resp != "OK":

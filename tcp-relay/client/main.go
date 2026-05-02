@@ -17,7 +17,10 @@ package transfers
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -193,12 +196,75 @@ func dial(relay, name string, o options) (*session, error) {
 		br:   bufio.NewReader(conn),
 		bw:   bufio.NewWriter(conn),
 	}
+	if err := s.httpUpgrade(relay); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("HTTP upgrade: %w", err)
+	}
 	s.sendLine("HELLO " + name)
 	if resp := s.recvLine(); resp != "OK" {
 		conn.Close()
 		return nil, fmt.Errorf("handshake rejected: %s", resp)
 	}
 	return s, nil
+}
+
+// httpUpgrade sends an HTTP/1.1 WebSocket-style upgrade request and validates
+// the 101 response.  After this the connection is a raw byte pipe.
+func (s *session) httpUpgrade(host string) error {
+	// Generate a random 16-byte key, base64-encoded (RFC 6455 §4.1).
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return err
+	}
+	key := base64.StdEncoding.EncodeToString(raw)
+
+	req := "GET /relay HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\n\r\n"
+	if _, err := fmt.Fprint(s.conn, req); err != nil {
+		return err
+	}
+
+	// Read status line.
+	status, err := s.br.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(strings.TrimSpace(status), "HTTP/1.1 101") {
+		return fmt.Errorf("expected 101, got: %s", strings.TrimSpace(status))
+	}
+
+	// Validate Sec-WebSocket-Accept, then drain remaining headers.
+	wantAccept := wsAccept(key)
+	var gotAccept string
+	for {
+		line, err := s.br.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-accept:") {
+			gotAccept = strings.TrimSpace(line[len("sec-websocket-accept:"):])
+		}
+	}
+	if gotAccept != wantAccept {
+		return fmt.Errorf("Sec-WebSocket-Accept mismatch (got %q want %q)", gotAccept, wantAccept)
+	}
+	return nil
+}
+
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+func wsAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
 func parseSpec(spec string) (name, path string) {

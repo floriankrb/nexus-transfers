@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -9,6 +11,56 @@ import (
 	"strings"
 	"sync"
 )
+
+// wsGUID is the fixed WebSocket GUID defined in RFC 6455.
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// wsAccept computes the Sec-WebSocket-Accept value from the client's key.
+func wsAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// httpUpgrade reads an HTTP/1.1 upgrade request from br/conn and responds
+// with 101 Switching Protocols.  After this call the connection is a raw
+// byte pipe — no WebSocket framing or XOR masking is performed.
+func httpUpgrade(conn net.Conn, br *bufio.Reader) error {
+	// Read request line (e.g. "GET /relay HTTP/1.1")
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read request line: %w", err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(line), "GET ") {
+		return fmt.Errorf("expected GET upgrade request, got: %q", strings.TrimSpace(line))
+	}
+
+	// Read headers until blank line, capture Sec-WebSocket-Key.
+	var wsKey string
+	for {
+		line, err = br.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read headers: %w", err)
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-key:") {
+			wsKey = strings.TrimSpace(line[len("sec-websocket-key:"):])
+		}
+	}
+	if wsKey == "" {
+		return fmt.Errorf("missing Sec-WebSocket-Key header")
+	}
+
+	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + wsAccept(wsKey) + "\r\n\r\n"
+	_, err = fmt.Fprint(conn, resp)
+	return err
+}
 
 const listenAddr = "127.0.0.1:9000"
 
@@ -98,6 +150,13 @@ func handle(conn net.Conn) {
 		conn: conn,
 		br:   bufio.NewReader(conn),
 		done: make(chan struct{}),
+	}
+
+	// HTTP/1.1 upgrade: client sends a WebSocket-style GET, we respond 101.
+	// After this the connection is raw bytes — no WS framing, no XOR.
+	if err := httpUpgrade(conn, c.br); err != nil {
+		log.Printf("upgrade failed from %s: %v", conn.RemoteAddr(), err)
+		return
 	}
 
 	line, err := c.readLine()
