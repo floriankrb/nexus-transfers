@@ -184,7 +184,8 @@ class Client:
             extra_headers["Authorization"] = f"Basic {credentials}"
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
-        connect_kwargs: dict = {"additional_headers": extra_headers}
+        connect_kwargs: dict = {"additional_headers": extra_headers,
+                                "max_size": 1_073_741_824}  # 1 GiB
         if not self.ssl_verify and self.url.startswith("wss://"):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
@@ -917,6 +918,21 @@ class Client:
 
                         case _:
                             _logger.debug("[recv] unhandled msg_name=%r from %s", msg_name, source)
+
+                # The async for loop ended normally — clean disconnect.
+                if self._closed:
+                    return
+                _logger.warning("Connection closed by server")
+                for future in self._pending.values():
+                    if not future.done():
+                        future.set_exception(ConnectionError("connection closed"))
+                self._pending.clear()
+                try:
+                    await self._reconnect()
+                except (NameTakenError, ConnectionError):
+                    raise
+                except Exception:
+                    return
 
             except asyncio.CancelledError:
                 return
