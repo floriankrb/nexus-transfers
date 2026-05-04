@@ -308,7 +308,7 @@ class Client:
             _logger.debug("[send] call %s -> %s.%s (id=%s)", self.name, target, func_name, msg_id)
 
             try:
-                await self._ws.send(frame)
+                await asyncio.wait_for(self._ws.send(frame), timeout=30)
             except Exception as exc:
                 self._pending.pop(msg_id, None)
                 raise ConnectionError(f"failed to send: {exc}") from exc
