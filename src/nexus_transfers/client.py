@@ -16,7 +16,8 @@ from rich.progress import (BarColumn, Progress, ProgressColumn,
 from rich.text import Text
 from websockets.asyncio.client import connect
 
-from nexus_transfers.dispatch import DISPATCH, FileTransfer, make_get_file, make_list_dir
+from nexus_transfers.dispatch import (DISPATCH, FileTransfer, S3Transfer,
+                                       make_get_file, make_list_dir)
 from nexus_transfers.protocol import decode_frame, encode_frame
 
 load_dotenv(Path.home() / ".env")
@@ -45,13 +46,18 @@ def _fmt_binary(n: float) -> str:
 
 
 class _CountOrBytesColumn(ProgressColumn):
-    """Shows 'X / N files' when task has unit='files', otherwise 'X.x MiB / Y.y MiB'."""
+    """Shows 'X / N files' when task has unit='files', otherwise 'X.x MiB / Y.y MiB'.
+
+    When the total is unknown (still being discovered), shows just 'X files'.
+    """
 
     def render(self, task) -> Text:
         completed = int(task.completed)
-        total = int(task.total) if task.total is not None else 0
         if task.fields.get("unit") == "files":
-            return Text(f"{completed} / {total} files")
+            if task.total is None:
+                return Text(f"{completed} files")
+            return Text(f"{completed} / {int(task.total)} files")
+        total = int(task.total) if task.total is not None else 0
         return Text(f"{_fmt_binary(completed)} / {_fmt_binary(total)}")
 
 
@@ -97,9 +103,11 @@ class Client:
         self.url = url or _DEFAULT_URL
         self.dispatch = dispatch if dispatch is not None else dict(DISPATCH)
         self.allowed_paths = [os.path.realpath(p) for p in allowed_paths] if allowed_paths else []
+        self._s3_keys: set[str] = set()
         if self.allowed_paths:
             self.dispatch["get_file"] = make_get_file(self.allowed_paths)
             self.dispatch["list_dir"] = make_list_dir(self.allowed_paths)
+            self.dispatch["s3_cleanup"] = self._s3_cleanup
         self._ws = None
         self._pending: dict[str, asyncio.Future] = {}
         self._binary_buffers: dict = {}
@@ -218,7 +226,8 @@ class Client:
     # ------------------------------------------------------------------
 
     async def get_directory(self, target, remote_path, local_path,
-                            max_concurrent=4, chunk_size=65536):
+                            max_concurrent=4, chunk_size=65536,
+                            use_s3=False):
         """Recursively copy a remote directory to a local path.
 
         Resumes interrupted transfers by skipping files whose local size
@@ -235,16 +244,31 @@ class Client:
         max_concurrent:
             Maximum number of parallel file transfers.
         chunk_size:
-            Binary chunk size in bytes sent to the remote ``get_file``.
+            Binary chunk size in bytes sent to the remote ``get_file``
+            (ignored when ``use_s3`` is True).
+        use_s3:
+            If True, stage transfers through the S3 bucket configured via
+            ``NEXUS_TRANSFER_S3_*`` env vars instead of sending bytes over
+            the WebSocket.
         """
+        label = os.path.basename(remote_path.rstrip("/")) or remote_path
         file_list = []
-        await self._walk_remote(target, remote_path, local_path, file_list)
+        walk_task = self._progress.add_task(
+            f"[magenta]Listing {label}[/magenta]", total=None, unit="files"
+        )
+        await self._walk_remote(target, remote_path, local_path, file_list,
+                                walk_task=walk_task)
+        self._progress.remove_task(walk_task)
+        self._progress.console.print(
+            f"Discovered [bold]{len(file_list)}[/bold] file(s) under "
+            f"[yellow]{label}[/yellow]"
+        )
         if not file_list:
             return
 
         sem = asyncio.Semaphore(max_concurrent)
         copy_task = self._progress.add_task(
-            f"[cyan]Copying {remote_path}[/cyan]", total=len(file_list), unit="files"
+            f"[cyan]Copying {label}[/cyan]", total=len(file_list), unit="files"
         )
         loop = asyncio.get_running_loop()
         total_bytes = 0
@@ -253,8 +277,12 @@ class Client:
         async def _transfer_one(remote_file, local_file):
             nonlocal total_bytes
             async with sem:
-                data = await self.send(f"{target}.get_file", remote_file,
-                                       chunk_size=chunk_size)
+                if use_s3:
+                    data = await self.send(f"{target}.get_file", remote_file,
+                                           use_s3=True)
+                else:
+                    data = await self.send(f"{target}.get_file", remote_file,
+                                           chunk_size=chunk_size)
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
                 total_bytes += len(data)
@@ -271,7 +299,8 @@ class Client:
             f"([bold]{_fmt_binary(rate)}/s[/bold])"
         )
 
-    async def _walk_remote(self, target, remote_path, local_path, file_list):
+    async def _walk_remote(self, target, remote_path, local_path, file_list,
+                            walk_task=None):
         os.makedirs(local_path, exist_ok=True)
         entries = []
         offset = 0
@@ -288,9 +317,117 @@ class Client:
             remote_child = f"{remote_path}/{name}" if remote_path != "." else name
             local_child = os.path.join(local_path, name)
             if entry["type"] == "dir":
-                await self._walk_remote(target, remote_child, local_child, file_list)
+                await self._walk_remote(target, remote_child, local_child,
+                                         file_list, walk_task=walk_task)
             else:
                 file_list.append((remote_child, local_child))
+                if walk_task is not None:
+                    self._progress.update(walk_task, completed=len(file_list))
+
+    # ------------------------------------------------------------------
+    # S3 staging (sending side)
+    # ------------------------------------------------------------------
+
+    def _s3_cleanup(self, s3_key: str):
+        """Delete an S3 object that this client previously uploaded.
+
+        Only keys uploaded by this client instance are accepted, to prevent
+        a peer from deleting arbitrary objects in the shared bucket.
+        """
+        if s3_key not in self._s3_keys:
+            raise PermissionError(f"unknown S3 key: {s3_key}")
+        from nexus_transfers import s3 as _s3
+
+        _s3.delete(s3_key)
+        self._s3_keys.discard(s3_key)
+        return True
+
+    async def _upload_and_reply(self, sender: str, msg_id: str,
+                                transfer: S3Transfer):
+        """Upload the file backing ``transfer`` and send the S3 reply frame."""
+        from nexus_transfers import s3 as _s3
+
+        loop = asyncio.get_running_loop()
+        fname = os.path.basename(transfer.local_path)
+        size = os.path.getsize(transfer.local_path)
+        task_id = self._progress.add_task(f"↑ {fname} (s3)", total=size)
+
+        def _on_progress(n: int) -> None:
+            self._progress.advance(task_id, n)
+
+        try:
+            s3_key, real_size, checksum = await loop.run_in_executor(
+                None, _s3.upload_file, transfer.local_path, _on_progress
+            )
+        except Exception as exc:
+            self._progress.remove_task(task_id)
+            body = {"msg_id": msg_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc()}
+            await self._ws.send(encode_frame(self.name, "reply", sender, "J",
+                                             json.dumps(body).encode()))
+            return
+
+        self._progress.remove_task(task_id)
+        self._s3_keys.add(s3_key)
+        body = {
+            "msg_id": msg_id,
+            "result": {"s3_key": s3_key, "size": real_size,
+                       "checksum": checksum},
+            "s3_transfer": True,
+        }
+        await self._ws.send(encode_frame(self.name, "reply", sender, "J",
+                                         json.dumps(body).encode()))
+
+    # ------------------------------------------------------------------
+    # S3 staging (receiving side)
+    # ------------------------------------------------------------------
+
+    async def _handle_s3_download(self, msg_id: str, source: str,
+                                  info: dict):
+        """Download an S3-staged file then ask the source to delete it.
+
+        Resolves the original ``send`` future with the file bytes once the
+        download completes and the checksum verifies.
+        """
+        from nexus_transfers import s3 as _s3
+
+        s3_key = info.get("s3_key")
+        size = int(info.get("size", 0))
+        checksum = info.get("checksum")
+        fname = s3_key.rsplit("/", 1)[-1] if s3_key else "file"
+        task_id = self._progress.add_task(f"↓ {fname} (s3)", total=size)
+        loop = asyncio.get_running_loop()
+
+        def _on_progress(n: int) -> None:
+            self._progress.advance(task_id, n)
+
+        try:
+            data = await loop.run_in_executor(
+                None, _s3.download_bytes, s3_key, checksum, _on_progress
+            )
+        except Exception as exc:
+            self._progress.remove_task(task_id)
+            future = self._pending.pop(msg_id, None)
+            if future and not future.done():
+                future.set_exception(RemoteError(f"S3 download failed: {exc}"))
+            asyncio.create_task(self._s3_cleanup_remote(source, s3_key))
+            return
+
+        self._progress.remove_task(task_id)
+        future = self._pending.pop(msg_id, None)
+        if future and not future.done():
+            future.set_result(data)
+        asyncio.create_task(self._s3_cleanup_remote(source, s3_key))
+
+    async def _s3_cleanup_remote(self, target: str, s3_key: str | None):
+        """Tell ``target`` to delete ``s3_key``; log on failure but don't raise."""
+        if not s3_key:
+            return
+        try:
+            await self.send(f"{target}.s3_cleanup", s3_key)
+        except Exception as exc:
+            _logger.warning("S3 cleanup failed for %s: %s", s3_key, exc)
 
     # ------------------------------------------------------------------
     # Binary chunk transfer (sending side)
@@ -429,6 +566,8 @@ class Client:
             await self._ws.send(encode_frame(self.name, "reply", sender, "J",
                                              json.dumps(body).encode()))
             asyncio.create_task(self._send_file_chunks(sender, msg_id, result))
+        elif isinstance(result, S3Transfer):
+            asyncio.create_task(self._upload_and_reply(sender, msg_id, result))
         else:
             body = {"msg_id": msg_id, "result": result}
             await self._ws.send(encode_frame(self.name, "reply", sender, "J",
@@ -472,6 +611,11 @@ class Client:
                                 future = self._pending.pop(msg_id, None)
                                 if future and not future.done():
                                     future.set_result(b"")
+                        elif data.get("s3_transfer"):
+                            asyncio.create_task(
+                                self._handle_s3_download(msg_id, source,
+                                                          data.get("result", {}))
+                            )
                         else:
                             future = self._pending.pop(msg_id, None)
                             if future and not future.done():
@@ -657,6 +801,14 @@ async def _interactive_listener(client, console):
                                       f"(id={msg_id}) {data['error']}")
                         if data.get("traceback"):
                             console.print(f"  [dim]{data['traceback']}[/dim]")
+                    elif data.get("s3_transfer"):
+                        info = data.get("result", {})
+                        console.print(f"\n  [info]\\[s3 staged from {sender}][/info] "
+                                      f"(id={msg_id}) key={info.get('s3_key')} "
+                                      f"size={info.get('size')}")
+                        asyncio.create_task(
+                            client._handle_s3_download(msg_id, source, info)
+                        )
                     else:
                         console.print(f"\n  [success]\\[result from {sender}][/success] "
                                       f"(id={msg_id}) {json.dumps(data.get('result'))}")

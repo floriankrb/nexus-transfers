@@ -49,6 +49,23 @@ class FileTransfer:
         self.total_chunks = math.ceil(self.size / chunk_size) if self.size > 0 else 0
 
 
+class S3Transfer:
+    """Marker returned by ``get_file(use_s3=True)`` to trigger S3 staging.
+
+    The ``Client`` running on the source uploads ``local_path`` to the
+    configured S3 bucket and replies with the object key, size, and
+    checksum.  No payload is sent over the WebSocket itself.
+
+    Parameters
+    ----------
+    local_path
+        Absolute path of the file to upload.
+    """
+
+    def __init__(self, local_path: str):
+        self.local_path = os.path.abspath(local_path)
+
+
 def resolve_safe_path(path, allowed_paths):
     """Resolve a path and verify it is within an allowed directory.
 
@@ -88,17 +105,22 @@ def make_get_file(allowed_paths):
     allowed_paths
         List of allowed base directories.
     """
-    def get_file(path, chunk_size=65536):
-        """Read a file and return it for binary transfer.
+    def get_file(path, chunk_size=65536, use_s3=False):
+        """Read a file and return it for transfer.
 
         Parameters
         ----------
         path
             Path to the file to read.
         chunk_size
-            Size of each binary chunk in bytes (chosen by the caller).
+            Size of each binary chunk in bytes (ignored when ``use_s3`` is True).
+        use_s3
+            If True, stage the file via the configured S3 bucket instead of
+            sending it as binary chunks over the WebSocket.
         """
         resolved = resolve_safe_path(path, allowed_paths)
+        if use_s3:
+            return S3Transfer(resolved)
         return FileTransfer(resolved, chunk_size=chunk_size)
 
     return get_file

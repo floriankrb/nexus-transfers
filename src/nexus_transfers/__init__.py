@@ -4,6 +4,7 @@ from nexus_transfers.client import Client
 from nexus_transfers.dispatch import (
     DISPATCH,
     FileTransfer,
+    S3Transfer,
     adder,
     echo,
     make_get_file,
@@ -15,6 +16,7 @@ __all__ = [
     "Client",
     "DISPATCH",
     "FileTransfer",
+    "S3Transfer",
     "adder",
     "echo",
     "make_get_file",

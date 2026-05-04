@@ -7,7 +7,13 @@ name = "nexus-transfers"
 version = "0.1.0"
 description = "WebSocket relay server and RPC client"
 requires-python = ">=3.12"
-dependencies = ["websockets>=16.0", "tqdm>=4.60", "python-dotenv>=1.0", "rich>=13.0"]
+dependencies = [
+    "websockets>=16.0",
+    "tqdm>=4.60",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+    "obstore>=0.9",
+]
 
 [project.scripts]
 nexus-server = "nexus_transfers.server:main"

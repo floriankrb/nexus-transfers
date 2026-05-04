@@ -84,11 +84,33 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
 - **Named routing** — clients register with a unique name; messages are routed by name
 - **RPC dispatch** — clients expose functions that other clients can call remotely
 - **Binary file transfer** — files are sent as raw binary WebSocket frames (no base64), chunked with tqdm progress bars
+- **Optional S3 staging** — pass `use_s3=True` (or `--use-s3` to `nexus-copy`) to relay through an S3-compatible bucket instead of the WebSocket
 - **SHA-256 checksums** — computed incrementally during transfer and verified on completion
 - **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
 - **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
 - **Shared memory** — key-value store on the server, accessible from any client via `/mem` commands
 - **Client discovery** — `list_clients` / `/clients` returns all connected client names
+
+## S3 staging
+
+Configure on both clients:
+
+```bash
+export NEXUS_TRANSFER_S3_BUCKET=my-bucket
+export NEXUS_TRANSFER_S3_ENDPOINT_URL=https://s3.example.com   # optional
+export NEXUS_TRANSFER_S3_ACCESS_KEY_ID=...                     # optional
+export NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY=...                 # optional
+```
+
+Then:
+
+```bash
+nexus-copy --from a /remote/path ./local-path --use-s3
+```
+
+Flow: provider uploads → returns key/size/sha256 → initiator downloads
+from S3 → initiator tells provider to delete the staged object. The file
+on the provider's disk is untouched.
 
 ## CLI reference
 
@@ -106,3 +128,14 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
 | `--name`        | (required)               | Unique client ID                                 |
 | `--server-url`  | `ws://localhost:8766`    | Server WebSocket URL                             |
 | `--allow-path`  | (none)                   | Directory to expose for file operations (repeatable) |
+
+### `nexus-copy`
+
+| Flag               | Default               | Description                                            |
+|--------------------|-----------------------|--------------------------------------------------------|
+| `--from`           | (required)            | Name of the remote client                              |
+| `source target`    | (required)            | Remote source dir, local target dir                    |
+| `--server-url`     | `ws://localhost:8766` | Server WebSocket URL                                   |
+| `--max-concurrent` | `4`                   | Maximum parallel file transfers                        |
+| `--chunk-size`     | `65536`               | Binary chunk size (ignored with `--use-s3`)            |
+| `--use-s3`         | off                   | Stage transfers through S3 (needs `NEXUS_TRANSFER_S3_*`) |

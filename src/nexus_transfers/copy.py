@@ -51,6 +51,11 @@ def main():
         help="Binary chunk size in bytes for file transfers (default: 65536)",
     )
     parser.add_argument(
+        "--use-s3",
+        action="store_true",
+        help="Stage transfers through S3 (requires NEXUS_TRANSFER_S3_* env vars)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -74,19 +79,24 @@ def main():
             target=args.target,
             max_concurrent=args.max_concurrent,
             chunk_size=args.chunk_size,
+            use_s3=args.use_s3,
         )
     )
 
 
-async def _copy(name, url, remote_client, source, target, max_concurrent, chunk_size):
+async def _copy(name, url, remote_client, source, target, max_concurrent,
+                chunk_size, use_s3=False):
     """Connect to the relay and copy a remote directory."""
     target = os.path.expanduser(target)
     console = Console()
     async with Client(name, url) as client:
         console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
-        console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{target}[/yellow]")
+        via = " [dim](via S3)[/dim]" if use_s3 else ""
+        console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{target}[/yellow]{via}")
         await client.get_directory(remote_client, source, target,
-                                   max_concurrent=max_concurrent, chunk_size=chunk_size)
+                                   max_concurrent=max_concurrent,
+                                   chunk_size=chunk_size,
+                                   use_s3=use_s3)
         console.print("[bold green]Done.[/bold green]")
 
 if __name__ == "__main__":
