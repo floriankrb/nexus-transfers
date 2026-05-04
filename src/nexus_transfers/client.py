@@ -185,7 +185,7 @@ class Client:
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
         connect_kwargs: dict = {"additional_headers": extra_headers,
-                                "max_size": 1_073_741_824}  # 1 GiB
+                                "max_size": 104_857_600}  # 100 MiB
         if not self.ssl_verify and self.url.startswith("wss://"):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
@@ -398,129 +398,134 @@ class Client:
             requires fetching remote file sizes during the directory walk.
         """
         label = os.path.basename(remote_path.rstrip("/")) or remote_path
-        file_list = []
+
         walk_task = self._progress.add_task(
             f"[magenta]Listing {label}[/magenta]", total=None, unit="files"
         )
-        await self._walk_remote(target, remote_path, local_path, file_list,
-                                walk_task=walk_task,
-                                include_size=track_bytes)
-        self._progress.remove_task(walk_task)
-        self._progress.console.print(
-            f"Discovered [bold]{len(file_list)}[/bold] file(s) under "
-            f"[yellow]{label}[/yellow]"
-        )
-        await self.monitor(
-            f"{self.name}: discovered {len(file_list)} file(s) under {label}",
-            status="progress",
-        )
-        if not file_list:
-            return
 
-        # Filter out files already fully downloaded (resume support).
-        pending = []
+        # Queue feeds files from _walk_remote to transfer workers as
+        # pages are discovered, so downloads start while listing is
+        # still in progress.
+        queue: asyncio.Queue = asyncio.Queue()
+        discovered = 0
         skipped = 0
         skipped_bytes = 0
-        for remote_file, local_file, remote_size in file_list:
-            if remote_size is not None and os.path.isfile(local_file):
-                try:
-                    local_size = os.path.getsize(local_file)
-                except OSError:
-                    local_size = -1
-                if local_size == remote_size:
-                    skipped += 1
-                    skipped_bytes += remote_size
-                    continue
-            pending.append((remote_file, local_file, remote_size))
 
-        if skipped:
-            _logger.info(
-                "Resuming: skipping %d already-complete file(s) (%s), "
-                "%d file(s) remaining",
-                skipped, _fmt_binary(skipped_bytes), len(pending),
+        async def _walk_and_enqueue():
+            nonlocal discovered, skipped, skipped_bytes
+            await self._walk_remote_streamed(
+                target, remote_path, local_path, queue,
+                walk_task=walk_task, include_size=track_bytes,
             )
-            self._progress.console.print(
-                f"Skipping [bold]{skipped}[/bold] already-complete file(s) "
-                f"([bold]{_fmt_binary(skipped_bytes)}[/bold]), "
-                f"[bold]{len(pending)}[/bold] remaining"
-            )
-            await self.monitor(
-                f"{self.name}: resuming, skipping {skipped} already-complete "
-                f"file(s) ({_fmt_binary(skipped_bytes)}), "
-                f"{len(pending)} remaining",
-                status="progress",
-            )
-        if not pending:
-            return
+            # Signal workers that listing is done.
+            for _ in range(max_concurrent):
+                await queue.put(None)
 
         sem = asyncio.Semaphore(max_concurrent)
-        if track_bytes:
-            pending_total = sum(s for _, _, s in pending if s is not None)
-            copy_task = self._progress.add_task(
-                f"[cyan]Copying {label}[/cyan]", total=pending_total,
-            )
-        else:
-            copy_task = self._progress.add_task(
-                f"[cyan]Copying {label}[/cyan]", total=len(pending),
-                unit="files",
-            )
+        copy_task = self._progress.add_task(
+            f"[cyan]Copying {label}[/cyan]", total=None, unit="files",
+        )
         loop = asyncio.get_running_loop()
         total_bytes = 0
         done_count = 0
         start = loop.time()
         last_monitor_time = start
 
-        async def _transfer_one(remote_file, local_file, remote_size):
+        async def _worker():
             nonlocal total_bytes, done_count, last_monitor_time
-            async with sem:
-                while True:
+            nonlocal skipped, skipped_bytes
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                remote_file, local_file, remote_size = item
+
+                # Resume: skip files whose local size matches remote.
+                if remote_size is not None and os.path.isfile(local_file):
                     try:
-                        if use_s3:
-                            data = await self.send(f"{target}.get_file", remote_file,
-                                                   use_s3=True,
-                                                   s3_prefix=s3_prefix)
-                        else:
-                            data = await self.send(f"{target}.get_file", remote_file,
-                                                   chunk_size=chunk_size)
-                        break
-                    except (PeerNotFoundError, ConnectionError,
-                            asyncio.TimeoutError) as exc:
-                        _logger.warning(
-                            "Transfer of %s failed (%s), retrying in %.1fs \u2026",
-                            os.path.basename(remote_file), exc, self.peer_delay,
-                        )
+                        local_size = os.path.getsize(local_file)
+                    except OSError:
+                        local_size = -1
+                    if local_size == remote_size:
+                        skipped += 1
+                        skipped_bytes += remote_size
+                        continue
+
+                async with sem:
+                    while True:
+                        try:
+                            if use_s3:
+                                data = await self.send(
+                                    f"{target}.get_file", remote_file,
+                                    use_s3=True, s3_prefix=s3_prefix)
+                            else:
+                                data = await self.send(
+                                    f"{target}.get_file", remote_file,
+                                    chunk_size=chunk_size)
+                            break
+                        except (PeerNotFoundError, ConnectionError,
+                                asyncio.TimeoutError) as exc:
+                            _logger.warning(
+                                "Transfer of %s failed (%s), retrying in %.1fs \u2026",
+                                os.path.basename(remote_file), exc,
+                                self.peer_delay,
+                            )
+                            await self.monitor(
+                                f"{self.name}: transfer of "
+                                f"{os.path.basename(remote_file)} failed "
+                                f"({type(exc).__name__}), retrying \u2026",
+                                status="warning",
+                            )
+                            await asyncio.sleep(self.peer_delay)
+
+                    os.makedirs(os.path.dirname(local_file), exist_ok=True)
+                    # Skip writing if the local file already has the same size.
+                    skip = False
+                    if os.path.isfile(local_file):
+                        try:
+                            local_size = os.path.getsize(local_file)
+                        except OSError:
+                            local_size = -1
+                        if local_size == len(data):
+                            skip = True
+                            _logger.debug("Skipping %s (local size matches)",
+                                          os.path.basename(local_file))
+                    if not skip:
+                        await loop.run_in_executor(
+                            None, _write_file, local_file, data)
+                    total_bytes += len(data)
+                    done_count += 1
+                    self._progress.update(copy_task, completed=done_count)
+
+                    # Send periodic progress to monitor (at most every 30s).
+                    now = loop.time()
+                    if now - last_monitor_time >= 30:
+                        last_monitor_time = now
+                        elapsed = now - start
+                        rate = total_bytes / elapsed if elapsed > 0 else 0
                         await self.monitor(
-                            f"{self.name}: transfer of "
-                            f"{os.path.basename(remote_file)} failed "
-                            f"({type(exc).__name__}), retrying …",
-                            status="warning",
+                            f"{self.name}: {done_count} files "
+                            f"({_fmt_binary(total_bytes)}, "
+                            f"{_fmt_binary(rate)}/s)",
+                            status="progress",
                         )
-                        await asyncio.sleep(self.peer_delay)
-                os.makedirs(os.path.dirname(local_file), exist_ok=True)
-                await loop.run_in_executor(None, _write_file, local_file, data)
-                total_bytes += len(data)
-                done_count += 1
-                if track_bytes:
-                    self._progress.advance(copy_task, len(data))
-                else:
-                    self._progress.advance(copy_task)
 
-                # Send periodic progress to monitor (at most every 30s).
-                now = loop.time()
-                if now - last_monitor_time >= 30:
-                    last_monitor_time = now
-                    elapsed = now - start
-                    rate = total_bytes / elapsed if elapsed > 0 else 0
-                    await self.monitor(
-                        f"{self.name}: {done_count}/{len(pending)} files "
-                        f"({_fmt_binary(total_bytes)}, "
-                        f"{_fmt_binary(rate)}/s)",
-                        status="progress",
-                    )
+        walk_coro = _walk_and_enqueue()
+        workers = [_worker() for _ in range(max_concurrent)]
+        await asyncio.gather(walk_coro, *workers)
 
-        await asyncio.gather(*[_transfer_one(rf, lf, rs)
-                               for rf, lf, rs in pending])
+        self._progress.remove_task(walk_task)
         self._progress.remove_task(copy_task)
+
+        if skipped:
+            _logger.info(
+                "Skipped %d already-complete file(s) (%s)",
+                skipped, _fmt_binary(skipped_bytes),
+            )
+            self._progress.console.print(
+                f"Skipped [bold]{skipped}[/bold] already-complete file(s) "
+                f"([bold]{_fmt_binary(skipped_bytes)}[/bold])"
+            )
 
         elapsed = loop.time() - start
         rate = total_bytes / elapsed if elapsed > 0 else 0
@@ -801,9 +806,52 @@ class Client:
             return
 
         try:
-            result = func(*func_args, **func_kwargs) if isinstance(func_args, list) \
-                else func(func_args, **func_kwargs)
+            if func_name == "list_dir":
+                path_arg = func_args[0] if func_args else "?"
+                _logger.info("Listing directory %s for %s …", path_arg, sender)
+                await self.monitor(
+                    f"{self.name}: listing {path_arg} for {sender} …",
+                    status="progress",
+                )
+
+            # Run in an executor so the event loop stays responsive
+            # (e.g. answering WebSocket pings) while slow I/O-bound
+            # functions like list_dir are executing.
+            loop = asyncio.get_running_loop()
+            if func_name == "list_dir":
+                label = os.path.basename(
+                    (func_args[0] if func_args else "?").rstrip("/")
+                ) or func_args[0]
+                task_id = self._progress.add_task(
+                    f"[magenta]Listing {label}[/magenta]",
+                    total=None, unit="files",
+                )
+
+                def _on_progress(count):
+                    self._progress.update(task_id, completed=count)
+
+                func_kwargs["progress_callback"] = _on_progress
+
+            if isinstance(func_args, list):
+                result = await loop.run_in_executor(
+                    None, lambda: func(*func_args, **func_kwargs))
+            else:
+                result = await loop.run_in_executor(
+                    None, lambda: func(func_args, **func_kwargs))
+
+            if func_name == "list_dir":
+                self._progress.remove_task(task_id)
+                count = len(result) if isinstance(result, list) else 0
+                _logger.info("Listed %d entries in %s for %s",
+                             count, path_arg, sender)
+                await self.monitor(
+                    f"{self.name}: listed {count} entries in {path_arg} "
+                    f"for {sender}",
+                    status="progress",
+                )
         except Exception as exc:
+            if func_name == "list_dir":
+                self._progress.remove_task(task_id)
             body = {"msg_id": msg_id, "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc()}
             await self._ws.send(encode_frame(self.name, "reply", sender, "J",

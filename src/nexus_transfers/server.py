@@ -120,7 +120,7 @@ async def relay_handler(websocket):
 
 async def run_server(host="localhost", port=8766):
     """Start the relay server."""
-    async with serve(relay_handler, host, port, max_size=1_073_741_824):  # 1 GiB
+    async with serve(relay_handler, host, port, max_size=104_857_600):  # 100 MiB
         print(f"Relay server listening on ws://{host}:{port}")
         await asyncio.get_running_loop().create_future()
 

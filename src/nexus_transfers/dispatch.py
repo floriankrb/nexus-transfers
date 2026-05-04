@@ -141,7 +141,8 @@ def make_list_dir(allowed_paths):
     allowed_paths
         List of allowed base directories.
     """
-    def list_dir(path=".", include_size=False, offset=0, limit=1000):
+    def list_dir(path=".", include_size=False, offset=0, limit=1000,
+                 progress_callback=None):
         """List the contents of a directory with pagination.
 
         Parameters
@@ -154,24 +155,40 @@ def make_list_dir(allowed_paths):
             Index of the first entry to return.
         limit
             Maximum number of entries to return.
+        progress_callback
+            Optional callable invoked with the current entry count as
+            files are scanned.
         """
         logger.debug("list_dir called with path=%r, include_size=%s, offset=%d, limit=%d", path, include_size, offset, limit)
         resolved = resolve_safe_path(path, allowed_paths)
         logger.debug("Resolved path: %s", resolved)
         if not os.path.isdir(resolved):
             raise NotADirectoryError(f"not a directory: {path}")
-        entries = []
+
+        # Sort names first (cheap), then only build info dicts for the
+        # requested page and only stat() files when include_size is set.
         with os.scandir(resolved) as it:
-            for entry in sorted(it, key=lambda e: e.name):
-                info = {
-                    "name": entry.name,
-                    "type": "dir" if entry.is_dir(follow_symlinks=False) else "file",
-                }
-                if include_size and entry.is_file(follow_symlinks=False):
-                    info["size"] = entry.stat(follow_symlinks=False).st_size
-                entries.append(info)
-        page = entries[offset:offset + limit]
-        logger.debug("Returning %d/%d entries (offset=%d) in %s", len(page), len(entries), offset, resolved)
+            sorted_entries = sorted(it, key=lambda e: e.name)
+
+        end = offset + limit
+        page = []
+        for i, entry in enumerate(sorted_entries):
+            if progress_callback is not None:
+                progress_callback(i + 1)
+            if i < offset:
+                continue
+            if i >= end:
+                break
+            info = {
+                "name": entry.name,
+                "type": "dir" if entry.is_dir(follow_symlinks=False) else "file",
+            }
+            if include_size and entry.is_file(follow_symlinks=False):
+                info["size"] = entry.stat(follow_symlinks=False).st_size
+            page.append(info)
+
+        logger.debug("Returning %d/%d entries (offset=%d) in %s",
+                     len(page), len(sorted_entries), offset, resolved)
         return page
 
     return list_dir
