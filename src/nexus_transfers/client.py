@@ -982,6 +982,10 @@ async def _interactive(name, url, allowed_paths=None, **client_kwargs):
             pass
         asyncio.create_task(_interactive_listener(client, console))
 
+        # Stop the progress bar so it doesn't interfere with terminal
+        # input in interactive mode.
+        client._progress.stop()
+
         loop = asyncio.get_event_loop()
         stop_event = threading.Event()
 
