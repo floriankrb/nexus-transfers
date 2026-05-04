@@ -356,7 +356,7 @@ class Client:
             self._progress.advance(task_id, n)
 
         try:
-            s3_key, real_size, checksum = await loop.run_in_executor(
+            bucket, s3_key, real_size, checksum = await loop.run_in_executor(
                 None, _s3.upload_file, transfer.local_path, _on_progress
             )
         except Exception as exc:
@@ -373,7 +373,7 @@ class Client:
         body = {
             "msg_id": msg_id,
             "result": {"s3_key": s3_key, "size": real_size,
-                       "checksum": checksum},
+                       "checksum": checksum, "bucket": bucket},
             "s3_transfer": True,
         }
         await self._ws.send(encode_frame(self.name, "reply", sender, "J",
@@ -395,6 +395,7 @@ class Client:
         s3_key = info.get("s3_key")
         size = int(info.get("size", 0))
         checksum = info.get("checksum")
+        bucket = info.get("bucket")
         fname = s3_key.rsplit("/", 1)[-1] if s3_key else "file"
         task_id = self._progress.add_task(f"↓ {fname} (s3)", total=size)
         loop = asyncio.get_running_loop()
@@ -404,7 +405,8 @@ class Client:
 
         try:
             data = await loop.run_in_executor(
-                None, _s3.download_bytes, s3_key, checksum, _on_progress
+                None, _s3.download_bytes, s3_key, checksum, _on_progress,
+                None, bucket,
             )
         except Exception as exc:
             self._progress.remove_task(task_id)

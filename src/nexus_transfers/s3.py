@@ -2,12 +2,14 @@
 
 When ``get_file`` is called with ``use_s3=True``, the source client (the one
 holding the file) uploads it to a shared S3-compatible bucket and returns
-the object key, size, and SHA-256 checksum. The initiator then downloads
-from S3 and asks the source to delete the staged object.
+the object key, size, SHA-256 checksum, **and the bucket name**. The
+initiator then downloads from S3 using the bucket name received from the
+source and asks the source to delete the staged object.
 
 Configuration is read from the environment:
 
-* ``NEXUS_TRANSFER_S3_BUCKET`` – bucket name (required).
+* ``NEXUS_TRANSFER_S3_BUCKET`` – bucket name (**required on the sending
+  side**; the receiving side learns the bucket from the sender's reply).
 * ``NEXUS_TRANSFER_S3_ENDPOINT_URL`` – endpoint URL (optional, for non-AWS
   S3-compatible services).
 * ``NEXUS_TRANSFER_S3_ACCESS_KEY_ID`` – access key (optional, falls back to
@@ -74,19 +76,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _build_store_from_env():
-    """Construct an ``S3Store`` from environment variables."""
+def _build_store_from_env(bucket_override: str | None = None):
+    """Construct an ``S3Store`` from environment variables.
+
+    Parameters
+    ----------
+    bucket_override
+        If supplied, used as the bucket name and ``NEXUS_TRANSFER_S3_BUCKET``
+        is not consulted.  Used by the receiving side, which learns the
+        bucket from the sender's reply rather than from its own environment.
+    """
     from obstore.store import S3Store
 
-    raw = os.environ.get(S3_BUCKET_ENV)
-    if not raw:
-        raise RuntimeError(
-            f"{S3_BUCKET_ENV} is not set – S3 staging is not available"
-        )
-    bucket, prefix = _split_bucket_spec(raw)
+    if bucket_override is not None:
+        bucket = bucket_override
+    else:
+        raw = os.environ.get(S3_BUCKET_ENV)
+        if not raw:
+            raise RuntimeError(
+                f"{S3_BUCKET_ENV} is not set – S3 staging is not available"
+            )
+        bucket, _ = _split_bucket_spec(raw)
     kwargs: dict = {}
-    if prefix:
-        kwargs["prefix"] = prefix
     endpoint = os.environ.get(S3_ENDPOINT_ENV)
     if endpoint:
         kwargs["endpoint"] = endpoint
@@ -99,8 +110,8 @@ def _build_store_from_env():
     if secret_key:
         kwargs["secret_access_key"] = secret_key
     logger.info(
-        "S3 store: bucket=%r prefix=%r endpoint=%r virtual_hosted=%s",
-        bucket, prefix, endpoint, kwargs.get("virtual_hosted_style_request"),
+        "S3 store: bucket=%r endpoint=%r virtual_hosted=%s",
+        bucket, endpoint, kwargs.get("virtual_hosted_style_request"),
     )
     return S3Store(bucket=bucket, **kwargs)
 
@@ -109,29 +120,59 @@ def _build_store_from_env():
 _store_factory: Callable[[], object] = _build_store_from_env
 
 
-def get_store():
-    """Return an object store instance built by the current factory."""
-    return _store_factory()
+def get_store(bucket: str | None = None):
+    """Return an object store. If ``bucket`` is given, override the env bucket.
+
+    The override path is only taken when the factory is the default
+    ``_build_store_from_env`` – tests that monkey-patch the factory always
+    receive their substitute.
+    """
+    if bucket is None or _store_factory is not _build_store_from_env:
+        return _store_factory()
+    return _build_store_from_env(bucket_override=bucket)
+
+
+def _env_prefix() -> str | None:
+    """Extract the prefix portion of ``NEXUS_TRANSFER_S3_BUCKET`` if any."""
+    raw = os.environ.get(S3_BUCKET_ENV)
+    if not raw:
+        return None
+    return _split_bucket_spec(raw)[1]
+
+
+def _env_bucket() -> str:
+    """Return the bucket portion of ``NEXUS_TRANSFER_S3_BUCKET`` (or ``?``)."""
+    raw = os.environ.get(S3_BUCKET_ENV)
+    if not raw:
+        return "?"
+    return _split_bucket_spec(raw)[0]
 
 
 def make_key(local_path: str) -> str:
     """Return the S3 key for ``local_path``.
 
-    Uses the absolute source path stripped of its leading ``/`` – no UUID,
-    no hash, no extra prefix. Within a bucket, two distinct source paths
-    therefore map to two distinct keys.
+    Uses the absolute source path stripped of its leading ``/``.  If the
+    bucket env var includes a prefix (``s3://bucket/some/prefix``), the
+    prefix is folded into the key so the receiving side only needs the
+    bucket name to reach the object.
     """
-    return os.path.abspath(local_path).lstrip("/")
+    key = os.path.abspath(local_path).lstrip("/")
+    prefix = _env_prefix()
+    if prefix:
+        return f"{prefix}/{key}"
+    return key
 
 
 def upload_file(
     local_path: str,
     progress_callback: Callable[[int], None] | None = None,
-) -> tuple[str, int, str]:
-    """Upload a local file and return ``(s3_key, size, sha256_hex)``.
+) -> tuple[str, str, int, str]:
+    """Upload a local file and return ``(bucket, s3_key, size, sha256_hex)``.
 
     Streams the file in chunks while updating the SHA-256 hash so the
-    file is read from disk only once.
+    file is read from disk only once.  The bucket name is included in the
+    return value so the receiving client can reach the object without
+    needing its own ``NEXUS_TRANSFER_S3_BUCKET``.
 
     Parameters
     ----------
@@ -141,7 +182,7 @@ def upload_file(
         Optional callable invoked with the byte count of each chunk read.
     """
     store = get_store()
-    bucket = _normalise_bucket(os.environ.get(S3_BUCKET_ENV, "?"))
+    bucket = _env_bucket()
     s3_key = make_key(local_path)
     size = os.path.getsize(local_path)
     hasher = hashlib.sha256()
@@ -161,7 +202,7 @@ def upload_file(
     obs.put(store, s3_key, _chunks())
     checksum = hasher.hexdigest()
     logger.debug("Upload of %s successful", local_path)
-    return s3_key, size, checksum
+    return bucket, s3_key, size, checksum
 
 
 def download_bytes(
@@ -169,6 +210,7 @@ def download_bytes(
     expected_checksum: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
     target: str | None = None,
+    bucket: str | None = None,
 ) -> bytes:
     """Download an object from S3, verify its checksum, and return its bytes.
 
@@ -182,9 +224,12 @@ def download_bytes(
         Optional callable invoked with the byte count of each streamed chunk.
     target
         Optional human-readable destination, used only for log lines.
+    bucket
+        Bucket name returned by the sender.  When supplied, the receiver
+        does not need ``NEXUS_TRANSFER_S3_BUCKET`` in its own environment.
     """
-    store = get_store()
-    bucket = _normalise_bucket(os.environ.get(S3_BUCKET_ENV, "?"))
+    store = get_store(bucket=bucket)
+    bucket = bucket or _normalise_bucket(os.environ.get(S3_BUCKET_ENV, "?"))
     target_label = target or "(memory)"
     logger.info("S3 download: s3://%s/%s -> %s", bucket, s3_key, target_label)
     result = obs.get(store, s3_key)

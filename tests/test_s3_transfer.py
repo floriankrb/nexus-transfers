@@ -79,10 +79,10 @@ def test_upload_download_round_trip(tmp_path, shared_store):
     src = tmp_path / "blob.bin"
     src.write_bytes(os.urandom(50_000))
 
-    s3_key, size, checksum = _s3.upload_file(str(src))
+    bucket, s3_key, size, checksum = _s3.upload_file(str(src))
     assert size == src.stat().st_size
 
-    data = _s3.download_bytes(s3_key, expected_checksum=checksum)
+    data = _s3.download_bytes(s3_key, expected_checksum=checksum, bucket=bucket)
     assert data == src.read_bytes()
 
     _s3.delete(s3_key)
@@ -112,6 +112,6 @@ def test_split_bucket_spec_extracts_prefix():
 def test_download_checksum_mismatch_raises(tmp_path, shared_store):
     src = tmp_path / "blob.bin"
     src.write_bytes(b"abc")
-    s3_key, _, _ = _s3.upload_file(str(src))
+    bucket, s3_key, _, _ = _s3.upload_file(str(src))
     with pytest.raises(ValueError, match="checksum mismatch"):
-        _s3.download_bytes(s3_key, expected_checksum="0" * 64)
+        _s3.download_bytes(s3_key, expected_checksum="0" * 64, bucket=bucket)
