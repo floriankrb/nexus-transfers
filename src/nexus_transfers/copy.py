@@ -8,6 +8,7 @@ Usage::
 
 import argparse
 import asyncio
+import datetime
 import logging
 import os
 import uuid
@@ -138,10 +139,15 @@ async def _copy(name, url, remote_client, source, target, max_concurrent,
             f"{name}: starting copy {remote_client}:{source} -> {target}",
             status="progress",
         )
+        s3_prefix = None
+        if use_s3:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+            s3_prefix = f"{ts}-{remote_client}-{name}-{uuid.uuid4()}"
         await client.get_directory(remote_client, source, target,
                                    max_concurrent=max_concurrent,
                                    chunk_size=chunk_size,
-                                   use_s3=use_s3)
+                                   use_s3=use_s3,
+                                   s3_prefix=s3_prefix)
         await client.monitor(
             f"{name}: copy complete {remote_client}:{source} -> {target}",
             status="ok",

@@ -148,15 +148,25 @@ def _env_bucket() -> str:
     return _split_bucket_spec(raw)[0]
 
 
-def make_key(local_path: str) -> str:
+def make_key(local_path: str, s3_prefix: str | None = None) -> str:
     """Return the S3 key for ``local_path``.
 
-    Uses the absolute source path stripped of its leading ``/``.  If the
-    bucket env var includes a prefix (``s3://bucket/some/prefix``), the
-    prefix is folded into the key so the receiving side only needs the
-    bucket name to reach the object.
+    Uses the absolute source path stripped of its leading ``/``.  If
+    ``s3_prefix`` is given it is prepended to the key.  Otherwise, if the
+    bucket env var includes a prefix (``s3://bucket/some/prefix``), that
+    prefix is used instead.
+
+    Parameters
+    ----------
+    local_path
+        File path to derive the key from.
+    s3_prefix
+        Optional prefix prepended to the key (e.g. a per-transfer
+        directory name).
     """
     key = os.path.abspath(local_path).lstrip("/")
+    if s3_prefix:
+        return f"{s3_prefix}/{key}"
     prefix = _env_prefix()
     if prefix:
         return f"{prefix}/{key}"
@@ -166,6 +176,7 @@ def make_key(local_path: str) -> str:
 def upload_file(
     local_path: str,
     progress_callback: Callable[[int], None] | None = None,
+    s3_prefix: str | None = None,
 ) -> tuple[str, str, int, str]:
     """Upload a local file and return ``(bucket, s3_key, size, sha256_hex)``.
 
@@ -180,10 +191,12 @@ def upload_file(
         Absolute path of the file to upload.
     progress_callback
         Optional callable invoked with the byte count of each chunk read.
+    s3_prefix
+        Optional prefix prepended to the S3 key.
     """
     store = get_store()
     bucket = _env_bucket()
-    s3_key = make_key(local_path)
+    s3_key = make_key(local_path, s3_prefix=s3_prefix)
     size = os.path.getsize(local_path)
     hasher = hashlib.sha256()
     logger.debug("S3 upload: %s -> s3://%s/%s", local_path, bucket, s3_key)

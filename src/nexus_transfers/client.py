@@ -368,7 +368,7 @@ class Client:
 
     async def get_directory(self, target, remote_path, local_path,
                             max_concurrent=4, chunk_size=65536,
-                            use_s3=True):
+                            use_s3=True, s3_prefix=None):
         """Recursively copy a remote directory to a local path.
 
         Resumes interrupted transfers by skipping files whose local size
@@ -390,6 +390,8 @@ class Client:
         use_s3:
             If True (default), stage transfers through S3.  Set to False
             to send file bytes over the WebSocket relay instead.
+        s3_prefix:
+            Optional prefix prepended to S3 keys for this transfer batch.
         """
         label = os.path.basename(remote_path.rstrip("/")) or remote_path
         file_list = []
@@ -409,6 +411,7 @@ class Client:
         # Filter out files already fully downloaded (resume support).
         pending = []
         skipped = 0
+        skipped_bytes = 0
         for remote_file, local_file, remote_size in file_list:
             if remote_size is not None and os.path.isfile(local_file):
                 try:
@@ -417,12 +420,20 @@ class Client:
                     local_size = -1
                 if local_size == remote_size:
                     skipped += 1
+                    skipped_bytes += remote_size
                     continue
             pending.append((remote_file, local_file))
 
         if skipped:
+            _logger.info(
+                "Resuming: skipping %d already-complete file(s) (%s), "
+                "%d file(s) remaining",
+                skipped, _fmt_binary(skipped_bytes), len(pending),
+            )
             self._progress.console.print(
-                f"Skipping [bold]{skipped}[/bold] already-complete file(s)"
+                f"Skipping [bold]{skipped}[/bold] already-complete file(s) "
+                f"([bold]{_fmt_binary(skipped_bytes)}[/bold]), "
+                f"[bold]{len(pending)}[/bold] remaining"
             )
         if not pending:
             return
@@ -442,7 +453,8 @@ class Client:
                     try:
                         if use_s3:
                             data = await self.send(f"{target}.get_file", remote_file,
-                                                   use_s3=True)
+                                                   use_s3=True,
+                                                   s3_prefix=s3_prefix)
                         else:
                             data = await self.send(f"{target}.get_file", remote_file,
                                                    chunk_size=chunk_size)
@@ -534,7 +546,8 @@ class Client:
 
         try:
             bucket, s3_key, real_size, checksum = await loop.run_in_executor(
-                None, _s3.upload_file, transfer.local_path, _on_progress
+                None, _s3.upload_file, transfer.local_path, _on_progress,
+                transfer.s3_prefix,
             )
         except Exception as exc:
             self._progress.remove_task(task_id)

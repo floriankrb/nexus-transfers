@@ -22,3 +22,9 @@ access_key_id = $NEXUS_TRANSFER_S3_ACCESS_KEY_ID
 secret_access_key = $NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY
 
 write also a skill for this
+
+
+when pushing file to s3, create a directory below the bucket, with the following format:
+YYYY-MM-DD-HHMMSS-<source>-<target>-<random-uuid>
+this directory name is provided by the nexus-copy so that all file from the same transfer are in the sub-"folder", the rest of the file path is made of the full path name of the file.
+the date is UTC

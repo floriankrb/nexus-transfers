@@ -99,6 +99,12 @@ def test_make_key_uses_source_path():
     assert _s3.make_key("/a/b/c.txt") == "a/b/c.txt"
 
 
+def test_make_key_with_s3_prefix():
+    prefix = "2025-05-04-143025-src-dst-abcd1234"
+    assert _s3.make_key("/tmp/foo.bin", s3_prefix=prefix) == f"{prefix}/tmp/foo.bin"
+    assert _s3.make_key("/a/b/c.txt", s3_prefix=prefix) == f"{prefix}/a/b/c.txt"
+
+
 def test_split_bucket_spec_extracts_prefix():
     assert _s3._split_bucket_spec("my-bucket") == ("my-bucket", None)
     assert _s3._split_bucket_spec("s3://my-bucket") == ("my-bucket", None)

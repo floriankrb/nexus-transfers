@@ -60,10 +60,14 @@ class S3Transfer:
     ----------
     local_path
         Absolute path of the file to upload.
+    s3_prefix
+        Optional prefix prepended to the S3 key (e.g. a per-transfer
+        directory name).
     """
 
-    def __init__(self, local_path: str):
+    def __init__(self, local_path: str, s3_prefix: str | None = None):
         self.local_path = os.path.abspath(local_path)
+        self.s3_prefix = s3_prefix
 
 
 def resolve_safe_path(path, allowed_paths):
@@ -105,7 +109,7 @@ def make_get_file(allowed_paths):
     allowed_paths
         List of allowed base directories.
     """
-    def get_file(path, chunk_size=65536, use_s3=True):
+    def get_file(path, chunk_size=65536, use_s3=True, s3_prefix=None):
         """Read a file and return it for transfer.
 
         Parameters
@@ -118,10 +122,12 @@ def make_get_file(allowed_paths):
         use_s3
             If True (default), stage the file via the configured S3 bucket.
             Set to False to send binary chunks over the WebSocket.
+        s3_prefix
+            Optional prefix prepended to the S3 object key.
         """
         resolved = resolve_safe_path(path, allowed_paths)
         if use_s3:
-            return S3Transfer(resolved)
+            return S3Transfer(resolved, s3_prefix=s3_prefix)
         return FileTransfer(resolved, chunk_size=chunk_size)
 
     return get_file
