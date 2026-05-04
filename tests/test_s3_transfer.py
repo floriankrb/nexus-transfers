@@ -28,7 +28,12 @@ async def test_s3_file_transfer(server, tmp_path, shared_store):
         Client("sender", url=server, allowed_paths=[str(tmp_path)]) as sender,
         Client("receiver", url=server) as receiver,
     ):
-        data = await receiver.send("sender.get_file", str(src_file))
+        result = await receiver.send("sender.get_file", str(src_file))
+        # S3 path returns a temp file path; read and verify contents.
+        assert isinstance(result, str)
+        with open(result, "rb") as fh:
+            data = fh.read()
+        os.unlink(result)
         assert data == content
 
         # Cleanup propagates: drain the cleanup task and check the bucket.

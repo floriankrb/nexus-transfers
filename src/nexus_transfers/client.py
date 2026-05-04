@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import ssl
 import tempfile
 import traceback
@@ -17,6 +18,7 @@ from rich.progress import (BarColumn, Progress, ProgressColumn,
                            SpinnerColumn, TextColumn, TimeRemainingColumn)
 from rich.text import Text
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosedError
 
 from nexus_transfers.dispatch import (DISPATCH, FileTransfer, S3Transfer,
                                        make_get_file, make_list_dir)
@@ -157,6 +159,7 @@ class Client:
         self._binary_received: dict = {}
         self._binary_hashes: dict = {}
         self._binary_checksums: dict = {}
+        self._reconnect_lock = asyncio.Lock()
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -195,7 +198,7 @@ class Client:
 
         reg = encode_frame(self.name, "register", "", "J", b"{}")
         await self._ws.send(reg)
-        ack = await self._ws.recv()
+        ack = await asyncio.wait_for(self._ws.recv(), timeout=30)
 
         _, _src, msg_name, _tgt, _enc, payload = decode_frame(ack)
         match msg_name:
@@ -361,7 +364,7 @@ class Client:
                 timeout=self._MONITOR_TIMEOUT,
             )
         except Exception:
-            pass
+            _logger.debug("Monitor send failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Directory / file transfer helpers
@@ -479,6 +482,8 @@ class Client:
                             await asyncio.sleep(self.peer_delay)
 
                     os.makedirs(os.path.dirname(local_file), exist_ok=True)
+                    file_size = (os.path.getsize(data) if isinstance(data, str)
+                                 else len(data))
                     # Skip writing if the local file already has the same size.
                     skip = False
                     if os.path.isfile(local_file):
@@ -486,14 +491,21 @@ class Client:
                             local_size = os.path.getsize(local_file)
                         except OSError:
                             local_size = -1
-                        if local_size == len(data):
+                        if local_size == file_size:
                             skip = True
                             _logger.debug("Skipping %s (local size matches)",
                                           os.path.basename(local_file))
+                            if isinstance(data, str):
+                                os.unlink(data)
                     if not skip:
-                        await loop.run_in_executor(
-                            None, _write_file, local_file, data)
-                    total_bytes += len(data)
+                        if isinstance(data, str):
+                            # S3 download returned a temp file path — move it.
+                            await loop.run_in_executor(
+                                None, shutil.move, data, local_file)
+                        else:
+                            await loop.run_in_executor(
+                                None, _write_file, local_file, data)
+                    total_bytes += file_size
                     done_count += 1
                     self._progress.update(copy_task, completed=done_count)
 
@@ -707,8 +719,8 @@ class Client:
                                   info: dict):
         """Download an S3-staged file then ask the source to delete it.
 
-        Resolves the original ``send`` future with the file bytes once the
-        download completes and the checksum verifies.
+        Resolves the original ``send`` future with the temp file path once
+        the download completes and the checksum verifies.
         """
         from nexus_transfers import s3 as _s3
 
@@ -725,7 +737,7 @@ class Client:
 
         try:
             data = await loop.run_in_executor(
-                None, _s3.download_bytes, s3_key, checksum, _on_progress,
+                None, _s3.download_file, s3_key, checksum, _on_progress,
                 None, bucket,
             )
         except Exception as exc:
@@ -1040,6 +1052,10 @@ class Client:
                 except (NameTakenError, ConnectionError):
                     raise
                 except Exception:
+                    _logger.error(
+                        "Listener exiting: reconnection failed after "
+                        "clean disconnect", exc_info=True,
+                    )
                     return
 
             except asyncio.CancelledError:
@@ -1047,6 +1063,24 @@ class Client:
             except Exception as exc:
                 if self._closed:
                     return
+                # Close code 1009 = message too big — do not reconnect
+                # (reconnecting would reproduce the same oversized reply).
+                if (
+                    isinstance(exc, ConnectionClosedError)
+                    and exc.rcvd is not None
+                    and exc.rcvd.code == 1009
+                ):
+                    _logger.error(
+                        "Connection closed: message too big (1009). "
+                        "Increase max_size or reduce payload."
+                    )
+                    for future in self._pending.values():
+                        if not future.done():
+                            future.set_exception(
+                                ConnectionError("message too big (1009)")
+                            )
+                    self._pending.clear()
+                    raise
                 _logger.warning("Connection lost: %s", exc)
                 # Fail all pending futures so callers don't hang.
                 for future in self._pending.values():
@@ -1058,6 +1092,9 @@ class Client:
                 except (NameTakenError, ConnectionError):
                     raise
                 except Exception:
+                    _logger.error(
+                        "Listener exiting: reconnection failed", exc_info=True,
+                    )
                     return
 
 

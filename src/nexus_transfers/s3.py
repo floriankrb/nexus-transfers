@@ -20,6 +20,8 @@ Configuration is read from the environment:
 import hashlib
 import logging
 import os
+import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +39,8 @@ S3_SECRET_KEY_ENV = "NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY"
 S3_VHOST_ENV = "NEXUS_TRANSFER_S3_VIRTUAL_HOSTED_STYLE"
 
 _STREAM_CHUNK = 1024 * 1024
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0  # seconds; doubled each attempt
 
 
 def is_configured() -> bool:
@@ -198,7 +202,7 @@ def upload_file(
     bucket = _env_bucket()
     s3_key = make_key(local_path, s3_prefix=s3_prefix)
     size = os.path.getsize(local_path)
-    hasher = hashlib.sha256()
+    hasher = None
     logger.debug("S3 upload: %s -> s3://%s/%s", local_path, bucket, s3_key)
 
     def _chunks():
@@ -212,20 +216,37 @@ def upload_file(
                     progress_callback(len(chunk))
                 yield chunk
 
-    obs.put(store, s3_key, _chunks())
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            hasher = hashlib.sha256()
+            obs.put(store, s3_key, _chunks())
+            break
+        except Exception:
+            if attempt == _MAX_RETRIES:
+                raise
+            delay = _RETRY_BASE_DELAY * 2 ** (attempt - 1)
+            logger.warning(
+                "S3 upload attempt %d/%d for %s failed, retrying in %.1fs …",
+                attempt, _MAX_RETRIES, s3_key, delay,
+            )
+            time.sleep(delay)
     checksum = hasher.hexdigest()
     logger.debug("Upload of %s successful", local_path)
     return bucket, s3_key, size, checksum
 
 
-def download_bytes(
+def download_file(
     s3_key: str,
     expected_checksum: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
     target: str | None = None,
     bucket: str | None = None,
-) -> bytes:
-    """Download an object from S3, verify its checksum, and return its bytes.
+) -> str:
+    """Download an object from S3 to a temporary file.
+
+    Streams directly to disk so arbitrarily large files never need to
+    fit in memory.  Returns the path to the temp file.  The caller is
+    responsible for moving or deleting it.
 
     Parameters
     ----------
@@ -243,30 +264,82 @@ def download_bytes(
     """
     store = get_store(bucket=bucket)
     bucket = bucket or _normalise_bucket(os.environ.get(S3_BUCKET_ENV, "?"))
-    target_label = target or "(memory)"
+    target_label = target or "(temp file)"
     logger.debug("S3 download: s3://%s/%s -> %s", bucket, s3_key, target_label)
-    result = obs.get(store, s3_key)
-    pieces: list[bytes] = []
-    hasher = hashlib.sha256()
-    for chunk in result.stream():
-        b = bytes(chunk)
-        hasher.update(b)
-        pieces.append(b)
-        if progress_callback is not None:
-            progress_callback(len(b))
-    data = b"".join(pieces)
-    actual = hasher.hexdigest()
-    if expected_checksum is not None and actual != expected_checksum:
-        raise ValueError(
-            f"S3 download checksum mismatch: expected {expected_checksum}, "
-            f"got {actual}"
-        )
-    logger.debug("Download of s3://%s/%s successful", bucket, s3_key)
-    return data
+
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            result = obs.get(store, s3_key)
+            fd, tmp_path = tempfile.mkstemp(prefix="nexus-s3-")
+            try:
+                hasher = hashlib.sha256()
+                with os.fdopen(fd, "wb") as fh:
+                    for chunk in result.stream():
+                        b = bytes(chunk)
+                        hasher.update(b)
+                        fh.write(b)
+                        if progress_callback is not None:
+                            progress_callback(len(b))
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
+
+            actual = hasher.hexdigest()
+            if expected_checksum is not None and actual != expected_checksum:
+                os.unlink(tmp_path)
+                raise ValueError(
+                    f"S3 download checksum mismatch: expected "
+                    f"{expected_checksum}, got {actual}"
+                )
+            logger.debug("Download of s3://%s/%s successful", bucket, s3_key)
+            return tmp_path
+        except ValueError:
+            # Checksum mismatches are not transient — do not retry.
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt == _MAX_RETRIES:
+                break
+            delay = _RETRY_BASE_DELAY * 2 ** (attempt - 1)
+            logger.warning(
+                "S3 download attempt %d/%d for %s failed (%s), "
+                "retrying in %.1fs …",
+                attempt, _MAX_RETRIES, s3_key, exc, delay,
+            )
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+def download_bytes(
+    s3_key: str,
+    expected_checksum: str | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    target: str | None = None,
+    bucket: str | None = None,
+) -> bytes:
+    """Download an object from S3 and return its content as bytes.
+
+    Thin wrapper around ``download_file`` for callers that need the data
+    in memory (e.g. tests).  For production transfers prefer
+    ``download_file`` which streams to disk.
+    """
+    tmp_path = download_file(
+        s3_key, expected_checksum=expected_checksum,
+        progress_callback=progress_callback, target=target, bucket=bucket,
+    )
+    try:
+        with open(tmp_path, "rb") as fh:
+            return fh.read()
+    finally:
+        os.unlink(tmp_path)
 
 
 def delete(s3_key: str) -> None:
     """Delete an object from the configured S3 bucket."""
     store = get_store()
-    obs.delete(store, s3_key)
-    logger.debug("Deleted s3://%s", s3_key)
+    try:
+        obs.delete(store, s3_key)
+        logger.debug("Deleted s3://%s", s3_key)
+    except Exception as exc:
+        logger.warning("Failed to delete s3://%s: %s", s3_key, exc)

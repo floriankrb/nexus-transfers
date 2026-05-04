@@ -85,7 +85,24 @@ async def relay_handler(websocket):
                             pass
                     await websocket.send(_err(client_name, f"unknown target '{target}'", msg_id=msg_id))
                     continue
-                await target_ws.send(raw)
+                try:
+                    await target_ws.send(raw)
+                except Exception as send_exc:
+                    logger.warning(
+                        "Relay %s -> %s failed: %s",
+                        client_name, target, send_exc,
+                    )
+                    msg_id = None
+                    if encoding == "J":
+                        try:
+                            msg_id = json.loads(payload).get("msg_id")
+                        except Exception:
+                            pass
+                    await websocket.send(
+                        _err(client_name, f"target '{target}' disconnected",
+                             msg_id=msg_id)
+                    )
+                    continue
                 logger.debug("relay %s -> %s: %s (%d bytes)",
                              client_name, target, msg_name, len(raw))
                 continue
