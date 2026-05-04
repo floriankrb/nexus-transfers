@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import traceback
 import uuid
 from pathlib import Path
@@ -32,8 +33,16 @@ def _trunc(s, limit=200):
 
 
 def _write_file(path, data):
-    with open(path, "wb") as fh:
-        fh.write(data)
+    """Write *data* to *path* atomically via a temp file + rename."""
+    dirpath = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=dirpath)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def _fmt_binary(n: float) -> str:
@@ -81,6 +90,14 @@ class RemoteError(Exception):
         self.remote_traceback = remote_traceback
 
 
+class PeerNotFoundError(RemoteError):
+    """Raised when the target peer is not registered on the relay."""
+
+
+class NameTakenError(Exception):
+    """Raised when another client already holds this name on the relay."""
+
+
 class Client:
     """Programmatic RPC client that connects to the relay server.
 
@@ -96,13 +113,34 @@ class Client:
     allowed_paths:
         List of directories that ``get_file`` and ``list_dir`` may access.
         If ``None``, file operations are disabled.
+    reconnect_retries:
+        Number of reconnection attempts when the server connection drops.
+        ``-1`` means infinite retries.  ``0`` disables reconnection.
+    reconnect_delay:
+        Seconds to wait between reconnection attempts.
+    peer_retries:
+        Number of retries when a target peer is not yet registered.
+        ``-1`` means infinite retries.  ``0`` means no retries.
+    peer_delay:
+        Seconds to wait between peer-not-found retries.
+    call_timeout:
+        Timeout in seconds for a single RPC call (waiting for a reply).
+        ``None`` means no timeout.
     """
 
-    def __init__(self, name, url=None, dispatch=None, allowed_paths=None):
+    def __init__(self, name, url=None, dispatch=None, allowed_paths=None,
+                 reconnect_retries=0, reconnect_delay=2.0,
+                 peer_retries=0, peer_delay=2.0,
+                 call_timeout=None):
         self.name = name
         self.url = url or _DEFAULT_URL
         self.dispatch = dispatch if dispatch is not None else dict(DISPATCH)
         self.allowed_paths = [os.path.realpath(p) for p in allowed_paths] if allowed_paths else []
+        self.reconnect_retries = reconnect_retries
+        self.reconnect_delay = reconnect_delay
+        self.peer_retries = peer_retries
+        self.peer_delay = peer_delay
+        self.call_timeout = call_timeout
         self._s3_keys: set[str] = set()
         if self.allowed_paths:
             self.dispatch["get_file"] = make_get_file(self.allowed_paths)
@@ -125,13 +163,14 @@ class Client:
         )
         self._progress_task_ids: dict = {}
         self._listener_task = None
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self):
-        """Connect to the server and register."""
+    async def _register(self):
+        """Send a register frame and wait for the acknowledgement."""
         extra_headers = {}
         user = os.environ.get("NEXUS_TRANSFERS_USER")
         password = os.environ.get("NEXUS_TRANSFERS_PASSWORD")
@@ -151,15 +190,22 @@ class Client:
             case "register":
                 pass
             case "error":
-                raise RuntimeError(f"Registration failed: {json.loads(payload).get('error')}")
+                error_msg = json.loads(payload).get("error", "")
+                if "already taken" in error_msg:
+                    raise NameTakenError(error_msg)
+                raise RuntimeError(f"Registration failed: {error_msg}")
             case _:
                 raise RuntimeError(f"Unexpected registration response: {msg_name!r}")
 
+    async def connect(self):
+        """Connect to the server and register, with optional retries."""
+        await self._register()
         self._progress.start()
         self._listener_task = asyncio.create_task(self._listener())
 
     async def close(self):
         """Disconnect from the server."""
+        self._closed = True
         if self._listener_task:
             self._listener_task.cancel()
             try:
@@ -176,6 +222,34 @@ class Client:
 
     async def __aexit__(self, *exc):
         await self.close()
+
+    # ------------------------------------------------------------------
+    # Reconnection
+    # ------------------------------------------------------------------
+
+    async def _reconnect(self):
+        """Attempt to re-establish the server connection.
+
+        Retries up to ``reconnect_retries`` times (``-1`` = infinite).
+        Raises ``NameTakenError`` immediately if the name is in use.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            if self.reconnect_retries != -1 and attempt > self.reconnect_retries:
+                _logger.error("Reconnection failed after %d attempts", attempt - 1)
+                raise ConnectionError("reconnection retries exhausted")
+            _logger.info("Reconnecting (attempt %d) in %.1fs …",
+                         attempt, self.reconnect_delay)
+            await asyncio.sleep(self.reconnect_delay)
+            try:
+                await self._register()
+                _logger.info("Reconnected successfully")
+                return
+            except NameTakenError:
+                raise
+            except Exception as exc:
+                _logger.warning("Reconnection attempt %d failed: %s", attempt, exc)
 
     # ------------------------------------------------------------------
     # Outgoing calls
@@ -197,21 +271,41 @@ class Client:
         ------
         RemoteError
             If the remote function raised an exception.
+        PeerNotFoundError
+            If the target peer is not registered and retries are exhausted.
+        asyncio.TimeoutError
+            If ``call_timeout`` is set and the reply does not arrive in time.
         """
         if "." not in target_func:
             raise ValueError(f"target_func must be '<target>.<func>', got '{target_func}'")
-        target, func_name = target_func.split(".", 1)
-        msg_id = str(uuid.uuid4())[:8]
-        future = asyncio.get_running_loop().create_future()
-        self._pending[msg_id] = future
 
-        body = {"msg_id": msg_id, "func": func_name, "args": list(args)}
-        if kwargs:
-            body["kwargs"] = kwargs
-        frame = encode_frame(self.name, "call", target, "J", json.dumps(body).encode())
-        _logger.debug("[send] call %s -> %s.%s (id=%s)", self.name, target, func_name, msg_id)
-        await self._ws.send(frame)
-        return await future
+        attempt = 0
+        while True:
+            target, func_name = target_func.split(".", 1)
+            msg_id = str(uuid.uuid4())[:8]
+            future = asyncio.get_running_loop().create_future()
+            self._pending[msg_id] = future
+
+            body = {"msg_id": msg_id, "func": func_name, "args": list(args)}
+            if kwargs:
+                body["kwargs"] = kwargs
+            frame = encode_frame(self.name, "call", target, "J", json.dumps(body).encode())
+            _logger.debug("[send] call %s -> %s.%s (id=%s)", self.name, target, func_name, msg_id)
+            await self._ws.send(frame)
+
+            try:
+                if self.call_timeout is not None:
+                    result = await asyncio.wait_for(future, self.call_timeout)
+                else:
+                    result = await future
+                return result
+            except PeerNotFoundError:
+                attempt += 1
+                if self.peer_retries != -1 and attempt > self.peer_retries:
+                    raise
+                _logger.info("Peer '%s' not found, retrying in %.1fs (attempt %d) …",
+                             target, self.peer_delay, attempt)
+                await asyncio.sleep(self.peer_delay)
 
     async def list_clients(self):
         """Return the list of currently connected client names."""
@@ -227,7 +321,7 @@ class Client:
 
     async def get_directory(self, target, remote_path, local_path,
                             max_concurrent=4, chunk_size=65536,
-                            use_s3=False):
+                            use_s3=True):
         """Recursively copy a remote directory to a local path.
 
         Resumes interrupted transfers by skipping files whose local size
@@ -245,11 +339,10 @@ class Client:
             Maximum number of parallel file transfers.
         chunk_size:
             Binary chunk size in bytes sent to the remote ``get_file``
-            (ignored when ``use_s3`` is True).
+            (only used when ``use_s3`` is False).
         use_s3:
-            If True, stage transfers through the S3 bucket configured via
-            ``NEXUS_TRANSFER_S3_*`` env vars instead of sending bytes over
-            the WebSocket.
+            If True (default), stage transfers through S3.  Set to False
+            to send file bytes over the WebSocket relay instead.
         """
         label = os.path.basename(remote_path.rstrip("/")) or remote_path
         file_list = []
@@ -266,9 +359,30 @@ class Client:
         if not file_list:
             return
 
+        # Filter out files already fully downloaded (resume support).
+        pending = []
+        skipped = 0
+        for remote_file, local_file, remote_size in file_list:
+            if remote_size is not None and os.path.isfile(local_file):
+                try:
+                    local_size = os.path.getsize(local_file)
+                except OSError:
+                    local_size = -1
+                if local_size == remote_size:
+                    skipped += 1
+                    continue
+            pending.append((remote_file, local_file))
+
+        if skipped:
+            self._progress.console.print(
+                f"Skipping [bold]{skipped}[/bold] already-complete file(s)"
+            )
+        if not pending:
+            return
+
         sem = asyncio.Semaphore(max_concurrent)
         copy_task = self._progress.add_task(
-            f"[cyan]Copying {label}[/cyan]", total=len(file_list), unit="files"
+            f"[cyan]Copying {label}[/cyan]", total=len(pending), unit="files"
         )
         loop = asyncio.get_running_loop()
         total_bytes = 0
@@ -288,7 +402,7 @@ class Client:
                 total_bytes += len(data)
                 self._progress.advance(copy_task)
 
-        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in file_list])
+        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in pending])
         self._progress.remove_task(copy_task)
 
         elapsed = loop.time() - start
@@ -307,7 +421,7 @@ class Client:
         limit = 10000
         while True:
             page = await self.send(f"{target}.list_dir", remote_path,
-                                   include_size=False, offset=offset, limit=limit)
+                                   include_size=True, offset=offset, limit=limit)
             entries.extend(page)
             if len(page) < limit:
                 break
@@ -320,7 +434,8 @@ class Client:
                 await self._walk_remote(target, remote_child, local_child,
                                          file_list, walk_task=walk_task)
             else:
-                file_list.append((remote_child, local_child))
+                remote_size = entry.get("size")
+                file_list.append((remote_child, local_child, remote_size))
                 if walk_task is not None:
                     self._progress.update(walk_task, completed=len(file_list))
 
@@ -580,95 +695,116 @@ class Client:
     # ------------------------------------------------------------------
 
     async def _listener(self):
-        """Background task that handles incoming frames."""
-        try:
-            async for raw in self._ws:
-                if not isinstance(raw, bytes):
-                    continue
-                try:
-                    _, source, msg_name, _target, encoding, payload = decode_frame(raw)
-                except ValueError:
-                    continue
+        """Background task that handles incoming frames.
 
-                _logger.debug("[recv] %s from %s", msg_name, source or "server")
+        When the WebSocket connection drops unexpectedly, attempts to
+        reconnect according to ``reconnect_retries`` / ``reconnect_delay``.
+        """
+        while True:
+            try:
+                async for raw in self._ws:
+                    if not isinstance(raw, bytes):
+                        continue
+                    try:
+                        _, source, msg_name, _target, encoding, payload = decode_frame(raw)
+                    except ValueError:
+                        continue
 
-                match msg_name:
-                    case "call":
-                        data = json.loads(payload)
-                        await self._dispatch_call(source, data.get("msg_id"), payload)
+                    _logger.debug("[recv] %s from %s", msg_name, source or "server")
 
-                    case "reply":
-                        data = json.loads(payload)
-                        msg_id = data.get("msg_id")
-                        if data.get("binary_transfer"):
-                            result_info = data.get("result", {})
-                            total_size = result_info.get("size", 0)
-                            total = result_info.get("total_chunks", 0)
-                            fname = result_info.get("name", "file")
-                            if total > 0:
-                                self._progress_task_ids[msg_id] = self._progress.add_task(
-                                    f"↓ {fname}", total=total_size
+                    match msg_name:
+                        case "call":
+                            data = json.loads(payload)
+                            await self._dispatch_call(source, data.get("msg_id"), payload)
+
+                        case "reply":
+                            data = json.loads(payload)
+                            msg_id = data.get("msg_id")
+                            if data.get("binary_transfer"):
+                                result_info = data.get("result", {})
+                                total_size = result_info.get("size", 0)
+                                total = result_info.get("total_chunks", 0)
+                                fname = result_info.get("name", "file")
+                                if total > 0:
+                                    self._progress_task_ids[msg_id] = self._progress.add_task(
+                                        f"↓ {fname}", total=total_size
+                                    )
+                                else:
+                                    future = self._pending.pop(msg_id, None)
+                                    if future and not future.done():
+                                        future.set_result(b"")
+                            elif data.get("s3_transfer"):
+                                asyncio.create_task(
+                                    self._handle_s3_download(msg_id, source,
+                                                              data.get("result", {}))
                                 )
                             else:
                                 future = self._pending.pop(msg_id, None)
                                 if future and not future.done():
-                                    future.set_result(b"")
-                        elif data.get("s3_transfer"):
-                            asyncio.create_task(
-                                self._handle_s3_download(msg_id, source,
-                                                          data.get("result", {}))
-                            )
-                        else:
-                            future = self._pending.pop(msg_id, None)
-                            if future and not future.done():
-                                if "error" in data:
-                                    future.set_exception(
-                                        RemoteError(data["error"], data.get("traceback"))
-                                    )
-                                else:
-                                    future.set_result(data.get("result"))
+                                    if "error" in data:
+                                        future.set_exception(
+                                            RemoteError(data["error"], data.get("traceback"))
+                                        )
+                                    else:
+                                        future.set_result(data.get("result"))
 
-                    case "chunk":
-                        completed = self._receive_chunk_payload(payload)
-                        if completed:
-                            msg_id, data, error = completed
+                        case "chunk":
+                            completed = self._receive_chunk_payload(payload)
+                            if completed:
+                                msg_id, data, error = completed
+                                future = self._pending.pop(msg_id, None)
+                                if future and not future.done():
+                                    if error:
+                                        future.set_exception(RemoteError(error))
+                                    else:
+                                        future.set_result(data)
+
+                        case "list_clients":
+                            data = json.loads(payload)
+                            future = self._pending.pop("__list_clients__", None)
+                            if future and not future.done():
+                                future.set_result(data.get("clients", []))
+
+                        case "error":
+                            data = json.loads(payload)
+                            error = data.get("error", "unknown error")
+                            msg_id = data.get("msg_id")
                             future = self._pending.pop(msg_id, None)
                             if future and not future.done():
-                                if error:
+                                if "unknown target" in error:
+                                    future.set_exception(PeerNotFoundError(error))
+                                else:
                                     future.set_exception(RemoteError(error))
-                                else:
-                                    future.set_result(data)
 
-                    case "list_clients":
-                        data = json.loads(payload)
-                        future = self._pending.pop("__list_clients__", None)
-                        if future and not future.done():
-                            future.set_result(data.get("clients", []))
+                        case _:
+                            _logger.debug("[recv] unhandled msg_name=%r from %s", msg_name, source)
 
-                    case "error":
-                        data = json.loads(payload)
-                        error = data.get("error", "unknown error")
-                        msg_id = data.get("msg_id")
-                        future = self._pending.pop(msg_id, None)
-                        if future and not future.done():
-                            future.set_exception(RemoteError(error))
-
-                    case _:
-                        _logger.debug("[recv] unhandled msg_name=%r from %s", msg_name, source)
-
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if self._closed:
+                    return
+                _logger.warning("Connection lost: %s", exc)
+                # Fail all pending futures so callers don't hang.
+                for future in self._pending.values():
+                    if not future.done():
+                        future.set_exception(ConnectionError("connection lost"))
+                self._pending.clear()
+                try:
+                    await self._reconnect()
+                except (NameTakenError, ConnectionError):
+                    raise
+                except Exception:
+                    return
 
 
 # ---------------------------------------------------------------------------
 # Headless / Interactive CLI
 # ---------------------------------------------------------------------------
 
-async def _serve(name, url, allowed_paths=None):
+async def _serve(name, url, allowed_paths=None, **client_kwargs):
     """Run the client as a headless RPC worker (no interactive prompt)."""
-    async with Client(name, url, allowed_paths=allowed_paths) as client:
+    async with Client(name, url, allowed_paths=allowed_paths, **client_kwargs) as client:
         funcs = ", ".join(client.dispatch.keys())
         print(f"Connected to {url} as '{name}'")
         print(f"Registered functions: {funcs}")
@@ -680,7 +816,7 @@ async def _serve(name, url, allowed_paths=None):
     print("Disconnected.")
 
 
-async def _interactive(name, url, allowed_paths=None):
+async def _interactive(name, url, allowed_paths=None, **client_kwargs):
     """Run the interactive client loop using cmd.Cmd and rich output."""
     import cmd as cmd_module
     import threading
@@ -694,7 +830,7 @@ async def _interactive(name, url, allowed_paths=None):
     })
     console = Console(theme=theme)
 
-    async with Client(name, url, allowed_paths=allowed_paths) as client:
+    async with Client(name, url, allowed_paths=allowed_paths, **client_kwargs) as client:
         funcs = ", ".join(client.dispatch.keys())
         console.print(f"Connected to [info]{client.url}[/info] as [label]'{name}'[/label]")
         console.print(f"Registered functions: [info]{funcs}[/info]")
@@ -855,6 +991,16 @@ def main():
                         help="Allowed directory for get_file/list_dir (repeatable)")
     parser.add_argument("--interactive", action="store_true",
                         help="Start an interactive prompt (default: headless RPC worker)")
+    parser.add_argument("--reconnect-retries", type=int, default=-1,
+                        help="Reconnection attempts on disconnect (-1 = infinite, default: -1)")
+    parser.add_argument("--reconnect-delay", type=float, default=2.0,
+                        help="Seconds between reconnection attempts (default: 2.0)")
+    parser.add_argument("--peer-retries", type=int, default=-1,
+                        help="Retries when target peer is not found (-1 = infinite, default: -1)")
+    parser.add_argument("--peer-delay", type=float, default=2.0,
+                        help="Seconds between peer-not-found retries (default: 2.0)")
+    parser.add_argument("--call-timeout", type=float, default=None,
+                        help="Timeout in seconds for RPC calls (default: no timeout)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
     from rich.logging import RichHandler
@@ -862,10 +1008,19 @@ def main():
         level=logging.DEBUG if args.debug else logging.INFO,
         handlers=[RichHandler(rich_tracebacks=True)],
     )
+    client_kwargs = dict(
+        reconnect_retries=args.reconnect_retries,
+        reconnect_delay=args.reconnect_delay,
+        peer_retries=args.peer_retries,
+        peer_delay=args.peer_delay,
+        call_timeout=args.call_timeout,
+    )
     coro = (
-        _interactive(args.name, args.server_url, allowed_paths=args.allow_path or None)
+        _interactive(args.name, args.server_url,
+                     allowed_paths=args.allow_path or None, **client_kwargs)
         if args.interactive
-        else _serve(args.name, args.server_url, allowed_paths=args.allow_path or None)
+        else _serve(args.name, args.server_url,
+                    allowed_paths=args.allow_path or None, **client_kwargs)
     )
     asyncio.run(coro)
 

@@ -109,7 +109,7 @@ def _build_store_from_env(bucket_override: str | None = None):
     secret_key = os.environ.get(S3_SECRET_KEY_ENV)
     if secret_key:
         kwargs["secret_access_key"] = secret_key
-    logger.info(
+    logger.debug(
         "S3 store: bucket=%r endpoint=%r virtual_hosted=%s",
         bucket, endpoint, kwargs.get("virtual_hosted_style_request"),
     )
@@ -186,7 +186,7 @@ def upload_file(
     s3_key = make_key(local_path)
     size = os.path.getsize(local_path)
     hasher = hashlib.sha256()
-    logger.info("S3 upload: %s -> s3://%s/%s", local_path, bucket, s3_key)
+    logger.debug("S3 upload: %s -> s3://%s/%s", local_path, bucket, s3_key)
 
     def _chunks():
         with open(local_path, "rb") as fh:
@@ -231,7 +231,7 @@ def download_bytes(
     store = get_store(bucket=bucket)
     bucket = bucket or _normalise_bucket(os.environ.get(S3_BUCKET_ENV, "?"))
     target_label = target or "(memory)"
-    logger.info("S3 download: s3://%s/%s -> %s", bucket, s3_key, target_label)
+    logger.debug("S3 download: s3://%s/%s -> %s", bucket, s3_key, target_label)
     result = obs.get(store, s3_key)
     pieces: list[bytes] = []
     hasher = hashlib.sha256()
@@ -256,4 +256,4 @@ def delete(s3_key: str) -> None:
     """Delete an object from the configured S3 bucket."""
     store = get_store()
     obs.delete(store, s3_key)
-    logger.info("Deleted s3://%s", s3_key)
+    logger.debug("Deleted s3://%s", s3_key)

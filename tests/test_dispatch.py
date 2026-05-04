@@ -58,7 +58,7 @@ class TestMakeGetFile:
         f = tmp_path / "data.bin"
         f.write_bytes(b"hello")
         get_file = make_get_file([str(tmp_path)])
-        result = get_file(str(f))
+        result = get_file(str(f), use_s3=False)
         assert isinstance(result, FileTransfer)
         assert result.size == 5
 

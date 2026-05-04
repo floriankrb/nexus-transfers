@@ -28,8 +28,7 @@ async def test_s3_file_transfer(server, tmp_path, shared_store):
         Client("sender", url=server, allowed_paths=[str(tmp_path)]) as sender,
         Client("receiver", url=server) as receiver,
     ):
-        data = await receiver.send("sender.get_file", str(src_file),
-                                   use_s3=True)
+        data = await receiver.send("sender.get_file", str(src_file))
         assert data == content
 
         # Cleanup propagates: drain the cleanup task and check the bucket.
@@ -58,7 +57,7 @@ async def test_s3_directory_transfer(server, tmp_path, shared_store):
         Client("srv", url=server, allowed_paths=[str(src)]) as srv,
         Client("cli", url=server) as cli,
     ):
-        await cli.get_directory("srv", str(src), str(dest), use_s3=True)
+        await cli.get_directory("srv", str(src), str(dest))
 
     assert (dest / "a.txt").read_text() == "hello"
     assert (dest / "sub" / "b.txt").read_text() == "world"

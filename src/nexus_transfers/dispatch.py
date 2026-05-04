@@ -105,7 +105,7 @@ def make_get_file(allowed_paths):
     allowed_paths
         List of allowed base directories.
     """
-    def get_file(path, chunk_size=65536, use_s3=False):
+    def get_file(path, chunk_size=65536, use_s3=True):
         """Read a file and return it for transfer.
 
         Parameters
@@ -113,10 +113,11 @@ def make_get_file(allowed_paths):
         path
             Path to the file to read.
         chunk_size
-            Size of each binary chunk in bytes (ignored when ``use_s3`` is True).
+            Size of each binary chunk in bytes (only used when ``use_s3``
+            is False).
         use_s3
-            If True, stage the file via the configured S3 bucket instead of
-            sending it as binary chunks over the WebSocket.
+            If True (default), stage the file via the configured S3 bucket.
+            Set to False to send binary chunks over the WebSocket.
         """
         resolved = resolve_safe_path(path, allowed_paths)
         if use_s3:
@@ -148,9 +149,9 @@ def make_list_dir(allowed_paths):
         limit
             Maximum number of entries to return.
         """
-        logger.info("list_dir called with path=%r, include_size=%s, offset=%d, limit=%d", path, include_size, offset, limit)
+        logger.debug("list_dir called with path=%r, include_size=%s, offset=%d, limit=%d", path, include_size, offset, limit)
         resolved = resolve_safe_path(path, allowed_paths)
-        logger.info("Resolved path: %s", resolved)
+        logger.debug("Resolved path: %s", resolved)
         if not os.path.isdir(resolved):
             raise NotADirectoryError(f"not a directory: {path}")
         entries = []
@@ -164,7 +165,7 @@ def make_list_dir(allowed_paths):
                     info["size"] = entry.stat(follow_symlinks=False).st_size
                 entries.append(info)
         page = entries[offset:offset + limit]
-        logger.info("Returning %d/%d entries (offset=%d) in %s", len(page), len(entries), offset, resolved)
+        logger.debug("Returning %d/%d entries (offset=%d) in %s", len(page), len(entries), offset, resolved)
         return page
 
     return list_dir

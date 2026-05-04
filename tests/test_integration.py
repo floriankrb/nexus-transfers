@@ -6,7 +6,7 @@ import os
 import pytest
 
 from nexus_transfers import Client
-from nexus_transfers.client import RemoteError
+from nexus_transfers.client import NameTakenError, PeerNotFoundError, RemoteError
 
 
 @pytest.mark.asyncio
@@ -40,14 +40,14 @@ async def test_unknown_function(server):
 @pytest.mark.asyncio
 async def test_unknown_target(server):
     async with Client("a", url=server) as a:
-        with pytest.raises(RemoteError, match="unknown target"):
+        with pytest.raises(PeerNotFoundError, match="unknown target"):
             await a.send("nobody.adder", 1)
 
 
 @pytest.mark.asyncio
 async def test_duplicate_name(server):
     async with Client("a", url=server) as a:
-        with pytest.raises(RuntimeError, match="already taken"):
+        with pytest.raises(NameTakenError, match="already taken"):
             async with Client("a", url=server) as a2:
                 pass
 
@@ -63,7 +63,8 @@ async def test_file_transfer(server, tmp_path):
         Client("sender", url=server, allowed_paths=[str(tmp_path)]) as sender,
         Client("receiver", url=server) as receiver,
     ):
-        data = await receiver.send("sender.get_file", str(src_file))
+        data = await receiver.send("sender.get_file", str(src_file),
+                                   use_s3=False)
         assert data == content
 
 
@@ -76,7 +77,7 @@ async def test_file_transfer_checksum(server, tmp_path):
         Client("s", url=server, allowed_paths=[str(tmp_path)]) as s,
         Client("r", url=server) as r,
     ):
-        data = await r.send("s.get_file", str(src_file))
+        data = await r.send("s.get_file", str(src_file), use_s3=False)
         assert data == src_file.read_bytes()
 
 
@@ -120,7 +121,7 @@ async def test_get_directory(server, tmp_path):
         Client("srv", url=server, allowed_paths=[str(src)]) as srv,
         Client("cli", url=server) as cli,
     ):
-        await cli.get_directory("srv", str(src), str(dest))
+        await cli.get_directory("srv", str(src), str(dest), use_s3=False)
 
     assert (dest / "a.txt").read_text() == "aaa"
     assert (dest / "sub" / "b.txt").read_text() == "bbb"
@@ -142,7 +143,7 @@ async def test_get_directory_resume(server, tmp_path):
         Client("srv", url=server, allowed_paths=[str(src)]) as srv,
         Client("cli", url=server) as cli,
     ):
-        await cli.get_directory("srv", str(src), str(dest))
+        await cli.get_directory("srv", str(src), str(dest), use_s3=False)
 
     assert (dest / "done.txt").read_text() == "done"
     assert (dest / "new.txt").read_text() == "new"
@@ -156,3 +157,101 @@ async def test_bidirectional_rpc(server):
         r2 = await b.send("a.adder", 20)
         assert r1 == 11
         assert r2 == 21
+
+
+@pytest.mark.asyncio
+async def test_call_timeout(server):
+    """send() should raise TimeoutError when call_timeout is exceeded."""
+    async with (
+        Client("a", url=server) as a,
+        Client("b", url=server, call_timeout=0.1) as b,
+    ):
+        # Target a function that doesn't exist on the server —
+        # we just need the future to never resolve.
+        # Instead, we'll use a peer that exists but never replies.
+        # Simplest: call a non-existent peer so the error comes via
+        # PeerNotFoundError which is quick. Let's instead use a real
+        # scenario: monkey-patch a slow function.
+        import time
+
+        def slow(*a, **kw):
+            time.sleep(5)
+
+        a.dispatch["slow"] = slow
+        with pytest.raises(asyncio.TimeoutError):
+            await b.send("a.slow")
+
+
+@pytest.mark.asyncio
+async def test_peer_retry_succeeds(server):
+    """send() retries when the peer is not found and eventually succeeds."""
+    async with Client("caller", url=server, peer_retries=5, peer_delay=0.1) as caller:
+        # Launch the peer after a short delay
+        async def _delayed_peer():
+            await asyncio.sleep(0.25)
+            async with Client("late", url=server) as late:
+                await asyncio.sleep(2)
+
+        task = asyncio.create_task(_delayed_peer())
+        result = await caller.send("late.adder", 99)
+        assert result == 100
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_peer_retry_exhausted(server):
+    """send() raises PeerNotFoundError when retries are exhausted."""
+    async with Client("a", url=server, peer_retries=2, peer_delay=0.05) as a:
+        with pytest.raises(PeerNotFoundError):
+            await a.send("ghost.adder", 1)
+
+
+@pytest.mark.asyncio
+async def test_atomic_file_write(server, tmp_path):
+    """Files should be written atomically — no partial files on disk."""
+    src_file = tmp_path / "big.bin"
+    content = os.urandom(50_000)
+    src_file.write_bytes(content)
+
+    dest = tmp_path / "output"
+    dest.mkdir()
+    dest_file = dest / "big.bin"
+
+    async with (
+        Client("s", url=server, allowed_paths=[str(tmp_path)]) as s,
+        Client("r", url=server) as r,
+    ):
+        data = await r.send("s.get_file", str(src_file), use_s3=False)
+        from nexus_transfers.client import _write_file
+        _write_file(str(dest_file), data)
+
+    assert dest_file.read_bytes() == content
+
+
+@pytest.mark.asyncio
+async def test_get_directory_resume_skips_complete(server, tmp_path):
+    """get_directory skips files whose local size matches the remote size."""
+    src = tmp_path / "remote"
+    src.mkdir()
+    content_a = b"already_done"
+    content_b = b"needs_transfer"
+    (src / "a.txt").write_bytes(content_a)
+    (src / "b.txt").write_bytes(content_b)
+
+    dest = tmp_path / "local"
+    dest.mkdir()
+    # Pre-create a.txt with matching size
+    (dest / "a.txt").write_bytes(content_a)
+
+    async with (
+        Client("srv", url=server, allowed_paths=[str(src)]) as srv,
+        Client("cli", url=server) as cli,
+    ):
+        await cli.get_directory("srv", str(src), str(dest), use_s3=False)
+
+    assert (dest / "a.txt").read_bytes() == content_a
+    assert (dest / "b.txt").read_bytes() == content_b

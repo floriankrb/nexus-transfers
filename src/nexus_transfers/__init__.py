@@ -1,6 +1,6 @@
 """Nexus Transfers – WebSocket relay server and RPC client."""
 
-from nexus_transfers.client import Client
+from nexus_transfers.client import Client, NameTakenError, PeerNotFoundError, RemoteError
 from nexus_transfers.dispatch import (
     DISPATCH,
     FileTransfer,
@@ -16,6 +16,9 @@ __all__ = [
     "Client",
     "DISPATCH",
     "FileTransfer",
+    "NameTakenError",
+    "PeerNotFoundError",
+    "RemoteError",
     "S3Transfer",
     "adder",
     "echo",

@@ -51,9 +51,39 @@ def main():
         help="Binary chunk size in bytes for file transfers (default: 65536)",
     )
     parser.add_argument(
-        "--use-s3",
+        "--use-server",
         action="store_true",
-        help="Stage transfers through S3 (requires NEXUS_TRANSFER_S3_* env vars)",
+        help="Transfer via the WebSocket relay instead of S3 staging",
+    )
+    parser.add_argument(
+        "--reconnect-retries",
+        type=int,
+        default=-1,
+        help="Reconnection attempts on disconnect (-1 = infinite, default: -1)",
+    )
+    parser.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=2.0,
+        help="Seconds between reconnection attempts (default: 2.0)",
+    )
+    parser.add_argument(
+        "--peer-retries",
+        type=int,
+        default=-1,
+        help="Retries when target peer is not found (-1 = infinite, default: -1)",
+    )
+    parser.add_argument(
+        "--peer-delay",
+        type=float,
+        default=2.0,
+        help="Seconds between peer-not-found retries (default: 2.0)",
+    )
+    parser.add_argument(
+        "--call-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for RPC calls (default: no timeout)",
     )
     parser.add_argument(
         "--debug",
@@ -79,19 +109,24 @@ def main():
             target=args.target,
             max_concurrent=args.max_concurrent,
             chunk_size=args.chunk_size,
-            use_s3=args.use_s3,
+            use_s3=not args.use_server,
+            reconnect_retries=args.reconnect_retries,
+            reconnect_delay=args.reconnect_delay,
+            peer_retries=args.peer_retries,
+            peer_delay=args.peer_delay,
+            call_timeout=args.call_timeout,
         )
     )
 
 
 async def _copy(name, url, remote_client, source, target, max_concurrent,
-                chunk_size, use_s3=False):
+                chunk_size, use_s3=True, **client_kwargs):
     """Connect to the relay and copy a remote directory."""
     target = os.path.expanduser(target)
     console = Console()
-    async with Client(name, url) as client:
+    async with Client(name, url, **client_kwargs) as client:
         console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
-        via = " [dim](via S3)[/dim]" if use_s3 else ""
+        via = "" if use_s3 else " [dim](via server)[/dim]"
         console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{target}[/yellow]{via}")
         await client.get_directory(remote_client, source, target,
                                    max_concurrent=max_concurrent,
