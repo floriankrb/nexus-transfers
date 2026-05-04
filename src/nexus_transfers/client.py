@@ -217,10 +217,21 @@ class Client:
         await self._register()
         self._progress.start()
         self._listener_task = asyncio.create_task(self._listener())
+        await self.monitor(
+            f"{self.name}: connected to {self.url}",
+            status="ok",
+        )
 
     async def close(self):
         """Disconnect from the server."""
         self._closed = True
+        # Emit before cancelling the listener — monitor() awaits a reply
+        # frame that only the listener can dispatch.
+        if self._ws is not None:
+            await self.monitor(
+                f"{self.name}: disconnecting from {self.url}",
+                status="info",
+            )
         if self._listener_task:
             self._listener_task.cancel()
             try:
@@ -260,6 +271,14 @@ class Client:
             try:
                 await self._register()
                 _logger.info("Reconnected successfully")
+                # Schedule on its own task: _reconnect runs inside the
+                # listener, and monitor() awaits a reply that only the
+                # listener can deliver — awaiting here would deadlock.
+                asyncio.create_task(self.monitor(
+                    f"{self.name}: reconnected to {self.url} "
+                    f"after {attempt} attempt(s)",
+                    status="ok",
+                ))
                 return
             except NameTakenError:
                 raise

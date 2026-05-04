@@ -279,9 +279,14 @@ async def test_monitor_receives_messages(server):
         # Give the monitor a moment to process
         await asyncio.sleep(0.1)
 
-    assert len(received) == 2
-    assert received[0] == ("hello world", "ok")
-    assert received[1] == ("just a message", None)
+    # Filter out lifecycle events emitted by connect()/close() so the
+    # assertion focuses on the explicit monitor() calls above.
+    payload = [(msg, status) for msg, status in received
+               if "connected to" not in msg and "disconnecting" not in msg]
+    assert payload == [("hello world", "ok"), ("just a message", None)]
+    # And confirm the lifecycle events were observed too.
+    assert any("worker: connected to" in msg for msg, _ in received)
+    assert any("worker: disconnecting from" in msg for msg, _ in received)
 
 
 @pytest.mark.asyncio
