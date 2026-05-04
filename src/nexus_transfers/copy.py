@@ -124,6 +124,7 @@ def main():
             remote_client=args.remote_client,
             source=args.source,
             target=args.target,
+            site=args.site,
             max_concurrent=args.max_concurrent,
             chunk_size=args.chunk_size,
             use_s3=not args.use_server,
@@ -138,17 +139,19 @@ def main():
     )
 
 
-async def _copy(name, url, remote_client, source, target, max_concurrent,
-                chunk_size, use_s3=True, track_bytes=False, **client_kwargs):
+async def _copy(name, url, remote_client, source, target, site=None,
+                max_concurrent=4, chunk_size=65536, use_s3=True,
+                track_bytes=False, **client_kwargs):
     """Connect to the relay and copy a remote directory."""
     target = os.path.expanduser(target)
     console = Console()
     async with Client(name, url, **client_kwargs) as client:
         console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
         via = "" if use_s3 else " [dim](via server)[/dim]"
-        console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{target}[/yellow]{via}")
+        dest_label = f"{site}:{target}" if site else target
+        console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{dest_label}[/yellow]{via}")
         await client.monitor(
-            f"{name}: starting copy {remote_client}:{source} -> {target}",
+            f"{name}: starting copy {remote_client}:{source} -> {dest_label}",
             status="progress",
         )
         s3_prefix = None
@@ -162,7 +165,7 @@ async def _copy(name, url, remote_client, source, target, max_concurrent,
                                    s3_prefix=s3_prefix,
                                    track_bytes=track_bytes)
         await client.monitor(
-            f"{name}: copy complete {remote_client}:{source} -> {target}",
+            f"{name}: copy complete {remote_client}:{source} -> {dest_label}",
             status="ok",
         )
         console.print("[bold green]Done.[/bold green]")

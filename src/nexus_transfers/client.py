@@ -488,6 +488,12 @@ class Client:
                             "Transfer of %s failed (%s), retrying in %.1fs \u2026",
                             os.path.basename(remote_file), exc, self.peer_delay,
                         )
+                        await self.monitor(
+                            f"{self.name}: transfer of "
+                            f"{os.path.basename(remote_file)} failed "
+                            f"({type(exc).__name__}), retrying …",
+                            status="warning",
+                        )
                         await asyncio.sleep(self.peer_delay)
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
@@ -535,9 +541,24 @@ class Client:
         offset = 0
         limit = 10000
         while True:
-            page = await self.send(f"{target}.list_dir", remote_path,
-                                   include_size=include_size, offset=offset,
-                                   limit=limit)
+            while True:
+                try:
+                    page = await self.send(f"{target}.list_dir", remote_path,
+                                           include_size=include_size,
+                                           offset=offset, limit=limit)
+                    break
+                except (PeerNotFoundError, ConnectionError,
+                        asyncio.TimeoutError) as exc:
+                    _logger.warning(
+                        "Listing %s failed (%s), retrying in %.1fs …",
+                        remote_path, exc, self.peer_delay,
+                    )
+                    await self.monitor(
+                        f"{self.name}: listing {remote_path} failed "
+                        f"({type(exc).__name__}), retrying …",
+                        status="warning",
+                    )
+                    await asyncio.sleep(self.peer_delay)
             entries.extend(page)
             if len(page) < limit:
                 break
