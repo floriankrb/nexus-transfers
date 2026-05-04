@@ -28,3 +28,7 @@ when pushing file to s3, create a directory below the bucket, with the following
 YYYY-MM-DD-HHMMSS-<source>-<target>-<random-uuid>
 this directory name is provided by the nexus-copy so that all file from the same transfer are in the sub-"folder", the rest of the file path is made of the full path name of the file.
 the date is UTC
+
+
+nexus-copy should have the option --site which will be used (if given) instead of the word 'copy' in the generated name.
+add also an option --size, to show the progress in bytes instead of number of files, only ask for the remote sizes if this option is set.

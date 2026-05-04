@@ -368,7 +368,7 @@ class Client:
 
     async def get_directory(self, target, remote_path, local_path,
                             max_concurrent=4, chunk_size=65536,
-                            use_s3=True, s3_prefix=None):
+                            use_s3=True, s3_prefix=None, track_bytes=False):
         """Recursively copy a remote directory to a local path.
 
         Resumes interrupted transfers by skipping files whose local size
@@ -392,6 +392,9 @@ class Client:
             to send file bytes over the WebSocket relay instead.
         s3_prefix:
             Optional prefix prepended to S3 keys for this transfer batch.
+        track_bytes:
+            If True, show progress in bytes instead of file count.  This
+            requires fetching remote file sizes during the directory walk.
         """
         label = os.path.basename(remote_path.rstrip("/")) or remote_path
         file_list = []
@@ -399,7 +402,8 @@ class Client:
             f"[magenta]Listing {label}[/magenta]", total=None, unit="files"
         )
         await self._walk_remote(target, remote_path, local_path, file_list,
-                                walk_task=walk_task)
+                                walk_task=walk_task,
+                                include_size=track_bytes)
         self._progress.remove_task(walk_task)
         self._progress.console.print(
             f"Discovered [bold]{len(file_list)}[/bold] file(s) under "
@@ -426,7 +430,7 @@ class Client:
                     skipped += 1
                     skipped_bytes += remote_size
                     continue
-            pending.append((remote_file, local_file))
+            pending.append((remote_file, local_file, remote_size))
 
         if skipped:
             _logger.info(
@@ -449,16 +453,23 @@ class Client:
             return
 
         sem = asyncio.Semaphore(max_concurrent)
-        copy_task = self._progress.add_task(
-            f"[cyan]Copying {label}[/cyan]", total=len(pending), unit="files"
-        )
+        if track_bytes:
+            pending_total = sum(s for _, _, s in pending if s is not None)
+            copy_task = self._progress.add_task(
+                f"[cyan]Copying {label}[/cyan]", total=pending_total,
+            )
+        else:
+            copy_task = self._progress.add_task(
+                f"[cyan]Copying {label}[/cyan]", total=len(pending),
+                unit="files",
+            )
         loop = asyncio.get_running_loop()
         total_bytes = 0
         done_count = 0
         start = loop.time()
         last_monitor_time = start
 
-        async def _transfer_one(remote_file, local_file):
+        async def _transfer_one(remote_file, local_file, remote_size):
             nonlocal total_bytes, done_count, last_monitor_time
             async with sem:
                 while True:
@@ -482,7 +493,10 @@ class Client:
                 await loop.run_in_executor(None, _write_file, local_file, data)
                 total_bytes += len(data)
                 done_count += 1
-                self._progress.advance(copy_task)
+                if track_bytes:
+                    self._progress.advance(copy_task, len(data))
+                else:
+                    self._progress.advance(copy_task)
 
                 # Send periodic progress to monitor (at most every 30s).
                 now = loop.time()
@@ -497,7 +511,8 @@ class Client:
                         status="progress",
                     )
 
-        await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in pending])
+        await asyncio.gather(*[_transfer_one(rf, lf, rs)
+                               for rf, lf, rs in pending])
         self._progress.remove_task(copy_task)
 
         elapsed = loop.time() - start
@@ -514,14 +529,15 @@ class Client:
         await self.monitor(f"{self.name}: {summary}", status="ok")
 
     async def _walk_remote(self, target, remote_path, local_path, file_list,
-                            walk_task=None):
+                            walk_task=None, include_size=False):
         os.makedirs(local_path, exist_ok=True)
         entries = []
         offset = 0
         limit = 10000
         while True:
             page = await self.send(f"{target}.list_dir", remote_path,
-                                   include_size=True, offset=offset, limit=limit)
+                                   include_size=include_size, offset=offset,
+                                   limit=limit)
             entries.extend(page)
             if len(page) < limit:
                 break
@@ -532,7 +548,8 @@ class Client:
             local_child = os.path.join(local_path, name)
             if entry["type"] == "dir":
                 await self._walk_remote(target, remote_child, local_child,
-                                         file_list, walk_task=walk_task)
+                                         file_list, walk_task=walk_task,
+                                         include_size=include_size)
             else:
                 remote_size = entry.get("size")
                 file_list.append((remote_child, local_child, remote_size))

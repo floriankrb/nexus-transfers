@@ -92,6 +92,16 @@ def main():
         help="Skip TLS certificate verification for wss:// connections",
     )
     parser.add_argument(
+        "--site",
+        default=None,
+        help="Site label used in the auto-generated client name instead of 'copy'",
+    )
+    parser.add_argument(
+        "--size",
+        action="store_true",
+        help="Show transfer progress in bytes instead of file count",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -104,7 +114,8 @@ def main():
         handlers=[RichHandler(rich_tracebacks=True)],
     )
 
-    name = args.name or f"copy-{uuid.uuid4().hex[:8]}"
+    tag = args.site or "copy"
+    name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
 
     asyncio.run(
         _copy(
@@ -116,6 +127,7 @@ def main():
             max_concurrent=args.max_concurrent,
             chunk_size=args.chunk_size,
             use_s3=not args.use_server,
+            track_bytes=args.size,
             reconnect_retries=args.reconnect_retries,
             reconnect_delay=args.reconnect_delay,
             peer_retries=args.peer_retries,
@@ -127,7 +139,7 @@ def main():
 
 
 async def _copy(name, url, remote_client, source, target, max_concurrent,
-                chunk_size, use_s3=True, **client_kwargs):
+                chunk_size, use_s3=True, track_bytes=False, **client_kwargs):
     """Connect to the relay and copy a remote directory."""
     target = os.path.expanduser(target)
     console = Console()
@@ -147,7 +159,8 @@ async def _copy(name, url, remote_client, source, target, max_concurrent,
                                    max_concurrent=max_concurrent,
                                    chunk_size=chunk_size,
                                    use_s3=use_s3,
-                                   s3_prefix=s3_prefix)
+                                   s3_prefix=s3_prefix,
+                                   track_bytes=track_bytes)
         await client.monitor(
             f"{name}: copy complete {remote_client}:{source} -> {target}",
             status="ok",
