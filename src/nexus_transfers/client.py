@@ -184,16 +184,13 @@ class Client:
             extra_headers["Authorization"] = f"Basic {credentials}"
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
-        ssl_context = None
+        connect_kwargs: dict = {"additional_headers": extra_headers}
         if not self.ssl_verify and self.url.startswith("wss://"):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
-        self._ws = await connect(
-            self.url,
-            additional_headers=extra_headers,
-            ssl=ssl_context,
-        ).__aenter__()
+            connect_kwargs["ssl"] = ssl_context
+        self._ws = await connect(self.url, **connect_kwargs).__aenter__()
 
         reg = encode_frame(self.name, "register", "", "J", b"{}")
         await self._ws.send(reg)
