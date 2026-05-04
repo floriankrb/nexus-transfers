@@ -255,3 +255,42 @@ async def test_get_directory_resume_skips_complete(server, tmp_path):
 
     assert (dest / "a.txt").read_bytes() == content_a
     assert (dest / "b.txt").read_bytes() == content_b
+
+
+@pytest.mark.asyncio
+async def test_transfer_retries_on_peer_kill(server, tmp_path):
+    """Transfers retry and maintain parallelism when the peer dies and restarts."""
+    src = tmp_path / "remote"
+    src.mkdir()
+    for i in range(6):
+        (src / f"f{i}.txt").write_bytes(f"content-{i}".encode())
+
+    dest = tmp_path / "local"
+
+    async with Client("cli", url=server, call_timeout=1.0,
+                       peer_retries=-1, peer_delay=0.1) as cli:
+        # Start the provider, let it register
+        provider = Client("prov", url=server, allowed_paths=[str(src)])
+        await provider.connect()
+
+        # Start the directory copy in background
+        copy_task = asyncio.create_task(
+            cli.get_directory("prov", str(src), str(dest),
+                              max_concurrent=4, use_s3=False)
+        )
+
+        # Give it a moment then kill the provider
+        await asyncio.sleep(0.2)
+        await provider.close()
+
+        # Restart the provider after a short pause
+        await asyncio.sleep(0.3)
+        provider2 = Client("prov", url=server, allowed_paths=[str(src)])
+        await provider2.connect()
+
+        # Wait for copy to finish
+        await asyncio.wait_for(copy_task, timeout=30)
+        await provider2.close()
+
+    for i in range(6):
+        assert (dest / f"f{i}.txt").read_bytes() == f"content-{i}".encode()

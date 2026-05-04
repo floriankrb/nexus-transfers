@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import ssl
 import tempfile
 import traceback
 import uuid
@@ -126,12 +127,15 @@ class Client:
     call_timeout:
         Timeout in seconds for a single RPC call (waiting for a reply).
         ``None`` means no timeout.
+    ssl_verify:
+        If False, skip TLS certificate verification for ``wss://``
+        connections.  Defaults to True.
     """
 
     def __init__(self, name, url=None, dispatch=None, allowed_paths=None,
                  reconnect_retries=0, reconnect_delay=2.0,
                  peer_retries=0, peer_delay=2.0,
-                 call_timeout=None):
+                 call_timeout=None, ssl_verify=True):
         self.name = name
         self.url = url or _DEFAULT_URL
         self.dispatch = dispatch if dispatch is not None else dict(DISPATCH)
@@ -141,6 +145,7 @@ class Client:
         self.peer_retries = peer_retries
         self.peer_delay = peer_delay
         self.call_timeout = call_timeout
+        self.ssl_verify = ssl_verify
         self._s3_keys: set[str] = set()
         if self.allowed_paths:
             self.dispatch["get_file"] = make_get_file(self.allowed_paths)
@@ -179,7 +184,16 @@ class Client:
             extra_headers["Authorization"] = f"Basic {credentials}"
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
-        self._ws = await connect(self.url, additional_headers=extra_headers).__aenter__()
+        ssl_context = None
+        if not self.ssl_verify and self.url.startswith("wss://"):
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        self._ws = await connect(
+            self.url,
+            additional_headers=extra_headers,
+            ssl=ssl_context,
+        ).__aenter__()
 
         reg = encode_frame(self.name, "register", "", "J", b"{}")
         await self._ws.send(reg)
@@ -291,7 +305,12 @@ class Client:
                 body["kwargs"] = kwargs
             frame = encode_frame(self.name, "call", target, "J", json.dumps(body).encode())
             _logger.debug("[send] call %s -> %s.%s (id=%s)", self.name, target, func_name, msg_id)
-            await self._ws.send(frame)
+
+            try:
+                await self._ws.send(frame)
+            except Exception as exc:
+                self._pending.pop(msg_id, None)
+                raise ConnectionError(f"failed to send: {exc}") from exc
 
             try:
                 if self.call_timeout is not None:
@@ -299,7 +318,11 @@ class Client:
                 else:
                     result = await future
                 return result
+            except asyncio.TimeoutError:
+                self._pending.pop(msg_id, None)
+                raise
             except PeerNotFoundError:
+                self._pending.pop(msg_id, None)
                 attempt += 1
                 if self.peer_retries != -1 and attempt > self.peer_retries:
                     raise
@@ -391,12 +414,22 @@ class Client:
         async def _transfer_one(remote_file, local_file):
             nonlocal total_bytes
             async with sem:
-                if use_s3:
-                    data = await self.send(f"{target}.get_file", remote_file,
-                                           use_s3=True)
-                else:
-                    data = await self.send(f"{target}.get_file", remote_file,
-                                           chunk_size=chunk_size)
+                while True:
+                    try:
+                        if use_s3:
+                            data = await self.send(f"{target}.get_file", remote_file,
+                                                   use_s3=True)
+                        else:
+                            data = await self.send(f"{target}.get_file", remote_file,
+                                                   chunk_size=chunk_size)
+                        break
+                    except (PeerNotFoundError, ConnectionError,
+                            asyncio.TimeoutError) as exc:
+                        _logger.warning(
+                            "Transfer of %s failed (%s), retrying in %.1fs \u2026",
+                            os.path.basename(remote_file), exc, self.peer_delay,
+                        )
+                        await asyncio.sleep(self.peer_delay)
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
                 total_bytes += len(data)
@@ -1001,6 +1034,8 @@ def main():
                         help="Seconds between peer-not-found retries (default: 2.0)")
     parser.add_argument("--call-timeout", type=float, default=None,
                         help="Timeout in seconds for RPC calls (default: no timeout)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip TLS certificate verification for wss:// connections")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
     from rich.logging import RichHandler
@@ -1014,6 +1049,7 @@ def main():
         peer_retries=args.peer_retries,
         peer_delay=args.peer_delay,
         call_timeout=args.call_timeout,
+        ssl_verify=not args.no_verify,
     )
     coro = (
         _interactive(args.name, args.server_url,

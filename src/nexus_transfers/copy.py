@@ -86,6 +86,11 @@ def main():
         help="Timeout in seconds for RPC calls (default: no timeout)",
     )
     parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip TLS certificate verification for wss:// connections",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -115,6 +120,7 @@ def main():
             peer_retries=args.peer_retries,
             peer_delay=args.peer_delay,
             call_timeout=args.call_timeout,
+            ssl_verify=not args.no_verify,
         )
     )
 
