@@ -22,6 +22,7 @@ from websockets.exceptions import ConnectionClosedError
 from nexus_transfers._progress import (
     _BinarySpeedColumn, _CountOrBytesColumn, _fmt_binary,
 )
+from nexus_transfers.config import cli_default, resolve
 from nexus_transfers.dispatch import (DISPATCH, FileTransfer, S3Transfer,
                                        make_get_file, make_list_dir)
 from nexus_transfers.protocol import decode_frame, encode_frame
@@ -29,7 +30,7 @@ from nexus_transfers.protocol import decode_frame, encode_frame
 load_dotenv(Path.home() / ".env")
 
 _logger = logging.getLogger(__name__)
-_DEFAULT_URL = os.environ.get("NEXUS_TRANSFERS_URL", "ws://localhost:8766")
+_DEFAULT_URL = resolve("NEXUS_TRANSFERS_URL", default="ws://localhost:8766")
 
 
 def _trunc(s, limit=200):
@@ -1286,25 +1287,35 @@ def main():
 
     parser = argparse.ArgumentParser(description="Transfer RPC client")
     parser.add_argument("--name", required=True, help="Unique client ID")
-    parser.add_argument("--server-url", default=None,
+    parser.add_argument("--server-url",
+                        default=cli_default("server_url", "client", default=None),
                         help=f"Server WebSocket URL (default: {_DEFAULT_URL})")
     parser.add_argument("--allow-path", action="append", default=[],
                         help="Allowed directory for get_file/list_dir (repeatable)")
     parser.add_argument("--interactive", action="store_true",
+                        default=cli_default("interactive", "client", default=False),
                         help="Start an interactive prompt (default: headless RPC worker)")
-    parser.add_argument("--reconnect-retries", type=int, default=-1,
+    parser.add_argument("--reconnect-retries", type=int,
+                        default=cli_default("reconnect_retries", "client", default=-1, type_fn=int),
                         help="Reconnection attempts on disconnect (-1 = infinite, default: -1)")
-    parser.add_argument("--reconnect-delay", type=float, default=2.0,
+    parser.add_argument("--reconnect-delay", type=float,
+                        default=cli_default("reconnect_delay", "client", default=2.0, type_fn=float),
                         help="Seconds between reconnection attempts (default: 2.0)")
-    parser.add_argument("--peer-retries", type=int, default=-1,
+    parser.add_argument("--peer-retries", type=int,
+                        default=cli_default("peer_retries", "client", default=-1, type_fn=int),
                         help="Retries when target peer is not found (-1 = infinite, default: -1)")
-    parser.add_argument("--peer-delay", type=float, default=2.0,
+    parser.add_argument("--peer-delay", type=float,
+                        default=cli_default("peer_delay", "client", default=2.0, type_fn=float),
                         help="Seconds between peer-not-found retries (default: 2.0)")
-    parser.add_argument("--call-timeout", type=float, default=None,
+    parser.add_argument("--call-timeout", type=float,
+                        default=cli_default("call_timeout", "client", default=None, type_fn=float),
                         help="Timeout in seconds for RPC calls (default: no timeout)")
     parser.add_argument("--no-verify", action="store_true",
+                        default=cli_default("no_verify", "client", default=False),
                         help="Skip TLS certificate verification for wss:// connections")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--debug", action="store_true",
+                        default=cli_default("debug", "client", default=False),
+                        help="Enable debug logging")
     args = parser.parse_args()
     from rich.logging import RichHandler
     logging.basicConfig(

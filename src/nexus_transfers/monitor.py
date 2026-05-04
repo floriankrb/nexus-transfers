@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timezone
 
 from nexus_transfers.client import Client, _DEFAULT_URL
+from nexus_transfers.config import cli_default
 from nexus_transfers.dispatch import DISPATCH
 from rich.console import Console
 
@@ -29,29 +30,31 @@ def main():
     )
     parser.add_argument(
         "--server-url",
-        default=None,
+        default=cli_default("server_url", "monitor", default=None),
         help=f"Server WebSocket URL (default: {_DEFAULT_URL})",
     )
     parser.add_argument(
         "--reconnect-retries",
         type=int,
-        default=-1,
+        default=cli_default("reconnect_retries", "monitor", default=-1, type_fn=int),
         help="Reconnection attempts on disconnect (-1 = infinite, default: -1)",
     )
     parser.add_argument(
         "--reconnect-delay",
         type=float,
-        default=2.0,
+        default=cli_default("reconnect_delay", "monitor", default=2.0, type_fn=float),
         help="Seconds between reconnection attempts (default: 2.0)",
     )
     parser.add_argument(
         "--no-verify",
         action="store_true",
+        default=cli_default("no_verify", "monitor", default=False),
         help="Skip TLS certificate verification for wss:// connections",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
+        default=cli_default("debug", "monitor", default=False),
         help="Enable debug logging",
     )
     args = parser.parse_args()

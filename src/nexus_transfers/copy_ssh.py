@@ -20,6 +20,7 @@ from nexus_transfers._progress import (
     _BinarySpeedColumn, _CountOrBytesColumn, _fmt_binary,
 )
 from nexus_transfers.client import Client, _DEFAULT_URL
+from nexus_transfers.config import cli_default
 from nexus_transfers.ssh import SSHPool, stat_remote, write_file
 
 _logger = logging.getLogger(__name__)
@@ -270,39 +271,52 @@ def main() -> None:
         help="Remote target: [user@]host:/remote/path",
     )
     parser.add_argument(
-        "--server-url", default=None,
+        "--server-url",
+        default=cli_default("server_url", "copy_ssh", default=None),
         help=f"Relay WebSocket URL for monitoring (default: ${_DEFAULT_URL!r})",
     )
     parser.add_argument(
-        "--name", default=None,
+        "--name", default=cli_default("name", "copy_ssh", default=None),
         help="Client name on the relay (default: auto-generated)",
     )
     parser.add_argument(
-        "--site", default=None, help="Site label for monitor messages",
+        "--site",
+        default=cli_default("site", "copy_ssh", default=None),
+        help="Site label for monitor messages",
     )
     parser.add_argument(
-        "--max-concurrent", type=int, default=4,
+        "--max-concurrent", type=int,
+        default=cli_default("max_concurrent", "copy_ssh", default=4, type_fn=int),
         help="Number of parallel SFTP uploads (default: 4)",
     )
     parser.add_argument(
-        "--ssh-port", type=int, default=22, help="SSH port (default: 22)",
+        "--ssh-port", type=int,
+        default=cli_default("ssh_port", "copy_ssh", default=22, type_fn=int),
+        help="SSH port (default: 22)",
     )
     parser.add_argument(
-        "--ssh-key", default=None, help="Path to SSH private key",
+        "--ssh-key",
+        default=cli_default("ssh_key", "copy_ssh", default=None),
+        help="Path to SSH private key",
     )
     parser.add_argument(
-        "--ssh-connections", type=int, default=2,
+        "--ssh-connections", type=int,
+        default=cli_default("ssh_connections", "copy_ssh", default=2, type_fn=int),
         help="Number of SSH connections to open (default: 2)",
     )
     parser.add_argument(
         "--size", action="store_true",
+        default=cli_default("size", "copy_ssh", default=False),
         help="Show byte-based progress instead of file count",
     )
     parser.add_argument(
         "--no-verify", action="store_true",
+        default=cli_default("no_verify", "copy_ssh", default=False),
         help="Skip TLS verification for the relay connection",
     )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--debug", action="store_true",
+                        default=cli_default("debug", "copy_ssh", default=False),
+                        help="Enable debug logging")
     args = parser.parse_args()
 
     from rich.logging import RichHandler
