@@ -583,6 +583,66 @@ class Client:
                 if walk_task is not None:
                     self._progress.update(walk_task, completed=len(file_list))
 
+    async def _walk_remote_streamed(self, target, remote_path, local_path,
+                                     queue, walk_task=None,
+                                     include_size=False, _counter=None):
+        """Walk a remote directory and push files onto *queue* as discovered.
+
+        Unlike ``_walk_remote``, this feeds files to the queue page-by-page
+        so that downloads can start while listing is still in progress.
+        """
+        if _counter is None:
+            _counter = [0]
+        os.makedirs(local_path, exist_ok=True)
+        offset = 0
+        limit = 10000
+        while True:
+            while True:
+                try:
+                    page = await self.send(f"{target}.list_dir", remote_path,
+                                           include_size=include_size,
+                                           offset=offset, limit=limit)
+                    break
+                except (PeerNotFoundError, ConnectionError,
+                        asyncio.TimeoutError) as exc:
+                    _logger.warning(
+                        "Listing %s failed (%s), retrying in %.1fs …",
+                        remote_path, exc, self.peer_delay,
+                    )
+                    await self.monitor(
+                        f"{self.name}: listing {remote_path} failed "
+                        f"({type(exc).__name__}), retrying …",
+                        status="warning",
+                    )
+                    await asyncio.sleep(self.peer_delay)
+
+            dirs = []
+            for entry in page:
+                name = entry["name"]
+                remote_child = (f"{remote_path}/{name}"
+                                if remote_path != "." else name)
+                local_child = os.path.join(local_path, name)
+                if entry["type"] == "dir":
+                    dirs.append((remote_child, local_child))
+                else:
+                    remote_size = entry.get("size")
+                    _counter[0] += 1
+                    if walk_task is not None:
+                        self._progress.update(
+                            walk_task, completed=_counter[0])
+                    await queue.put((remote_child, local_child, remote_size))
+
+            if len(page) < limit:
+                break
+            offset += len(page)
+
+        for remote_child, local_child in dirs:
+            await self._walk_remote_streamed(
+                target, remote_child, local_child, queue,
+                walk_task=walk_task, include_size=include_size,
+                _counter=_counter,
+            )
+
     # ------------------------------------------------------------------
     # S3 staging (sending side)
     # ------------------------------------------------------------------
