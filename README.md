@@ -79,6 +79,30 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
     await asyncio.Future()  # keep running
 ```
 
+## Direct SSH copy (no relay required)
+
+`nexus-copy-to-ssh` copies a local directory straight to a remote host over
+SFTP.  No `nexus-client` on the remote side, no S3, no relay for data — the
+relay is used only to send progress messages to a monitor peer.
+
+```
+Local filesystem ──► nexus-copy-to-ssh ──► SFTP ──► SSH target
+                             │
+                             └──► relay ──► monitor (progress only)
+```
+
+```bash
+nexus-copy-to-ssh \
+    --source /data/dataset.zarr \
+    --target user@host:/remote/path \
+    --server-url wss://relay.example.com \
+    --max-concurrent 8 \
+    --ssh-connections 2
+```
+
+Interrupted transfers resume automatically: a file is skipped when its remote
+size already matches the local size.
+
 ## Features
 
 - **Named routing** — clients register with a unique name; messages are routed by name
@@ -87,6 +111,7 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
 - **Optional S3 staging** — pass `use_s3=True` (or `--use-s3` to `nexus-copy`) to relay through an S3-compatible bucket instead of the WebSocket
 - **SHA-256 checksums** — computed incrementally during transfer and verified on completion
 - **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
+- **Direct SSH copy** — `nexus-copy-to-ssh` uploads a local directory via SFTP without any relay involvement in the data path
 - **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
 - **Shared memory** — key-value store on the server, accessible from any client via `/mem` commands
 - **Client discovery** — `list_clients` / `/clients` returns all connected client names
@@ -139,3 +164,30 @@ on the provider's disk is untouched.
 | `--max-concurrent` | `4`                   | Maximum parallel file transfers                        |
 | `--chunk-size`     | `65536`               | Binary chunk size (ignored with `--use-s3`)            |
 | `--use-s3`         | off                   | Stage transfers through S3 (needs `NEXUS_TRANSFER_S3_*`) |
+
+### `nexus-copy-to-ssh`
+
+| Flag               | Default                | Description                                         |
+|--------------------|------------------------|-----------------------------------------------------|
+| `--source`         | (required)             | Local directory to copy                             |
+| `--target`         | (required)             | `[user@]host:/remote/path`                          |
+| `--server-url`     | `$NEXUS_TRANSFERS_URL` | Relay URL for monitoring only (optional)            |
+| `--name`           | auto-generated         | Client name on the relay                            |
+| `--site`           | (none)                 | Site label for monitor messages                     |
+| `--max-concurrent` | `4`                    | Number of parallel SFTP uploads                     |
+| `--ssh-port`       | `22`                   | SSH port on the target host                         |
+| `--ssh-key`        | SSH agent / default    | Path to private key file                            |
+| `--ssh-connections`| `2`                    | Number of SSH connections to open (see note below)  |
+| `--size`           | off                    | Show byte-based progress instead of file count      |
+| `--no-verify`      | off                    | Skip TLS verification for the relay connection      |
+| `--debug`          | off                    | Enable debug logging                                |
+
+**`--ssh-connections` vs `--max-concurrent`**: `--ssh-connections` controls how
+many TCP connections are opened to the SSH server.  Each connection carries one
+SFTP session, and the `--max-concurrent` upload workers are distributed across
+those sessions in round-robin order.  Opening more than one connection lets
+multiple SFTP sessions run in parallel, which can saturate bandwidth that a
+single SSH connection cannot fully use (SSH multiplexes all channels over one
+TCP stream, so a single connection is limited by its flow-control window).  Two
+connections is a reasonable default; raise it if the link is fast and latency is
+high.

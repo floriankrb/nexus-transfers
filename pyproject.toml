@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "rich>=13.0",
     "obstore>=0.9",
+    "asyncssh>=2.14",
 ]
 
 [project.scripts]
@@ -20,6 +21,7 @@ nexus-server = "nexus_transfers.server:main"
 nexus-client = "nexus_transfers.client:main"
 nexus-copy = "nexus_transfers.copy:main"
 nexus-monitor = "nexus_transfers.monitor:main"
+nexus-copy-to-ssh = "nexus_transfers.copy_ssh:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
