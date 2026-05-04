@@ -14,6 +14,7 @@ import os
 import uuid
 
 from nexus_transfers.client import Client, _DEFAULT_URL
+from nexus_transfers.config import cli_default
 from rich.console import Console
 
 def main():
@@ -31,79 +32,83 @@ def main():
     parser.add_argument("target", help="Local destination directory")
     parser.add_argument(
         "--server-url",
-        default=None,
+        default=cli_default("server_url", "copy", default=None),
         help=f"Server WebSocket URL (default: {_DEFAULT_URL})",
     )
     parser.add_argument(
         "--name",
-        default=None,
+        default=cli_default("name", "copy", default=None),
         help="Client name (default: auto-generated)",
     )
     parser.add_argument(
         "--max-concurrent",
         type=int,
-        default=4,
+        default=cli_default("max_concurrent", "copy", default=4, type_fn=int),
         help="Maximum parallel file transfers (default: 4)",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=65536,
+        default=cli_default("chunk_size", "copy", default=65536, type_fn=int),
         help="Binary chunk size in bytes for file transfers (default: 65536)",
     )
     parser.add_argument(
         "--use-server",
         action="store_true",
+        default=cli_default("use_server", "copy", default=False),
         help="Transfer via the WebSocket relay instead of S3 staging",
     )
     parser.add_argument(
         "--reconnect-retries",
         type=int,
-        default=-1,
+        default=cli_default("reconnect_retries", "copy", default=-1, type_fn=int),
         help="Reconnection attempts on disconnect (-1 = infinite, default: -1)",
     )
     parser.add_argument(
         "--reconnect-delay",
         type=float,
-        default=2.0,
+        default=cli_default("reconnect_delay", "copy", default=2.0, type_fn=float),
         help="Seconds between reconnection attempts (default: 2.0)",
     )
     parser.add_argument(
         "--peer-retries",
         type=int,
-        default=-1,
+        default=cli_default("peer_retries", "copy", default=-1, type_fn=int),
         help="Retries when target peer is not found (-1 = infinite, default: -1)",
     )
     parser.add_argument(
         "--peer-delay",
         type=float,
-        default=2.0,
+        default=cli_default("peer_delay", "copy", default=2.0, type_fn=float),
         help="Seconds between peer-not-found retries (default: 2.0)",
     )
     parser.add_argument(
         "--call-timeout",
         type=float,
-        default=None,
+        default=cli_default("call_timeout", "copy", default=None, type_fn=float),
         help="Timeout in seconds for RPC calls (default: no timeout)",
     )
     parser.add_argument(
         "--no-verify",
         action="store_true",
+        default=cli_default("no_verify", "copy", default=False),
         help="Skip TLS certificate verification for wss:// connections",
     )
     parser.add_argument(
         "--site",
-        default=None,
+        default=cli_default("site", "copy", default=None),
         help="Site label used in the auto-generated client name instead of 'copy'",
     )
     parser.add_argument(
         "--size",
         action="store_true",
+        default=cli_default("size", "copy", default=False),
         help="Show transfer progress in bytes instead of file count",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
+        default=cli_default("debug", "copy", default=False),
         help="Enable debug logging",
     )
     args = parser.parse_args()

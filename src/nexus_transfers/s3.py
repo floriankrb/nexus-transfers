@@ -28,6 +28,8 @@ from typing import Callable
 import obstore as obs
 from dotenv import load_dotenv
 
+from nexus_transfers.config import resolve, resolve_bool
+
 load_dotenv(Path.home() / ".env")
 
 logger = logging.getLogger(__name__)
@@ -44,8 +46,8 @@ _RETRY_BASE_DELAY = 1.0  # seconds; doubled each attempt
 
 
 def is_configured() -> bool:
-    """Return True if the bucket env var is set."""
-    return bool(os.environ.get(S3_BUCKET_ENV))
+    """Return True if the bucket env var or config is set."""
+    return bool(resolve(S3_BUCKET_ENV, default=None))
 
 
 def _split_bucket_spec(raw: str) -> tuple[str, str | None]:
@@ -73,15 +75,12 @@ def _normalise_bucket(raw: str) -> str:
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean env var (``1/true/yes/on`` are truthy)."""
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+    """Parse a boolean env var (``1/true/yes/on`` are truthy), with config fallback."""
+    return resolve_bool(name, default=default)
 
 
 def _build_store_from_env(bucket_override: str | None = None):
-    """Construct an ``S3Store`` from environment variables.
+    """Construct an ``S3Store`` from environment variables / config.
 
     Parameters
     ----------
@@ -95,22 +94,22 @@ def _build_store_from_env(bucket_override: str | None = None):
     if bucket_override is not None:
         bucket = bucket_override
     else:
-        raw = os.environ.get(S3_BUCKET_ENV)
+        raw = resolve(S3_BUCKET_ENV, default=None)
         if not raw:
             raise RuntimeError(
                 f"{S3_BUCKET_ENV} is not set – S3 staging is not available"
             )
         bucket, _ = _split_bucket_spec(raw)
     kwargs: dict = {}
-    endpoint = os.environ.get(S3_ENDPOINT_ENV)
+    endpoint = resolve(S3_ENDPOINT_ENV, default=None)
     if endpoint:
         kwargs["endpoint"] = endpoint
         kwargs["virtual_hosted_style_request"] = _env_bool(S3_VHOST_ENV, False)
         kwargs["allow_http"] = endpoint.startswith("http://")
-    access_key = os.environ.get(S3_ACCESS_KEY_ENV)
+    access_key = resolve(S3_ACCESS_KEY_ENV, default=None)
     if access_key:
         kwargs["access_key_id"] = access_key
-    secret_key = os.environ.get(S3_SECRET_KEY_ENV)
+    secret_key = resolve(S3_SECRET_KEY_ENV, default=None)
     if secret_key:
         kwargs["secret_access_key"] = secret_key
     logger.debug(
@@ -138,7 +137,7 @@ def get_store(bucket: str | None = None):
 
 def _env_prefix() -> str | None:
     """Extract the prefix portion of ``NEXUS_TRANSFER_S3_BUCKET`` if any."""
-    raw = os.environ.get(S3_BUCKET_ENV)
+    raw = resolve(S3_BUCKET_ENV, default=None)
     if not raw:
         return None
     return _split_bucket_spec(raw)[1]
@@ -146,7 +145,7 @@ def _env_prefix() -> str | None:
 
 def _env_bucket() -> str:
     """Return the bucket portion of ``NEXUS_TRANSFER_S3_BUCKET`` (or ``?``)."""
-    raw = os.environ.get(S3_BUCKET_ENV)
+    raw = resolve(S3_BUCKET_ENV, default=None)
     if not raw:
         return "?"
     return _split_bucket_spec(raw)[0]

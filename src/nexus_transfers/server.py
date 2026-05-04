@@ -146,10 +146,18 @@ def main():
     """CLI entry point for ``nexus-server``."""
     import argparse
 
+    from nexus_transfers.config import cli_default
+
     parser = argparse.ArgumentParser(description="Transfer relay server")
-    parser.add_argument("--host", default="localhost", help="Bind address")
-    parser.add_argument("--port", type=int, default=8766, help="Bind port")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--host",
+                        default=cli_default("host", "server", default="localhost"),
+                        help="Bind address")
+    parser.add_argument("--port", type=int,
+                        default=cli_default("port", "server", default=8766, type_fn=int),
+                        help="Bind port")
+    parser.add_argument("--debug", action="store_true",
+                        default=cli_default("debug", "server", default=False),
+                        help="Enable debug logging")
     args = parser.parse_args()
     from rich.logging import RichHandler
     logging.basicConfig(
