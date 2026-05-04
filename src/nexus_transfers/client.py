@@ -1047,6 +1047,10 @@ class Client:
                     if not future.done():
                         future.set_exception(ConnectionError("connection closed"))
                 self._pending.clear()
+                self._binary_buffers.clear()
+                self._binary_received.clear()
+                self._binary_hashes.clear()
+                self._binary_checksums.clear()
                 try:
                     await self._reconnect()
                 except (NameTakenError, ConnectionError):
@@ -1080,6 +1084,10 @@ class Client:
                                 ConnectionError("message too big (1009)")
                             )
                     self._pending.clear()
+                    self._binary_buffers.clear()
+                    self._binary_received.clear()
+                    self._binary_hashes.clear()
+                    self._binary_checksums.clear()
                     raise
                 _logger.warning("Connection lost: %s", exc)
                 # Fail all pending futures so callers don't hang.
@@ -1087,6 +1095,10 @@ class Client:
                     if not future.done():
                         future.set_exception(ConnectionError("connection lost"))
                 self._pending.clear()
+                self._binary_buffers.clear()
+                self._binary_received.clear()
+                self._binary_hashes.clear()
+                self._binary_checksums.clear()
                 try:
                     await self._reconnect()
                 except (NameTakenError, ConnectionError):
