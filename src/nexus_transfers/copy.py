@@ -134,10 +134,18 @@ async def _copy(name, url, remote_client, source, target, max_concurrent,
         console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
         via = "" if use_s3 else " [dim](via server)[/dim]"
         console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{target}[/yellow]{via}")
+        await client.monitor(
+            f"{name}: starting copy {remote_client}:{source} -> {target}",
+            status="progress",
+        )
         await client.get_directory(remote_client, source, target,
                                    max_concurrent=max_concurrent,
                                    chunk_size=chunk_size,
                                    use_s3=use_s3)
+        await client.monitor(
+            f"{name}: copy complete {remote_client}:{source} -> {target}",
+            status="ok",
+        )
         console.print("[bold green]Done.[/bold green]")
 
 if __name__ == "__main__":

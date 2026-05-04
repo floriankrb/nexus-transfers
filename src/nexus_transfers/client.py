@@ -335,6 +335,33 @@ class Client:
         await self._ws.send(frame)
         return await future
 
+    _MONITOR_TIMEOUT = 0.5
+
+    async def monitor(self, message: str, status: str | None = None):
+        """Send a monitoring message to the ``monitor`` peer.
+
+        This is fire-and-forget: if no monitor peer is connected, or the
+        call times out, the error is silently ignored so it never blocks
+        the caller.
+
+        Parameters
+        ----------
+        message
+            Free-form message string.
+        status
+            Optional status label (e.g. ``"ok"``, ``"error"``, ``"progress"``).
+        """
+        try:
+            kwargs = {}
+            if status is not None:
+                kwargs["status"] = status
+            await asyncio.wait_for(
+                self.send("monitor.log", message, **kwargs),
+                timeout=self._MONITOR_TIMEOUT,
+            )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Directory / file transfer helpers
     # ------------------------------------------------------------------
@@ -437,11 +464,16 @@ class Client:
 
         elapsed = loop.time() - start
         rate = total_bytes / elapsed if elapsed > 0 else 0
+        summary = (
+            f"Transferred {_fmt_binary(total_bytes)} "
+            f"in {elapsed:.1f}s ({_fmt_binary(rate)}/s)"
+        )
         self._progress.console.print(
             f"Transferred [bold]{_fmt_binary(total_bytes)}[/bold] "
             f"in [bold]{elapsed:.1f}s[/bold] "
             f"([bold]{_fmt_binary(rate)}/s[/bold])"
         )
+        await self.monitor(f"{self.name}: {summary}", status="ok")
 
     async def _walk_remote(self, target, remote_path, local_path, file_list,
                             walk_task=None):

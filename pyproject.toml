@@ -19,6 +19,7 @@ dependencies = [
 nexus-server = "nexus_transfers.server:main"
 nexus-client = "nexus_transfers.client:main"
 nexus-copy = "nexus_transfers.copy:main"
+nexus-monitor = "nexus_transfers.monitor:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

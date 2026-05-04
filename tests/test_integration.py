@@ -7,6 +7,7 @@ import pytest
 
 from nexus_transfers import Client
 from nexus_transfers.client import NameTakenError, PeerNotFoundError, RemoteError
+from nexus_transfers.dispatch import DISPATCH
 
 
 @pytest.mark.asyncio
@@ -255,6 +256,40 @@ async def test_get_directory_resume_skips_complete(server, tmp_path):
 
     assert (dest / "a.txt").read_bytes() == content_a
     assert (dest / "b.txt").read_bytes() == content_b
+
+
+@pytest.mark.asyncio
+async def test_monitor_receives_messages(server):
+    """The monitor peer receives log messages from other clients."""
+    received = []
+
+    def log(message, status=None):
+        received.append((message, status))
+        return True
+
+    dispatch = dict(DISPATCH)
+    dispatch["log"] = log
+
+    async with (
+        Client("monitor", url=server, dispatch=dispatch) as mon,
+        Client("worker", url=server) as worker,
+    ):
+        await worker.monitor("hello world", status="ok")
+        await worker.monitor("just a message")
+        # Give the monitor a moment to process
+        await asyncio.sleep(0.1)
+
+    assert len(received) == 2
+    assert received[0] == ("hello world", "ok")
+    assert received[1] == ("just a message", None)
+
+
+@pytest.mark.asyncio
+async def test_monitor_no_peer_does_not_block(server):
+    """monitor() does not block or raise when no monitor peer is connected."""
+    async with Client("lonely", url=server) as client:
+        # Should return quickly without error
+        await client.monitor("nobody is listening", status="progress")
 
 
 @pytest.mark.asyncio
