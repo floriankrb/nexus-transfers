@@ -405,6 +405,10 @@ class Client:
             f"Discovered [bold]{len(file_list)}[/bold] file(s) under "
             f"[yellow]{label}[/yellow]"
         )
+        await self.monitor(
+            f"{self.name}: discovered {len(file_list)} file(s) under {label}",
+            status="progress",
+        )
         if not file_list:
             return
 
@@ -435,6 +439,12 @@ class Client:
                 f"([bold]{_fmt_binary(skipped_bytes)}[/bold]), "
                 f"[bold]{len(pending)}[/bold] remaining"
             )
+            await self.monitor(
+                f"{self.name}: resuming, skipping {skipped} already-complete "
+                f"file(s) ({_fmt_binary(skipped_bytes)}), "
+                f"{len(pending)} remaining",
+                status="progress",
+            )
         if not pending:
             return
 
@@ -444,10 +454,12 @@ class Client:
         )
         loop = asyncio.get_running_loop()
         total_bytes = 0
+        done_count = 0
         start = loop.time()
+        last_monitor_time = start
 
         async def _transfer_one(remote_file, local_file):
-            nonlocal total_bytes
+            nonlocal total_bytes, done_count, last_monitor_time
             async with sem:
                 while True:
                     try:
@@ -469,7 +481,21 @@ class Client:
                 os.makedirs(os.path.dirname(local_file), exist_ok=True)
                 await loop.run_in_executor(None, _write_file, local_file, data)
                 total_bytes += len(data)
+                done_count += 1
                 self._progress.advance(copy_task)
+
+                # Send periodic progress to monitor (at most every 30s).
+                now = loop.time()
+                if now - last_monitor_time >= 30:
+                    last_monitor_time = now
+                    elapsed = now - start
+                    rate = total_bytes / elapsed if elapsed > 0 else 0
+                    await self.monitor(
+                        f"{self.name}: {done_count}/{len(pending)} files "
+                        f"({_fmt_binary(total_bytes)}, "
+                        f"{_fmt_binary(rate)}/s)",
+                        status="progress",
+                    )
 
         await asyncio.gather(*[_transfer_one(rf, lf) for rf, lf in pending])
         self._progress.remove_task(copy_task)
