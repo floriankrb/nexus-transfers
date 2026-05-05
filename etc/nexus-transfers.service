@@ -1,0 +1,15 @@
+[Unit]
+Description=Nexus Transfers WebSocket Relay Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=nexus-transfer broker --host 127.0.0.1 --port 8766
+Environment=PYTHON_GIL=0
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/nexus-transfers/server.log
+StandardError=append:/var/log/nexus-transfers/server.log
+
+[Install]
+WantedBy=default.target
