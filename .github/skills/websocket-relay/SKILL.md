@@ -11,7 +11,7 @@ An async WebSocket relay broker that routes binary-framed messages between named
 
 | File | Purpose |
 |---|---|
-| `cli.py` | Unified `nexus-transfer` entry point — dispatches to subcommands |
+| `cli.py` | Unified `nexus-transfers` entry point — dispatches to subcommands |
 | `protocol.py` | `encode_frame` / `decode_frame` — the binary wire format |
 | `broker.py` | Relay broker on `ws://localhost:8766`. Routes frames to named targets; only decodes JSON when the frame is addressed to the broker itself. Manages monitor registrations and broadcasts events. |
 | `client.py` | RPC client class + interactive CLI. Registers, dispatches incoming calls, sends binary file chunks, emits monitoring events. |
@@ -153,29 +153,29 @@ Every client exposes these functions by default:
 
 ## Running
 
-All commands are available via the unified `nexus-transfer` CLI:
+All commands are available via the unified `nexus-transfers` CLI:
 
 ```bash
 # Show available commands
-nexus-transfer --help
+nexus-transfers --help
 
 # Broker (runs forever)
-nexus-transfer broker [--host HOST] [--port PORT] [--debug]
+nexus-transfers broker [--host HOST] [--port PORT] [--debug]
 
 # Server — a peer awaiting messages (runs forever)
-nexus-transfer server --name a [--allow-path /data]
+nexus-transfers server --name a [--allow-path /data]
 
 # Server (interactive shell)
-nexus-transfer server --name a --interactive
+nexus-transfers server --name a --interactive
 
 # Monitor — prints broadcast events (runs forever)
-nexus-transfer monitor [--broker-url URL] [--json] [--name NAME]
+nexus-transfers monitor [--broker-url URL] [--json] [--name NAME]
 
 # Copy — recursive remote-to-local directory copy (terminates)
-nexus-transfer copy --from <remote> <src> <local> [--chunk-size BYTES] [--max-concurrent N]
+nexus-transfers copy --from <remote> <src> <local> [--chunk-size BYTES] [--max-concurrent N]
 
 # Copy-ssh — local-to-remote SSH/SFTP copy (terminates)
-nexus-transfer copy-ssh --source /local/dir --target user@host:/remote/path
+nexus-transfers copy-ssh --source /local/dir --target user@host:/remote/path
 ```
 
 Legacy standalone commands (`nexus-broker`, `nexus-client`, `nexus-copy`, `nexus-monitor`, `nexus-copy-to-ssh`) are still available for backward compatibility.

@@ -15,13 +15,13 @@ pip install -e .
 ### 1. Start the broker
 
 ```bash
-nexus-broker --port 8766
+nexus-transfers broker --port 8766
 ```
 
 ### 2. Start a client
 
 ```bash
-nexus-client --name a --broker-url ws://localhost:8766 --allow-path /path/to/share
+nexus-transfers server --name a --broker-url ws://localhost:8766 --allow-path /path/to/share
 ```
 
 `--allow-path` can be repeated to expose multiple directories for `get_file` and `list_dir` operations. Without it, only built-in RPC functions (`adder`, `echo`) are available.
@@ -31,7 +31,7 @@ nexus-client --name a --broker-url ws://localhost:8766 --allow-path /path/to/sha
 From another terminal (or from Python):
 
 ```bash
-nexus-client --name b --broker-url ws://localhost:8766
+nexus-transfers server --name b --broker-url ws://localhost:8766
 ```
 
 Then in the interactive prompt:
@@ -81,18 +81,18 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
 
 ## Direct SSH copy (no relay required)
 
-`nexus-copy-to-ssh` copies a local directory straight to a remote host over
-SFTP.  No `nexus-client` on the remote side, no S3, no relay for data — the
+`nexus-transfers copy-ssh` copies a local directory straight to a remote host over
+SFTP.  No `nexus-transfers server` on the remote side, no S3, no relay for data — the
 relay is used only to send progress messages to a monitor peer.
 
 ```
-Local filesystem ──► nexus-copy-to-ssh ──► SFTP ──► SSH target
-                             │
-                             └──► relay ──► monitor (progress only)
+Local filesystem ──► nexus-transfers copy-ssh ──► SFTP ──► SSH target
+                                   │
+                                   └──► relay ──► monitor (progress only)
 ```
 
 ```bash
-nexus-copy-to-ssh \
+nexus-transfers copy-ssh \
     --source /data/dataset.zarr \
     --target user@host:/remote/path \
     --broker-url wss://relay.example.com \
@@ -108,10 +108,10 @@ size already matches the local size.
 - **Named routing** — clients register with a unique name; messages are routed by name
 - **RPC dispatch** — clients expose functions that other clients can call remotely
 - **Binary file transfer** — files are sent as raw binary WebSocket frames (no base64), chunked with tqdm progress bars
-- **Optional S3 staging** — pass `use_s3=True` (or `--use-s3` to `nexus-copy`) to relay through an S3-compatible bucket instead of the WebSocket
+- **Optional S3 staging** — pass `use_s3=True` (or `--use-s3` to `nexus-transfers copy`) to relay through an S3-compatible bucket instead of the WebSocket
 - **SHA-256 checksums** — computed incrementally during transfer and verified on completion
 - **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
-- **Direct SSH copy** — `nexus-copy-to-ssh` uploads a local directory via SFTP without any relay involvement in the data path
+- **Direct SSH copy** — `nexus-transfers copy-ssh` uploads a local directory via SFTP without any relay involvement in the data path
 - **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
 - **Shared memory** — key-value store on the broker, accessible from any client via `/mem` commands
 - **Client discovery** — `list_clients` / `/clients` returns all connected client names
@@ -130,7 +130,7 @@ export NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY=...                 # optional
 Then:
 
 ```bash
-nexus-copy --from a /remote/path ./local-path --use-s3
+nexus-transfers copy --from a /remote/path ./local-path --use-s3
 ```
 
 Flow: provider uploads → returns key/size/sha256 → initiator downloads
@@ -139,14 +139,14 @@ on the provider's disk is untouched.
 
 ## CLI reference
 
-### `nexus-broker`
+### `nexus-transfers broker`
 
 | Flag     | Default     | Description   |
 |----------|-------------|---------------|
 | `--host` | `localhost` | Bind address  |
 | `--port` | `8766`      | Bind port     |
 
-### `nexus-client`
+### `nexus-transfers server`
 
 | Flag            | Default                  | Description                                      |
 |-----------------|--------------------------|--------------------------------------------------|
@@ -154,7 +154,7 @@ on the provider's disk is untouched.
 | `--broker-url`  | `ws://localhost:8766`    | Broker WebSocket URL                             |
 | `--allow-path`  | (none)                   | Directory to expose for file operations (repeatable) |
 
-### `nexus-copy`
+### `nexus-transfers copy`
 
 | Flag               | Default               | Description                                            |
 |--------------------|-----------------------|--------------------------------------------------------|
@@ -165,7 +165,7 @@ on the provider's disk is untouched.
 | `--chunk-size`     | `65536`               | Binary chunk size (ignored with `--use-s3`)            |
 | `--use-s3`         | off                   | Stage transfers through S3 (needs `NEXUS_TRANSFER_S3_*`) |
 
-### `nexus-copy-to-ssh`
+### `nexus-transfers copy-ssh`
 
 | Flag               | Default                | Description                                         |
 |--------------------|------------------------|-----------------------------------------------------|

@@ -1,4 +1,4 @@
-Read an optional ~/.nexus-transfer.toml
+Read an optional ~/.nexus-transfers.toml
 
 Look at the code, and for all environment variables start starts with NEXT_TRANSFER_  create an equivalent entry in the config (in lowercase,
 without the prefix).

@@ -1,6 +1,6 @@
 """Configuration loader for nexus-transfers.
 
-Reads ``~/.nexus-transfer.toml`` and provides helpers to resolve values
+Reads ``~/.nexus-transfers.toml`` and provides helpers to resolve values
 with the precedence: CLI option > environment variable > config file > default.
 
 Environment variables starting with ``NEXUS_TRANSFER_`` (or ``NEXUS_TRANSFERS_``)
@@ -14,7 +14,7 @@ import os
 import tomllib
 from pathlib import Path
 
-_CONFIG_PATH = Path.home() / ".nexus-transfer.toml"
+_CONFIG_PATH = Path.home() / ".nexus-transfers.toml"
 
 _config: dict | None = None
 

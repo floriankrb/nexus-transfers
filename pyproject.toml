@@ -17,12 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nexus-transfer = "nexus_transfers.cli:main"
-nexus-broker = "nexus_transfers.broker:main"
-nexus-client = "nexus_transfers.client:main"
-nexus-copy = "nexus_transfers.copy:main"
-nexus-monitor = "nexus_transfers.monitor:main"
-nexus-copy-to-ssh = "nexus_transfers.copy_ssh:main"
+nexus-transfers = "nexus_transfers.cli:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
