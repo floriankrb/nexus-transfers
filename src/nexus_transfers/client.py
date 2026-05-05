@@ -169,7 +169,7 @@ class Client:
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
         connect_kwargs: dict = {"additional_headers": extra_headers,
-                                "max_size": 104_857_600}  # 100 MiB
+                                "max_size": 10_485_760}  # 10 MiB
         if not self.ssl_verify and self.url.startswith("wss://"):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
@@ -598,7 +598,7 @@ class Client:
         os.makedirs(local_path, exist_ok=True)
         entries = []
         offset = 0
-        limit = 10000
+        limit = 1000
         while True:
             while True:
                 try:
@@ -648,7 +648,7 @@ class Client:
             _counter = [0]
         os.makedirs(local_path, exist_ok=True)
         offset = 0
-        limit = 10000
+        limit = 1000
         while True:
             while True:
                 try:
@@ -1087,7 +1087,7 @@ class Client:
                             msg_id = data.get("msg_id")
                             future = self._pending.pop(msg_id, None)
                             if future and not future.done():
-                                if "unknown target" in error:
+                                if "unknown target" in error or "disconnected" in error:
                                     future.set_exception(PeerNotFoundError(error))
                                 else:
                                     future.set_exception(RemoteError(error))

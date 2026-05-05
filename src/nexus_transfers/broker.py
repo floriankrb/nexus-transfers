@@ -238,7 +238,7 @@ async def relay_handler(websocket):
 
 async def run_broker(host="localhost", port=8766):
     """Start the relay broker."""
-    async with serve(relay_handler, host, port, max_size=104_857_600):  # 100 MiB
+    async with serve(relay_handler, host, port, max_size=10_485_760):  # 10 MiB
         print(f"Relay broker listening on ws://{host}:{port}")
         await asyncio.get_running_loop().create_future()
 
