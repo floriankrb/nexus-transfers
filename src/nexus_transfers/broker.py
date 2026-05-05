@@ -25,6 +25,11 @@ clients_lock = threading.Lock()  # kept; conftest.py uses it to clear state betw
 monitors: dict[str, object] = {}
 monitors_lock = threading.Lock()
 
+# Pending calls: target_name -> list of (msg_id, source_name)
+# Tracks calls relayed to a target that have not yet been replied to.
+pending_calls: dict[str, list[tuple[str, str]]] = {}
+pending_calls_lock = threading.Lock()
+
 
 def _utcnow() -> str:
     """Return current UTC time in ISO 8601 format."""
@@ -134,6 +139,26 @@ async def relay_handler(websocket):
                              msg_id=msg_id)
                     )
                     continue
+
+                # Track pending calls/replies for dead-peer detection
+                if encoding == "J" and msg_name in ("call", "reply"):
+                    try:
+                        msg_id = json.loads(payload).get("msg_id")
+                    except Exception:
+                        msg_id = None
+                    if msg_id:
+                        if msg_name == "call":
+                            with pending_calls_lock:
+                                pending_calls.setdefault(target, []).append(
+                                    (msg_id, client_name)
+                                )
+                        elif msg_name == "reply":
+                            with pending_calls_lock:
+                                entries = pending_calls.get(client_name, [])
+                                pending_calls[client_name] = [
+                                    e for e in entries if e[0] != msg_id
+                                ]
+
                 logger.debug("relay %s -> %s: %s (%d bytes)",
                              client_name, target, msg_name, len(raw))
                 continue
@@ -182,6 +207,23 @@ async def relay_handler(websocket):
             if is_monitor:
                 with monitors_lock:
                     monitors.pop(client_name, None)
+
+            # Send error replies for any calls that this client never answered
+            with pending_calls_lock:
+                orphaned = pending_calls.pop(client_name, [])
+            for msg_id, caller in orphaned:
+                with clients_lock:
+                    caller_ws = clients.get(caller)
+                if caller_ws is not None:
+                    try:
+                        await caller_ws.send(
+                            _err(caller,
+                                 f"peer '{client_name}' disconnected before replying",
+                                 msg_id=msg_id)
+                        )
+                    except Exception:
+                        pass  # caller also gone
+
             logger.info("[-] Disconnected: %s (%s)", client_name, remote)
             # Emit disconnect event to monitors
             await _broadcast_event({

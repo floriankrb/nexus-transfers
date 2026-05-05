@@ -8,6 +8,7 @@ Usage::
 import argparse
 import asyncio
 import logging
+import uuid
 from datetime import datetime
 
 from rich.console import Console
@@ -75,8 +76,8 @@ def main():
     )
     parser.add_argument(
         "--name",
-        default=cli_default("name", "monitor", default="monitor"),
-        help="Client name to register with (default: monitor)",
+        default=cli_default("name", "monitor", default=f"monitor-{uuid.uuid4().hex[:6]}"),
+        help="Client name to register with (default: monitor-<random>)",
     )
     parser.add_argument(
         "--broker-url",

@@ -432,3 +432,34 @@ async def test_multiple_monitors(broker):
     info_b = [e for e in events_b if e.get("message") == "broadcast test"]
     assert len(info_a) >= 1
     assert len(info_b) >= 1
+
+
+@pytest.mark.asyncio
+async def test_dead_peer_sends_error_reply(broker):
+    """When a peer disconnects before replying, the caller gets an error."""
+    import threading
+
+    # A synchronous handler that blocks until the event is set
+    block = threading.Event()
+
+    def hang(*args, **kwargs):
+        block.wait()
+        return "unreachable"
+
+    async with Client("caller", url=broker, call_timeout=5) as caller:
+        b = Client("responder", url=broker)
+        await b.connect()
+        b.dispatch["hang"] = hang
+
+        # Initiate a call that will hang
+        call_task = asyncio.create_task(caller.send("responder.hang"))
+        # Give the call time to be relayed to B
+        await asyncio.sleep(0.2)
+
+        # Forcefully close B's websocket (simulates crash)
+        await b._ws.close()
+        block.set()  # unblock the thread so it doesn't leak
+
+        # Caller should receive an error about the dead peer
+        with pytest.raises(RemoteError, match="disconnected before replying"):
+            await call_task

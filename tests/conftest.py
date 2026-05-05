@@ -9,6 +9,8 @@ from nexus_transfers.broker import (
     clients_lock,
     monitors,
     monitors_lock,
+    pending_calls,
+    pending_calls_lock,
     relay_handler,
 )
 
@@ -30,6 +32,8 @@ async def broker(free_port):
         clients.clear()
     with monitors_lock:
         monitors.clear()
+    with pending_calls_lock:
+        pending_calls.clear()
 
     async with serve(relay_handler, "localhost", free_port):
         yield f"ws://localhost:{free_port}"
