@@ -105,7 +105,7 @@ def main():
         "--size",
         action="store_true",
         default=cli_default("size", "copy", default=False),
-        help="Show transfer progress in bytes instead of file count",
+        help="Show transfer progress in bytes and use size to verify resume skips",
     )
     parser.add_argument(
         "--debug",

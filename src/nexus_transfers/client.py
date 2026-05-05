@@ -416,8 +416,9 @@ class Client:
                             use_s3=True, s3_prefix=None, track_bytes=False):
         """Recursively copy a remote directory to a local path.
 
-        Resumes interrupted transfers by skipping files whose local size
-        already matches the remote size.
+        Resumes interrupted transfers by skipping files that already exist
+        locally.  When *track_bytes* is True (``--size``), the remote size
+        must also match the local size before a file is skipped.
 
         Parameters
         ----------
@@ -484,15 +485,26 @@ class Client:
                     return
                 remote_file, local_file, remote_size = item
 
-                # Resume: skip files whose local size matches remote.
-                if remote_size is not None and os.path.isfile(local_file):
-                    try:
-                        local_size = os.path.getsize(local_file)
-                    except OSError:
-                        local_size = -1
-                    if local_size == remote_size:
+                # Resume: skip files that already exist locally.
+                # With --size, also require the size to match.
+                if os.path.isfile(local_file):
+                    size_ok = True
+                    if track_bytes and remote_size is not None:
+                        try:
+                            local_size = os.path.getsize(local_file)
+                        except OSError:
+                            local_size = -1
+                        size_ok = local_size == remote_size
+                    if size_ok:
                         skipped += 1
-                        skipped_bytes += remote_size
+                        skipped_bytes += remote_size or 0
+                        if skipped == 1 or skipped % 1000 == 0:
+                            _logger.info("Skipping already-downloaded files: %d so far", skipped)
+                        self._progress.update(
+                            copy_task,
+                            completed=done_count + skipped,
+                            description=f"[cyan]Copying {label}[/cyan] [dim]({skipped} skipped)[/dim]",
+                        )
                         continue
 
                 async with sem:
@@ -525,30 +537,16 @@ class Client:
                     os.makedirs(os.path.dirname(local_file), exist_ok=True)
                     file_size = (os.path.getsize(data) if isinstance(data, str)
                                  else len(data))
-                    # Skip writing if the local file already has the same size.
-                    skip = False
-                    if os.path.isfile(local_file):
-                        try:
-                            local_size = os.path.getsize(local_file)
-                        except OSError:
-                            local_size = -1
-                        if local_size == file_size:
-                            skip = True
-                            _logger.debug("Skipping %s (local size matches)",
-                                          os.path.basename(local_file))
-                            if isinstance(data, str):
-                                os.unlink(data)
-                    if not skip:
-                        if isinstance(data, str):
-                            # S3 download returned a temp file path — move it.
-                            await loop.run_in_executor(
-                                None, shutil.move, data, local_file)
-                        else:
-                            await loop.run_in_executor(
-                                None, _write_file, local_file, data)
+                    if isinstance(data, str):
+                        # S3 download returned a temp file path — move it.
+                        await loop.run_in_executor(
+                            None, shutil.move, data, local_file)
+                    else:
+                        await loop.run_in_executor(
+                            None, _write_file, local_file, data)
                     total_bytes += file_size
                     done_count += 1
-                    self._progress.update(copy_task, completed=done_count)
+                    self._progress.update(copy_task, completed=done_count + skipped)
 
                     # Send periodic progress to monitor (at most every 30s).
                     now = loop.time()
