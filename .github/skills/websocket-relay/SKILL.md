@@ -15,7 +15,7 @@ An async WebSocket relay broker that routes binary-framed messages between named
 | `protocol.py` | `encode_frame` / `decode_frame` — the binary wire format |
 | `broker.py` | Relay broker on `ws://localhost:8766`. Routes frames to named targets; only decodes JSON when the frame is addressed to the broker itself. Manages monitor registrations and broadcasts events. |
 | `client.py` | RPC client class + interactive CLI. Registers, dispatches incoming calls, sends binary file chunks, emits monitoring events. |
-| `monitor.py` | CLI tool (`nexus-monitor`) that registers as a monitoring service and prints broadcast events. |
+| `monitor.py` | CLI tool (`nexus-transfers monitor`) that registers as a monitoring service and prints broadcast events. |
 | `copy.py` | Recursive remote-to-local directory copy via relay/S3. |
 | `copy_ssh.py` | Local-to-remote SSH/SFTP directory copy. |
 | `dispatch.py` | Default dispatch table (`adder`, `echo`, `get_file`, `list_dir`). |
@@ -177,8 +177,6 @@ nexus-transfers copy --from <remote> <src> <local> [--chunk-size BYTES] [--max-c
 # Copy-ssh — local-to-remote SSH/SFTP copy (terminates)
 nexus-transfers copy-ssh --source /local/dir --target user@host:/remote/path
 ```
-
-Legacy standalone commands (`nexus-broker`, `nexus-client`, `nexus-copy`, `nexus-monitor`, `nexus-copy-to-ssh`) are still available for backward compatibility.
 
 ### Interactive shell commands
 
