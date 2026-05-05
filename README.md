@@ -79,6 +79,71 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
     await asyncio.Future()  # keep running
 ```
 
+### Calling `copy` and `copy-ssh` from Python
+
+Both CLI commands have importable async counterparts:
+
+```python
+from nexus_transfers.copy import _copy
+from nexus_transfers.copy_ssh import _copy_to_ssh
+
+# Equivalent to: nexus-transfers copy --from a /remote/src ./local-copy
+asyncio.run(_copy(
+    name="my-copy",
+    url="ws://localhost:8766",
+    remote_client="a",
+    source="/remote/src",
+    target="./local-copy",
+    max_concurrent=4,
+    use_s3=True,
+    track_bytes=False,
+))
+
+# Equivalent to: nexus-transfers copy-ssh --source /data --target user@host:/remote
+asyncio.run(_copy_to_ssh(
+    source="/data",
+    target="user@host:/remote",
+    broker_url="ws://localhost:8766",  # None to skip monitoring
+    name="my-ssh-copy",
+    site=None,
+    max_concurrent=4,
+    ssh_port=22,
+    ssh_key=None,
+    ssh_connections=2,
+    track_bytes=False,
+    ssl_verify=True,
+))
+```
+
+### Progress callbacks
+
+The relay broadcasts a progress event roughly every 30 seconds during a copy.
+Register a monitoring client with `on_monitor_event` to receive these events:
+
+```python
+def on_progress(event: dict) -> None:
+    # event keys: type, message, source, date
+    # type is "progress", "ok", "error", or "info"
+    print(event["source"], event["message"])
+
+async with Client("monitor", url="ws://localhost:8766",
+                  on_monitor_event=on_progress) as monitor:
+    await monitor.register_monitor()
+    await asyncio.Future()  # keep receiving events
+```
+
+You can also set the handler after construction:
+
+```python
+client.on_monitor_event = my_callback
+```
+
+Or pass it to `register_monitor`:
+
+```python
+await client.register_monitor(callback=my_callback)
+```
+
 ## Direct SSH copy (no relay required)
 
 `nexus-transfers copy-ssh` copies a local directory straight to a remote host over

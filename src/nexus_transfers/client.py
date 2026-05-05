@@ -112,12 +112,18 @@ class Client:
     ssl_verify:
         If False, skip TLS certificate verification for ``wss://``
         connections.  Defaults to True.
+    on_monitor_event:
+        Optional callable invoked with each monitor-event dict broadcast by
+        the relay.  The client must also call :meth:`register_monitor` to
+        subscribe to broadcasts; ``on_monitor_event`` only sets the handler.
+        Equivalent to setting :attr:`on_monitor_event` after construction.
     """
 
     def __init__(self, name, url=None, dispatch=None, allowed_paths=None,
                  reconnect_retries=0, reconnect_delay=2.0,
                  peer_retries=0, peer_delay=2.0,
-                 call_timeout=None, ssl_verify=True):
+                 call_timeout=None, ssl_verify=True,
+                 on_monitor_event=None):
         self.name = name
         self.url = url or _DEFAULT_URL
         self.dispatch = dispatch if dispatch is not None else dict(DISPATCH)
@@ -128,6 +134,7 @@ class Client:
         self.peer_delay = peer_delay
         self.call_timeout = call_timeout
         self.ssl_verify = ssl_verify
+        self.on_monitor_event = on_monitor_event
         self._s3_keys: set[str] = set()
         if self.allowed_paths:
             self.dispatch["get_file"] = make_get_file(self.allowed_paths)
@@ -152,7 +159,6 @@ class Client:
         self._progress_task_ids: dict = {}
         self._listener_task = None
         self._closed = False
-        self._on_monitor_event = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -214,7 +220,7 @@ class Client:
             _on_monitor_event was set directly.
         """
         if callback is not None:
-            self._on_monitor_event = callback
+            self.on_monitor_event = callback
         frame = encode_frame(self.name, "register_monitor", "", "J", b"{}")
         await self._ws.send(frame)
         # Wait for ack
@@ -1070,12 +1076,10 @@ class Client:
                                 future.set_result(True)
 
                         case "monitor_event":
-                            # Received a broadcast event from the broker.
-                            # Dispatch to local on_monitor_event callback if set.
-                            if self._on_monitor_event is not None:
+                            if self.on_monitor_event is not None:
                                 try:
                                     event = json.loads(payload)
-                                    self._on_monitor_event(event)
+                                    self.on_monitor_event(event)
                                 except Exception:
                                     _logger.debug("on_monitor_event failed", exc_info=True)
 
