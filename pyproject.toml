@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "nexus-transfers"
 version = "0.1.0"
-description = "WebSocket relay server and RPC client"
+description = "WebSocket relay broker and RPC client"
 requires-python = ">=3.12"
 dependencies = [
     "websockets>=16.0",
@@ -17,7 +17,8 @@ dependencies = [
 ]
 
 [project.scripts]
-nexus-server = "nexus_transfers.server:main"
+nexus-transfer = "nexus_transfers.cli:main"
+nexus-broker = "nexus_transfers.broker:main"
 nexus-client = "nexus_transfers.client:main"
 nexus-copy = "nexus_transfers.copy:main"
 nexus-monitor = "nexus_transfers.monitor:main"

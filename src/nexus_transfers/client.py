@@ -11,20 +11,33 @@ import ssl
 import tempfile
 import traceback
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
-                           TimeRemainingColumn)
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
 from nexus_transfers._progress import (
-    _BinarySpeedColumn, _CountOrBytesColumn, _fmt_binary,
+    _BinarySpeedColumn,
+    _CountOrBytesColumn,
+    _fmt_binary,
 )
 from nexus_transfers.config import cli_default, resolve
-from nexus_transfers.dispatch import (DISPATCH, FileTransfer, S3Transfer,
-                                       make_get_file, make_list_dir)
+from nexus_transfers.dispatch import (
+    DISPATCH,
+    FileTransfer,
+    S3Transfer,
+    make_get_file,
+    make_list_dir,
+)
 from nexus_transfers.protocol import decode_frame, encode_frame
 
 load_dotenv(Path.home() / ".env")
@@ -69,14 +82,14 @@ class NameTakenError(Exception):
 
 
 class Client:
-    """Programmatic RPC client that connects to the relay server.
+    """Programmatic RPC client that connects to the relay broker.
 
     Parameters
     ----------
     name:
         Unique client identifier.
     url:
-        WebSocket server URL.
+        WebSocket broker URL.
     dispatch:
         Dispatch table for incoming calls.  Defaults to the built-in
         ``DISPATCH`` table (adder, echo).
@@ -84,7 +97,7 @@ class Client:
         List of directories that ``get_file`` and ``list_dir`` may access.
         If ``None``, file operations are disabled.
     reconnect_retries:
-        Number of reconnection attempts when the server connection drops.
+        Number of reconnection attempts when the broker connection drops.
         ``-1`` means infinite retries.  ``0`` disables reconnection.
     reconnect_delay:
         Seconds to wait between reconnection attempts.
@@ -139,6 +152,7 @@ class Client:
         self._progress_task_ids: dict = {}
         self._listener_task = None
         self._closed = False
+        self._on_monitor_event = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -180,7 +194,7 @@ class Client:
                 raise RuntimeError(f"Unexpected registration response: {msg_name!r}")
 
     async def connect(self):
-        """Connect to the server and register, with optional retries."""
+        """Connect to the broker and register, with optional retries."""
         await self._register()
         self._progress.start()
         self._listener_task = asyncio.create_task(self._listener())
@@ -189,11 +203,28 @@ class Client:
             status="ok",
         )
 
+    async def register_monitor(self, callback=None):
+        """Register this client as a monitor to receive broadcast events.
+
+        Parameters
+        ----------
+        callback
+            Callable invoked with each event dict when a monitor_event
+            frame arrives. If None, events are silently discarded unless
+            _on_monitor_event was set directly.
+        """
+        if callback is not None:
+            self._on_monitor_event = callback
+        frame = encode_frame(self.name, "register_monitor", "", "J", b"{}")
+        await self._ws.send(frame)
+        # Wait for ack
+        ack_future = asyncio.get_running_loop().create_future()
+        self._pending["__register_monitor__"] = ack_future
+        await asyncio.wait_for(ack_future, timeout=10)
+
     async def close(self):
-        """Disconnect from the server."""
+        """Disconnect from the broker."""
         self._closed = True
-        # Emit before cancelling the listener — monitor() awaits a reply
-        # frame that only the listener can dispatch.
         if self._ws is not None:
             await self.monitor(
                 f"{self.name}: disconnecting from {self.url}",
@@ -221,7 +252,7 @@ class Client:
     # ------------------------------------------------------------------
 
     async def _reconnect(self):
-        """Attempt to re-establish the server connection.
+        """Attempt to re-establish the broker connection.
 
         Retries up to ``reconnect_retries`` times (``-1`` = infinite).
         Raises ``NameTakenError`` immediately if the name is in use.
@@ -238,14 +269,11 @@ class Client:
             try:
                 await self._register()
                 _logger.info("Reconnected successfully")
-                # Schedule on its own task: _reconnect runs inside the
-                # listener, and monitor() awaits a reply that only the
-                # listener can deliver — awaiting here would deadlock.
-                asyncio.create_task(self.monitor(
+                await self.monitor(
                     f"{self.name}: reconnected to {self.url} "
                     f"after {attempt} attempt(s)",
                     status="ok",
-                ))
+                )
                 return
             except NameTakenError:
                 raise
@@ -327,12 +355,29 @@ class Client:
 
     _MONITOR_TIMEOUT = 0.5
 
-    async def monitor(self, message: str, status: str | None = None):
-        """Send a monitoring message to the ``monitor`` peer.
+    def _utcnow(self) -> str:
+        """Return current UTC time in ISO 8601 format."""
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
-        This is fire-and-forget: if no monitor peer is connected, or the
-        call times out, the error is silently ignored so it never blocks
+    async def _emit_event(self, event: dict):
+        """Send a structured monitoring event to the broker for broadcast.
+
+        Fire-and-forget: silently ignores failures so it never blocks
         the caller.
+        """
+        event.setdefault("source", self.name)
+        event.setdefault("date", self._utcnow())
+        payload = json.dumps(event).encode()
+        frame = encode_frame(self.name, "monitor_event", "", "J", payload)
+        try:
+            await asyncio.wait_for(self._ws.send(frame), timeout=self._MONITOR_TIMEOUT)
+        except Exception:
+            _logger.debug("Monitor event send failed", exc_info=True)
+
+    async def monitor(self, message: str, status: str | None = None,
+                      event_type: str = "info", task: dict | None = None,
+                      progress: dict | None = None):
+        """Emit a monitoring event.
 
         Parameters
         ----------
@@ -340,17 +385,27 @@ class Client:
             Free-form message string.
         status
             Optional status label (e.g. ``"ok"``, ``"error"``, ``"progress"``).
+            Maps to event_type if event_type not explicitly set.
+        event_type
+            Event type (e.g. ``"info"``, ``"error"``, ``"warning"``, ``"progress"``).
+        task
+            Optional task descriptor dict.
+        progress
+            Optional progress descriptor dict.
         """
-        try:
-            kwargs = {}
-            if status is not None:
-                kwargs["status"] = status
-            await asyncio.wait_for(
-                self.send("monitor.log", message, **kwargs),
-                timeout=self._MONITOR_TIMEOUT,
-            )
-        except Exception:
-            _logger.debug("Monitor send failed", exc_info=True)
+        if status and event_type == "info":
+            # Backwards compat: map status to event_type
+            event_type = status
+
+        event: dict = {
+            "type": event_type,
+            "message": message,
+        }
+        if task is not None:
+            event["task"] = task
+        if progress is not None:
+            event["progress"] = progress
+        await self._emit_event(event)
 
     # ------------------------------------------------------------------
     # Directory / file transfer helpers
@@ -956,7 +1011,7 @@ class Client:
                     except ValueError:
                         continue
 
-                    _logger.debug("[recv] %s from %s", msg_name, source or "server")
+                    _logger.debug("[recv] %s from %s", msg_name, source or "broker")
 
                     match msg_name:
                         case "call":
@@ -1011,6 +1066,21 @@ class Client:
                             if future and not future.done():
                                 future.set_result(data.get("clients", []))
 
+                        case "register_monitor":
+                            future = self._pending.pop("__register_monitor__", None)
+                            if future and not future.done():
+                                future.set_result(True)
+
+                        case "monitor_event":
+                            # Received a broadcast event from the broker.
+                            # Dispatch to local on_monitor_event callback if set.
+                            if self._on_monitor_event is not None:
+                                try:
+                                    event = json.loads(payload)
+                                    self._on_monitor_event(event)
+                                except Exception:
+                                    _logger.debug("on_monitor_event failed", exc_info=True)
+
                         case "error":
                             data = json.loads(payload)
                             error = data.get("error", "unknown error")
@@ -1028,7 +1098,7 @@ class Client:
                 # The async for loop ended normally — clean disconnect.
                 if self._closed:
                     return
-                _logger.warning("Connection closed by server")
+                _logger.warning("Connection closed by broker")
                 for future in self._pending.values():
                     if not future.done():
                         future.set_exception(ConnectionError("connection closed"))
@@ -1218,11 +1288,11 @@ async def _interactive_listener(client, console):
             try:
                 _, source, msg_name, _target, encoding, payload = decode_frame(raw)
             except ValueError:
-                console.print(f"\n  [dim]<< <malformed frame>[/dim]")
+                console.print("\n  [dim]<< <malformed frame>[/dim]")
                 print(f"[{name}] > ", end="", flush=True)
                 continue
 
-            sender = source or "server"
+            sender = source or "broker"
 
             match msg_name:
                 case "call":
@@ -1270,7 +1340,7 @@ async def _interactive_listener(client, console):
 
                 case "error":
                     data = json.loads(payload)
-                    console.print(f"\n  [error]\\[server error][/error] {data.get('error')}")
+                    console.print(f"\n  [error]\\[broker error][/error] {data.get('error')}")
 
                 case _:
                     console.print(f"\n  [dim]<< msg={msg_name!r} from {sender}[/dim]")
@@ -1287,9 +1357,9 @@ def main():
 
     parser = argparse.ArgumentParser(description="Transfer RPC client")
     parser.add_argument("--name", required=True, help="Unique client ID")
-    parser.add_argument("--server-url",
-                        default=cli_default("server_url", "client", default=None),
-                        help=f"Server WebSocket URL (default: {_DEFAULT_URL})")
+    parser.add_argument("--broker-url",
+                        default=cli_default("broker_url", "client", default=None),
+                        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})")
     parser.add_argument("--allow-path", action="append", default=[],
                         help="Allowed directory for get_file/list_dir (repeatable)")
     parser.add_argument("--interactive", action="store_true",
@@ -1331,10 +1401,10 @@ def main():
         ssl_verify=not args.no_verify,
     )
     coro = (
-        _interactive(args.name, args.server_url,
+        _interactive(args.name, args.broker_url,
                      allowed_paths=args.allow_path or None, **client_kwargs)
         if args.interactive
-        else _serve(args.name, args.server_url,
+        else _serve(args.name, args.broker_url,
                     allowed_paths=args.allow_path or None, **client_kwargs)
     )
     asyncio.run(coro)

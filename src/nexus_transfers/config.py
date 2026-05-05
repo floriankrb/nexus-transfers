@@ -6,7 +6,7 @@ with the precedence: CLI option > environment variable > config file > default.
 Environment variables starting with ``NEXUS_TRANSFER_`` (or ``NEXUS_TRANSFERS_``)
 map to config keys in lowercase without the prefix.
 
-Per-tool CLI defaults are read from TOML sections: ``[server]``, ``[client]``,
+Per-tool CLI defaults are read from TOML sections: ``[broker]``, ``[client]``,
 ``[copy]``, ``[monitor]``, ``[copy_ssh]``.
 """
 
@@ -40,7 +40,7 @@ def get(key: str, *, section: str | None = None, default=None):
     key : str
         Config key name (e.g. ``"url"``, ``"reconnect_retries"``).
     section : str or None
-        TOML section name (e.g. ``"server"``, ``"client"``).
+        TOML section name (e.g. ``"broker"``, ``"client"``).
         If None, reads from the top-level table.
     default :
         Fallback value if the key is not found.

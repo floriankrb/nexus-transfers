@@ -29,9 +29,9 @@ url = "ws://localhost:8766"
 # Use virtual-hosted-style requests (env: NEXUS_TRANSFER_S3_VIRTUAL_HOSTED_STYLE)
 # s3_virtual_hosted_style = false
 
-# ─── [server] — nexus-server ─────────────────────────────────────────────────
+# ─── [broker] — nexus-broker ──────────────────────────────────────────────────
 
-[server]
+[broker]
 host = "localhost"
 port = 8766
 # debug = false
@@ -39,7 +39,7 @@ port = 8766
 # ─── [client] — nexus-client ─────────────────────────────────────────────────
 
 [client]
-# server_url = "ws://localhost:8766"
+# broker_url = "ws://localhost:8766"
 reconnect_retries = -1       # -1 = infinite
 reconnect_delay = 2.0        # seconds
 peer_retries = -1            # -1 = infinite
@@ -52,10 +52,10 @@ peer_delay = 2.0             # seconds
 # ─── [copy] — nexus-copy ─────────────────────────────────────────────────────
 
 [copy]
-# server_url = "ws://localhost:8766"
+# broker_url = "ws://localhost:8766"
 max_concurrent = 4           # parallel file transfers
 chunk_size = 65536           # bytes per binary chunk
-# use_server = false         # true = relay via WebSocket instead of S3
+# use_broker = false         # true = relay via WebSocket instead of S3
 reconnect_retries = -1
 reconnect_delay = 2.0
 peer_retries = -1
@@ -69,7 +69,7 @@ peer_delay = 2.0
 # ─── [monitor] — nexus-monitor ───────────────────────────────────────────────
 
 [monitor]
-# server_url = "ws://localhost:8766"
+# broker_url = "ws://localhost:8766"
 reconnect_retries = -1
 reconnect_delay = 2.0
 # no_verify = false
@@ -78,7 +78,7 @@ reconnect_delay = 2.0
 # ─── [copy_ssh] — nexus-copy-to-ssh ──────────────────────────────────────────
 
 [copy_ssh]
-# server_url = "ws://localhost:8766"  # relay for monitoring only
+# broker_url = "ws://localhost:8766"  # relay for monitoring only
 max_concurrent = 4           # parallel SFTP uploads
 ssh_port = 22
 # ssh_key = "/home/user/.ssh/id_ed25519"

@@ -1,11 +1,16 @@
 """Shared fixtures for nexus-transfers tests."""
 
-import asyncio
 
 import pytest
 from websockets.asyncio.server import serve
 
-from nexus_transfers.server import relay_handler, clients, clients_lock
+from nexus_transfers.broker import (
+    clients,
+    clients_lock,
+    monitors,
+    monitors_lock,
+    relay_handler,
+)
 
 
 @pytest.fixture()
@@ -19,10 +24,12 @@ def free_port():
 
 
 @pytest.fixture()
-async def server(free_port):
-    """Start a relay server on a free port and yield the URL."""
+async def broker(free_port):
+    """Start a relay broker on a free port and yield the URL."""
     with clients_lock:
         clients.clear()
+    with monitors_lock:
+        monitors.clear()
 
     async with serve(relay_handler, "localhost", free_port):
         yield f"ws://localhost:{free_port}"

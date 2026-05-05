@@ -6,16 +6,16 @@ Frame layout
   ----  -----
    1    version       uint8, must be 1
    1    src_len       uint8
-   N    source        sender name (UTF-8); empty string for server-originated frames
+   N    source        sender name (UTF-8); empty string for broker-originated frames
    1    msg_len       uint8
    M    msg_name      message type (UTF-8), e.g. "register", "call", "reply", "chunk"
-   1    tgt_len       uint8; **0 means the frame is addressed to the server itself**
+   1    tgt_len       uint8; **0 means the frame is addressed to the broker itself**
    K    target        recipient client name (UTF-8); absent when tgt_len == 0
    1    encoding      ord('J') = JSON payload, ord('R') = raw bytes
    4    size          payload byte count, big-endian uint32
    P    payload       payload bytes
 
-The server only decodes the payload when the frame is addressed to itself (tgt_len == 0).
+The broker only decodes the payload when the frame is addressed to itself (tgt_len == 0).
 For all other frames it forwards the raw bytes without touching the payload.
 """
 
@@ -34,11 +34,11 @@ def encode_frame(
     Parameters
     ----------
     source:
-        Sender name. Use ``""`` for frames originated by the server.
+        Sender name. Use ``""`` for frames originated by the broker.
     msg_name:
         Message type string, e.g. ``"register"``, ``"call"``, ``"chunk"``.
     target:
-        Destination client name. Use ``""`` to address the server.
+        Destination client name. Use ``""`` to address the broker.
     encoding:
         ``'J'`` for a JSON payload, ``'R'`` for opaque bytes.
     payload:

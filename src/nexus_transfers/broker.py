@@ -1,7 +1,7 @@
-"""WebSocket relay server that routes binary frames between named clients.
+"""WebSocket relay broker that routes binary frames between named clients.
 
-The server only decodes the JSON payload of frames addressed to itself
-(target == "").  All other frames are forwarded verbatim so the server
+The broker only decodes the JSON payload of frames addressed to itself
+(target == "").  All other frames are forwarded verbatim so the broker
 never needs to inspect client-to-client message bodies.
 """
 
@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 
 from websockets.asyncio.server import serve
 
@@ -19,6 +20,28 @@ logger = logging.getLogger(__name__)
 # name -> websocket mapping
 clients: dict[str, object] = {}
 clients_lock = threading.Lock()  # kept; conftest.py uses it to clear state between tests
+
+# name -> websocket mapping for monitor clients
+monitors: dict[str, object] = {}
+monitors_lock = threading.Lock()
+
+
+def _utcnow() -> str:
+    """Return current UTC time in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+async def _broadcast_event(event: dict):
+    """Send an event to all registered monitors (fire-and-forget, no reply)."""
+    payload = json.dumps(event).encode()
+    frame = encode_frame("", "monitor_event", "", "J", payload)
+    with monitors_lock:
+        targets = list(monitors.values())
+    for ws in targets:
+        try:
+            await ws.send(frame)
+        except Exception:
+            pass  # monitor disconnected; will be cleaned up on close
 
 
 def _err(target: str, error: str, *, msg_id: str | None = None) -> bytes:
@@ -35,6 +58,7 @@ def _ok(target: str, msg_name: str, body: dict | None = None) -> bytes:
 async def relay_handler(websocket):
     """Handle a single client connection."""
     client_name = None
+    is_monitor = False
     remote = websocket.remote_address
 
     try:
@@ -66,6 +90,13 @@ async def relay_handler(websocket):
                 client_name = source
                 await websocket.send(_ok(client_name, "register"))
                 logger.info("[+] Registered: %s (%s)", client_name, remote)
+                # Emit connect event to monitors
+                await _broadcast_event({
+                    "type": "connected",
+                    "date": _utcnow(),
+                    "source": client_name,
+                    "message": f"Client '{client_name}' connected",
+                })
                 continue
 
             # ----------------------------------------------------------------
@@ -108,18 +139,36 @@ async def relay_handler(websocket):
                 continue
 
             # ----------------------------------------------------------------
-            # Frame addressed to the server — decode JSON and dispatch
+            # Frame addressed to the broker — decode JSON and dispatch
             # ----------------------------------------------------------------
             match msg_name:
                 case "register":
                     # Re-registration from an already-registered client
                     await websocket.send(_ok(client_name, "register"))
 
+                case "register_monitor":
+                    with monitors_lock:
+                        monitors[client_name] = websocket
+                    is_monitor = True
+                    await websocket.send(_ok(client_name, "register_monitor"))
+                    logger.info("[+] Monitor registered: %s", client_name)
+
                 case "list_clients":
                     with clients_lock:
                         names = sorted(clients.keys())
                     await websocket.send(_ok(client_name, "list_clients", {"clients": names}))
                     logger.debug("list_clients -> %s: %s", client_name, names)
+
+                case "monitor_event":
+                    # Client emitting a monitoring event — broadcast to all monitors
+                    try:
+                        event = json.loads(payload)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    # Ensure source is set
+                    event.setdefault("source", client_name)
+                    event.setdefault("date", _utcnow())
+                    await _broadcast_event(event)
 
                 case msg:
                     await websocket.send(_err(client_name, f"unknown message '{msg}'"))
@@ -130,33 +179,43 @@ async def relay_handler(websocket):
         if client_name:
             with clients_lock:
                 clients.pop(client_name, None)
+            if is_monitor:
+                with monitors_lock:
+                    monitors.pop(client_name, None)
             logger.info("[-] Disconnected: %s (%s)", client_name, remote)
+            # Emit disconnect event to monitors
+            await _broadcast_event({
+                "type": "disconnected",
+                "date": _utcnow(),
+                "source": client_name,
+                "message": f"Client '{client_name}' disconnected",
+            })
         else:
             logger.info("[-] Disconnected unregistered: %s", remote)
 
 
-async def run_server(host="localhost", port=8766):
-    """Start the relay server."""
+async def run_broker(host="localhost", port=8766):
+    """Start the relay broker."""
     async with serve(relay_handler, host, port, max_size=104_857_600):  # 100 MiB
-        print(f"Relay server listening on ws://{host}:{port}")
+        print(f"Relay broker listening on ws://{host}:{port}")
         await asyncio.get_running_loop().create_future()
 
 
 def main():
-    """CLI entry point for ``nexus-server``."""
+    """CLI entry point for ``nexus-broker``."""
     import argparse
 
     from nexus_transfers.config import cli_default
 
-    parser = argparse.ArgumentParser(description="Transfer relay server")
+    parser = argparse.ArgumentParser(description="Transfer relay broker")
     parser.add_argument("--host",
-                        default=cli_default("host", "server", default="localhost"),
+                        default=cli_default("host", "broker", default="localhost"),
                         help="Bind address")
     parser.add_argument("--port", type=int,
-                        default=cli_default("port", "server", default=8766, type_fn=int),
+                        default=cli_default("port", "broker", default=8766, type_fn=int),
                         help="Bind port")
     parser.add_argument("--debug", action="store_true",
-                        default=cli_default("debug", "server", default=False),
+                        default=cli_default("debug", "broker", default=False),
                         help="Enable debug logging")
     args = parser.parse_args()
     from rich.logging import RichHandler
@@ -164,7 +223,7 @@ def main():
         level=logging.DEBUG if args.debug else logging.INFO,
         handlers=[RichHandler(rich_tracebacks=True)],
     )
-    asyncio.run(run_server(args.host, args.port))
+    asyncio.run(run_broker(args.host, args.port))
 
 
 if __name__ == "__main__":

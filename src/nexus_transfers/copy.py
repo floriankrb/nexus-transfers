@@ -3,7 +3,7 @@
 Usage::
 
     nexus-copy --from a /remote/dir /local/dir
-    nexus-copy --from a src ./mirror --server-url wss://example.com/transfers
+    nexus-copy --from a src ./mirror --broker-url wss://example.com/transfers
 """
 
 import argparse
@@ -13,9 +13,11 @@ import logging
 import os
 import uuid
 
-from nexus_transfers.client import Client, _DEFAULT_URL
-from nexus_transfers.config import cli_default
 from rich.console import Console
+
+from nexus_transfers.client import _DEFAULT_URL, Client
+from nexus_transfers.config import cli_default
+
 
 def main():
     """CLI entry point for ``nexus-copy``."""
@@ -31,9 +33,9 @@ def main():
     parser.add_argument("source", help="Remote directory path")
     parser.add_argument("target", help="Local destination directory")
     parser.add_argument(
-        "--server-url",
-        default=cli_default("server_url", "copy", default=None),
-        help=f"Server WebSocket URL (default: {_DEFAULT_URL})",
+        "--broker-url",
+        default=cli_default("broker_url", "copy", default=None),
+        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})",
     )
     parser.add_argument(
         "--name",
@@ -53,9 +55,9 @@ def main():
         help="Binary chunk size in bytes for file transfers (default: 65536)",
     )
     parser.add_argument(
-        "--use-server",
+        "--use-broker",
         action="store_true",
-        default=cli_default("use_server", "copy", default=False),
+        default=cli_default("use_broker", "copy", default=False),
         help="Transfer via the WebSocket relay instead of S3 staging",
     )
     parser.add_argument(
@@ -125,14 +127,14 @@ def main():
     asyncio.run(
         _copy(
             name=name,
-            url=args.server_url,
+            url=args.broker_url,
             remote_client=args.remote_client,
             source=args.source,
             target=args.target,
             site=args.site,
             max_concurrent=args.max_concurrent,
             chunk_size=args.chunk_size,
-            use_s3=not args.use_server,
+            use_s3=not args.use_broker,
             track_bytes=args.size,
             reconnect_retries=args.reconnect_retries,
             reconnect_delay=args.reconnect_delay,
@@ -152,7 +154,7 @@ async def _copy(name, url, remote_client, source, target, site=None,
     console = Console()
     async with Client(name, url, **client_kwargs) as client:
         console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
-        via = "" if use_s3 else " [dim](via server)[/dim]"
+        via = "" if use_s3 else " [dim](via broker)[/dim]"
         dest_label = f"{site}:{target}" if site else target
         console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{dest_label}[/yellow]{via}")
         await client.monitor(

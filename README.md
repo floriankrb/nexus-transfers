@@ -1,6 +1,6 @@
 # nexus-transfers
 
-WebSocket relay server with named RPC routing, binary file transfer, and recursive directory sync.
+WebSocket relay broker with named RPC routing, binary file transfer, and recursive directory sync.
 
 ## Installation
 
@@ -12,16 +12,16 @@ pip install -e .
 
 ## Quick start
 
-### 1. Start the server
+### 1. Start the broker
 
 ```bash
-nexus-server --port 8766
+nexus-broker --port 8766
 ```
 
 ### 2. Start a client
 
 ```bash
-nexus-client --name a --server-port 8766 --allow-path /path/to/share
+nexus-client --name a --broker-url ws://localhost:8766 --allow-path /path/to/share
 ```
 
 `--allow-path` can be repeated to expose multiple directories for `get_file` and `list_dir` operations. Without it, only built-in RPC functions (`adder`, `echo`) are available.
@@ -31,7 +31,7 @@ nexus-client --name a --server-port 8766 --allow-path /path/to/share
 From another terminal (or from Python):
 
 ```bash
-nexus-client --name b --server-port 8766
+nexus-client --name b --broker-url ws://localhost:8766
 ```
 
 Then in the interactive prompt:
@@ -95,7 +95,7 @@ Local filesystem ──► nexus-copy-to-ssh ──► SFTP ──► SSH target
 nexus-copy-to-ssh \
     --source /data/dataset.zarr \
     --target user@host:/remote/path \
-    --server-url wss://relay.example.com \
+    --broker-url wss://relay.example.com \
     --max-concurrent 8 \
     --ssh-connections 2
 ```
@@ -113,7 +113,7 @@ size already matches the local size.
 - **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
 - **Direct SSH copy** — `nexus-copy-to-ssh` uploads a local directory via SFTP without any relay involvement in the data path
 - **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
-- **Shared memory** — key-value store on the server, accessible from any client via `/mem` commands
+- **Shared memory** — key-value store on the broker, accessible from any client via `/mem` commands
 - **Client discovery** — `list_clients` / `/clients` returns all connected client names
 
 ## S3 staging
@@ -139,7 +139,7 @@ on the provider's disk is untouched.
 
 ## CLI reference
 
-### `nexus-server`
+### `nexus-broker`
 
 | Flag     | Default     | Description   |
 |----------|-------------|---------------|
@@ -151,7 +151,7 @@ on the provider's disk is untouched.
 | Flag            | Default                  | Description                                      |
 |-----------------|--------------------------|--------------------------------------------------|
 | `--name`        | (required)               | Unique client ID                                 |
-| `--server-url`  | `ws://localhost:8766`    | Server WebSocket URL                             |
+| `--broker-url`  | `ws://localhost:8766`    | Broker WebSocket URL                             |
 | `--allow-path`  | (none)                   | Directory to expose for file operations (repeatable) |
 
 ### `nexus-copy`
@@ -160,7 +160,7 @@ on the provider's disk is untouched.
 |--------------------|-----------------------|--------------------------------------------------------|
 | `--from`           | (required)            | Name of the remote client                              |
 | `source target`    | (required)            | Remote source dir, local target dir                    |
-| `--server-url`     | `ws://localhost:8766` | Server WebSocket URL                                   |
+| `--broker-url`     | `ws://localhost:8766` | Broker WebSocket URL                                   |
 | `--max-concurrent` | `4`                   | Maximum parallel file transfers                        |
 | `--chunk-size`     | `65536`               | Binary chunk size (ignored with `--use-s3`)            |
 | `--use-s3`         | off                   | Stage transfers through S3 (needs `NEXUS_TRANSFER_S3_*`) |
@@ -171,7 +171,7 @@ on the provider's disk is untouched.
 |--------------------|------------------------|-----------------------------------------------------|
 | `--source`         | (required)             | Local directory to copy                             |
 | `--target`         | (required)             | `[user@]host:/remote/path`                          |
-| `--server-url`     | `$NEXUS_TRANSFERS_URL` | Relay URL for monitoring only (optional)            |
+| `--broker-url`     | `$NEXUS_TRANSFERS_URL` | Relay URL for monitoring only (optional)            |
 | `--name`           | auto-generated         | Client name on the relay                            |
 | `--site`           | (none)                 | Site label for monitor messages                     |
 | `--max-concurrent` | `4`                    | Number of parallel SFTP uploads                     |

@@ -1,6 +1,11 @@
-"""Nexus Transfers – WebSocket relay server and RPC client."""
+"""Nexus Transfers – WebSocket relay broker and RPC client."""
 
-from nexus_transfers.client import Client, NameTakenError, PeerNotFoundError, RemoteError
+from nexus_transfers.client import (
+    Client,
+    NameTakenError,
+    PeerNotFoundError,
+    RemoteError,
+)
 from nexus_transfers.dispatch import (
     DISPATCH,
     FileTransfer,

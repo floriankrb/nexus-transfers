@@ -13,13 +13,20 @@ import uuid
 from pathlib import PurePosixPath
 
 from rich.console import Console
-from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
-                           TimeRemainingColumn)
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 from nexus_transfers._progress import (
-    _BinarySpeedColumn, _CountOrBytesColumn, _fmt_binary,
+    _BinarySpeedColumn,
+    _CountOrBytesColumn,
+    _fmt_binary,
 )
-from nexus_transfers.client import Client, _DEFAULT_URL
+from nexus_transfers.client import _DEFAULT_URL, Client
 from nexus_transfers.config import cli_default
 from nexus_transfers.ssh import SSHPool, stat_remote, write_file
 
@@ -88,7 +95,7 @@ async def _walk_local(source_path: str, queue: asyncio.Queue) -> None:
 async def _copy_to_ssh(
     source: str,
     target: str,
-    server_url: str | None,
+    broker_url: str | None,
     name: str,
     site: str | None,
     max_concurrent: int,
@@ -106,7 +113,7 @@ async def _copy_to_ssh(
         Local directory to copy.
     target : str
         Remote target in the form ``[user@]host:/path``.
-    server_url : str or None
+    broker_url : str or None
         Relay WebSocket URL for monitoring only; ``None`` disables monitoring.
     name : str
         Client name on the relay.
@@ -136,10 +143,10 @@ async def _copy_to_ssh(
     )
 
     monitor_client: Client | None = None
-    if server_url:
+    if broker_url:
         try:
             monitor_client = Client(
-                name, server_url, dispatch={},
+                name, broker_url, dispatch={},
                 ssl_verify=ssl_verify, reconnect_retries=0,
             )
             await monitor_client.connect()
@@ -271,8 +278,8 @@ def main() -> None:
         help="Remote target: [user@]host:/remote/path",
     )
     parser.add_argument(
-        "--server-url",
-        default=cli_default("server_url", "copy_ssh", default=None),
+        "--broker-url",
+        default=cli_default("broker_url", "copy_ssh", default=None),
         help=f"Relay WebSocket URL for monitoring (default: ${_DEFAULT_URL!r})",
     )
     parser.add_argument(
@@ -332,7 +339,7 @@ def main() -> None:
         _copy_to_ssh(
             source=args.source,
             target=args.target,
-            server_url=args.server_url,
+            broker_url=args.broker_url,
             name=name,
             site=args.site,
             max_concurrent=args.max_concurrent,

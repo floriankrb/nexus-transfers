@@ -1,9 +1,46 @@
+One or more client will be able to register as monitoring service.
+Each monitor messages (called events) will be broadcast to all monitoring services.
+No replies will be given to the monitoring messages.
 
 
-let's add a monitoring facility
+the broker will issue a monitoring events when a new client connects and a client a client is disconnected
 
-there will be a fucntion called monitor, called by any peer, take a string and optional status. this will call the peer called monitor with the parameters, and if monitor does not run, the error is ignored (don't block), the imteout for the reply is very short and not an error.
-write nexus-monitor cli that will register as 'monitor' and print the message string (and status)
-let s add a call to monitor in nexus-copy that will send a message to report on the progress on the copy.
+write nexus-monitor cli that will register as a monitoring and print the broadcasted messages in the terminal.
 
+Events have the following format (all dates in ISO UTC):
 
+```json
+{
+    "type": "...",
+    "date": "...",
+    "source: "... name of client ...",
+    "task": {
+        "name": "...",
+        "uuid": uuid,
+        ... more entries related to each kind of task ...
+    },
+    "message": "Some text",
+    "progress": {
+        "label": "...",
+        "uuid": uuid,
+        "start": "... start date ... ",
+        "update": "... update date ... ",
+        "minimum": 1,
+        "maximum": 123,
+        "value": 27,
+        "unit": "byte"
+        "rate": 2.4,
+    }
+}
+```
+
+progress can be missing for simple messages
+All events with the same progress uuid refer to the same progress
+
+We start with the following events
+- Registered to broker
+- End
+- Messages to peers (e.g. list_dir, get_file, ...)
+- Data transfer progress (only top level progress)
+- Errors
+- Warnings
