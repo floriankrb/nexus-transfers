@@ -240,6 +240,7 @@ def download_file(
     progress_callback: Callable[[int], None] | None = None,
     target: str | None = None,
     bucket: str | None = None,
+    target_path: str | None = None,
 ) -> str:
     """Download an object from S3 to a temporary file.
 
@@ -260,17 +261,30 @@ def download_file(
     bucket
         Bucket name returned by the sender.  When supplied, the receiver
         does not need ``NEXUS_TRANSFER_S3_BUCKET`` in its own environment.
+    target_path
+        If provided, the temp file is created next to this path with a
+        ``.tmp.<random>`` suffix instead of in the system temp dir.  This
+        avoids cross-filesystem rename errors when the caller renames the
+        result onto ``target_path``.
     """
     store = get_store(bucket=bucket)
     bucket = bucket or _normalise_bucket(os.environ.get(S3_BUCKET_ENV, "?"))
-    target_label = target or "(temp file)"
+    target_label = target or target_path or "(temp file)"
     logger.debug("S3 download: s3://%s/%s -> %s", bucket, s3_key, target_label)
 
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             result = obs.get(store, s3_key)
-            fd, tmp_path = tempfile.mkstemp(prefix="nexus-s3-")
+            if target_path is not None:
+                target_dir = os.path.dirname(target_path) or "."
+                os.makedirs(target_dir, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=target_dir,
+                    prefix=os.path.basename(target_path) + ".tmp.",
+                )
+            else:
+                fd, tmp_path = tempfile.mkstemp(prefix="nexus-s3-")
             try:
                 hasher = hashlib.sha256()
                 with os.fdopen(fd, "wb") as fh:

@@ -20,11 +20,3 @@ def _write_file(path, data):
     except BaseException:
         os.unlink(tmp)
         raise
-
-
-def _move_file_atomic(src, dst):
-    """Move *src* to *dst* atomically via ``os.replace``.
-
-    Requires *src* and *dst* to be on the same filesystem.
-    """
-    os.replace(src, dst)

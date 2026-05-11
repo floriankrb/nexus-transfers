@@ -106,6 +106,7 @@ class Client:
             self.dispatch["s3_cleanup"] = self._s3_cleanup
         self._ws = None
         self._pending: dict[str, asyncio.Future] = {}
+        self._local_targets: dict[str, str] = {}
         self._binary_buffers: dict = {}
         self._binary_received: dict = {}
         self._binary_hashes: dict = {}
@@ -289,12 +290,16 @@ class Client:
         if "." not in target_func:
             raise ValueError(f"target_func must be '<target>.<func>', got '{target_func}'")
 
+        local_target = kwargs.pop("_local_target", None)
+
         attempt = 0
         while True:
             target, func_name = target_func.split(".", 1)
             msg_id = str(uuid.uuid4())[:8]
             future = asyncio.get_running_loop().create_future()
             self._pending[msg_id] = future
+            if local_target is not None:
+                self._local_targets[msg_id] = local_target
 
             body = {"msg_id": msg_id, "func": func_name, "args": list(args)}
             if kwargs:
@@ -306,6 +311,7 @@ class Client:
                 await asyncio.wait_for(self._ws.send(frame), timeout=30)
             except Exception as exc:
                 self._pending.pop(msg_id, None)
+                self._local_targets.pop(msg_id, None)
                 raise ConnectionError(f"failed to send: {exc}") from exc
 
             try:
@@ -316,9 +322,11 @@ class Client:
                 return result
             except asyncio.TimeoutError:
                 self._pending.pop(msg_id, None)
+                self._local_targets.pop(msg_id, None)
                 raise
             except PeerNotFoundError:
                 self._pending.pop(msg_id, None)
+                self._local_targets.pop(msg_id, None)
                 attempt += 1
                 if self.peer_retries != -1 and attempt > self.peer_retries:
                     raise
@@ -505,10 +513,19 @@ class Client:
         def _on_progress(n: int) -> None:
             self._progress.advance(task_id, n)
 
+        local_target = self._local_targets.pop(msg_id, None)
+
         try:
             data = await loop.run_in_executor(
-                None, _s3.download_file, s3_key, checksum, _on_progress,
-                None, bucket,
+                None,
+                lambda: _s3.download_file(
+                    s3_key,
+                    expected_checksum=checksum,
+                    progress_callback=_on_progress,
+                    target=None,
+                    bucket=bucket,
+                    target_path=local_target,
+                ),
             )
         except Exception as exc:
             self._progress.remove_task(task_id)

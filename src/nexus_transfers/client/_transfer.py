@@ -6,7 +6,7 @@ import os
 
 from nexus_transfers._progress import _fmt_binary
 from ._errors import PeerNotFoundError
-from ._io import _move_file_atomic, _write_file
+from ._io import _write_file
 
 _logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ class _DirectoryTransfer:
                     continue
 
                 async with sem:
-                    data = await self._transfer_file(remote_file)
+                    data = await self._transfer_file(remote_file, local_file)
                     file_size = await self._save_file(data, local_file)
                     self._total_bytes += file_size
                     self._done_count += 1
@@ -229,7 +229,7 @@ class _DirectoryTransfer:
 
     # -- file transfer -----------------------------------------------------
 
-    async def _transfer_file(self, remote_file):
+    async def _transfer_file(self, remote_file, local_file):
         """Download a single file, retrying on transient errors."""
         while True:
             try:
@@ -237,6 +237,7 @@ class _DirectoryTransfer:
                     return await self._client.send(
                         f"{self._target}.get_file", remote_file,
                         use_s3=True, s3_prefix=self._s3_prefix,
+                        _local_target=local_file,
                     )
                 else:
                     return await self._client.send(
@@ -264,7 +265,7 @@ class _DirectoryTransfer:
         file_size = os.path.getsize(data) if isinstance(data, str) else len(data)
         if isinstance(data, str):
             await self._loop.run_in_executor(
-                None, _move_file_atomic, data, local_file,
+                None, os.replace, data, local_file,
             )
         else:
             await self._loop.run_in_executor(
