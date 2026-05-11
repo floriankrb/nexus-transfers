@@ -30,6 +30,7 @@ def _load() -> dict:
         return _config
     for path, legacy in [(_CONFIG_PATH, False), (_LEGACY_CONFIG_PATH, True)]:
         if not path.exists():
+            _logger.debug("Config file %s does not exist, skipping", path)
             continue
         if legacy:
             _logger.warning(
