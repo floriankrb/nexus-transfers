@@ -39,6 +39,7 @@ def _load() -> dict:
         try:
             with open(path, "rb") as f:
                 _config = tomllib.load(f)
+            _logger.debug("Loaded config from %s", path)
         except PermissionError:
             _logger.warning("Cannot read config file %s (permission denied)", path)
             _config = {}
