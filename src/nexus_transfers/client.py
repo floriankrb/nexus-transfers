@@ -193,8 +193,8 @@ class Client:
     async def _register(self):
         """Send a register frame and wait for the acknowledgement."""
         extra_headers = {}
-        user = os.environ.get("NEXUS_TRANSFERS_USER")
-        password = os.environ.get("NEXUS_TRANSFERS_PASSWORD")
+        user = resolve("NEXUS_TRANSFERS_USER")
+        password = resolve("NEXUS_TRANSFERS_PASSWORD")
         if user and password:
             credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
             extra_headers["Authorization"] = f"Basic {credentials}"
