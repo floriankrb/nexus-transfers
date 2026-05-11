@@ -10,13 +10,17 @@ Per-tool CLI defaults are read from TOML sections: ``[broker]``, ``[client]``,
 ``[copy]``, ``[monitor]``, ``[copy_ssh]``.
 """
 
+import logging
 import os
 import tomllib
+import warnings
 from pathlib import Path
 
-_CONFIG_PATH = Path.home() / ".nexus-transfers.toml"
+_CONFIG_PATH = Path.home() / ".config" / "nexus-transfers" / "settings.toml"
+_LEGACY_CONFIG_PATH = Path.home() / ".nexus-transfers.toml"
 
 _config: dict | None = None
+_logger = logging.getLogger(__name__)
 
 
 def _load() -> dict:
@@ -26,6 +30,13 @@ def _load() -> dict:
         return _config
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, "rb") as f:
+            _config = tomllib.load(f)
+    elif _LEGACY_CONFIG_PATH.exists():
+        _logger.warning(
+            "Reading config from deprecated %s — please move it to %s",
+            _LEGACY_CONFIG_PATH, _CONFIG_PATH,
+        )
+        with open(_LEGACY_CONFIG_PATH, "rb") as f:
             _config = tomllib.load(f)
     else:
         _config = {}
