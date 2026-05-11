@@ -64,6 +64,32 @@ def _write_file(path, data):
         raise
 
 
+def _move_file_atomic(src, dst):
+    """Move *src* to *dst* with a guaranteed atomic final placement.
+
+    Creates an intermediate temp file in the same directory as *dst* so that
+    the final ``os.replace`` is always an intra-filesystem rename — never a
+    cross-filesystem copy.  *src* is deleted after a successful move.
+    """
+    dirpath = os.path.dirname(os.path.abspath(dst))
+    fd, tmp = tempfile.mkstemp(dir=dirpath)
+    try:
+        os.close(fd)
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+
+
 
 class RemoteError(Exception):
     """Raised when a remote function call returns an error."""
@@ -544,10 +570,15 @@ class Client:
                     file_size = (os.path.getsize(data) if isinstance(data, str)
                                  else len(data))
                     if isinstance(data, str):
-                        # S3 download returned a temp file path — move it.
+                        # S3 mode: send() resolved to the path of a temp file
+                        # downloaded from S3.  Move it atomically (same-fs
+                        # temp + rename) so the final placement is never a
+                        # cross-filesystem copy-then-delete.
                         await loop.run_in_executor(
-                            None, shutil.move, data, local_file)
+                            None, _move_file_atomic, data, local_file)
                     else:
+                        # Relay mode: send() resolved to the raw bytes received
+                        # over the WebSocket.  Write them atomically.
                         await loop.run_in_executor(
                             None, _write_file, local_file, data)
                     total_bytes += file_size

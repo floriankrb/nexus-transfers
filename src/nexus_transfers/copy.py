@@ -19,6 +19,46 @@ from nexus_transfers.client import _DEFAULT_URL, Client
 from nexus_transfers.config import cli_default
 
 
+async def list_dir(name, broker_url, remote_client, path, **client_kwargs):
+    """List the contents of a remote directory, handling pagination.
+
+    Parameters
+    ----------
+    name:
+        Local nexus client name for this session.
+    broker_url:
+        WebSocket broker URL.
+    remote_client:
+        Name of the remote nexus client.
+    path:
+        Path on the remote client to list.
+    **client_kwargs:
+        Forwarded to :class:`~nexus_transfers.client.Client`.
+
+    Returns
+    -------
+    list[dict]
+        All entries from the remote directory.  Each entry has at minimum
+        ``"name"`` and ``"type"`` keys; ``"size"`` is included for files
+        when the remote side supports it.
+    """
+    async with Client(name, broker_url, **client_kwargs) as client:
+        entries = []
+        offset = 0
+        limit = 1000
+        while True:
+            page = await client.send(
+                f"{remote_client}.list_dir", path,
+                offset=offset, limit=limit,
+            )
+            entries.extend(page)
+            if len(page) < limit:
+                break
+            offset += len(page)
+        return entries
+
+
+
 def main():
     """CLI entry point for ``nexus-copy``."""
     parser = argparse.ArgumentParser(
@@ -125,9 +165,9 @@ def main():
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
 
     asyncio.run(
-        _copy(
+        copy(
             name=name,
-            url=args.broker_url,
+            broker_url=args.broker_url,
             remote_client=args.remote_client,
             source=args.source,
             target=args.target,
@@ -146,17 +186,60 @@ def main():
     )
 
 
-async def _copy(name, url, remote_client, source, target, site=None,
-                max_concurrent=4, chunk_size=65536, use_s3=True,
-                track_bytes=False, **client_kwargs):
-    """Connect to the relay and copy a remote directory."""
+async def copy(name, broker_url, remote_client, source, target, site=None,
+               max_concurrent=4, chunk_size=65536, use_s3=True,
+               track_bytes=False, quiet=False, on_monitor=None, **client_kwargs):
+    """Connect to the relay and copy a remote directory.
+
+    Parameters
+    ----------
+    name:
+        Local nexus client name for this session.
+    broker_url:
+        WebSocket broker URL.
+    remote_client:
+        Name of the remote nexus client to copy from.
+    source:
+        Path on the remote client to copy.
+    target:
+        Local destination path.
+    site:
+        Optional site label used in console output and monitor messages.
+    max_concurrent:
+        Maximum number of parallel file transfers.
+    chunk_size:
+        Binary chunk size in bytes (only used when ``use_s3`` is False).
+    use_s3:
+        If True (default), stage transfers through S3.
+    track_bytes:
+        If True, show progress in bytes and use size to verify resume skips.
+    quiet:
+        If True, suppress rich console output (monitor events are still emitted).
+    on_monitor:
+        Optional async callable invoked after each ``client.monitor`` call with
+        the same ``(message, status=..., **kwargs)`` signature.  Use this to
+        forward progress events to an external system without reimplementing
+        the copy loop.
+    **client_kwargs:
+        Forwarded to :class:`~nexus_transfers.client.Client`.
+    """
     target = os.path.expanduser(target)
     console = Console()
-    async with Client(name, url, **client_kwargs) as client:
-        console.print(f"[bold green]Connected[/bold green] to [cyan]{url}[/cyan] as '[magenta]{name}[/magenta]'")
+    async with Client(name, broker_url, **client_kwargs) as client:
+        if on_monitor is not None:
+            _original_monitor = client.monitor
+
+            async def _hooked_monitor(message, status=None, **kw):
+                await _original_monitor(message, status=status, **kw)
+                await on_monitor(message, status=status, **kw)
+
+            client.monitor = _hooked_monitor
+        if not quiet:
+            console.print(f"[bold green]Connected[/bold green] to [cyan]{broker_url}[/cyan] as '[magenta]{name}[/magenta]'")
         via = "" if use_s3 else " [dim](via broker)[/dim]"
         dest_label = f"{site}:{target}" if site else target
-        console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{dest_label}[/yellow]{via}")
+        if not quiet:
+            console.print(f"Copying [yellow]{remote_client}:{source}[/yellow] -> [yellow]{dest_label}[/yellow]{via}")
         await client.monitor(
             f"{name}: starting copy {remote_client}:{source} -> {dest_label}",
             status="progress",
@@ -175,7 +258,8 @@ async def _copy(name, url, remote_client, source, target, site=None,
             f"{name}: copy complete {remote_client}:{source} -> {dest_label}",
             status="ok",
         )
-        console.print("[bold green]Done.[/bold green]")
+        if not quiet:
+            console.print("[bold green]Done.[/bold green]")
 
 if __name__ == "__main__":
     main()

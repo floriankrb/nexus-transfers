@@ -1,5 +1,6 @@
 """Nexus Transfers – WebSocket relay broker and RPC client."""
 
+from nexus_transfers.copy import copy, list_dir
 from nexus_transfers.client import (
     Client,
     NameTakenError,
@@ -18,16 +19,11 @@ from nexus_transfers.dispatch import (
 )
 
 __all__ = [
+    "copy",
+    "list_dir",
+    "echo",
     "Client",
-    "DISPATCH",
-    "FileTransfer",
     "NameTakenError",
     "PeerNotFoundError",
     "RemoteError",
-    "S3Transfer",
-    "adder",
-    "echo",
-    "make_get_file",
-    "make_list_dir",
-    "resolve_safe_path",
 ]
