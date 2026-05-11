@@ -214,7 +214,18 @@ class Client:
         await self.connect()
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None and self._ws is not None:
+            try:
+                await self.monitor(
+                    f"{self.name}: failed "
+                    f"({exc_type.__name__}: {exc_value})",
+                    status="error",
+                )
+            except Exception as monitor_exc:
+                _logger.warning(
+                    "Failed to send error monitor message: %s", monitor_exc,
+                )
         await self.close()
 
     # ======================================================================

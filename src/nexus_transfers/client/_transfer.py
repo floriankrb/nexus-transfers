@@ -100,7 +100,7 @@ class _DirectoryTransfer:
                 remote_file, local_file, remote_size = item
 
                 if self._should_skip(local_file, remote_size):
-                    self._add_skip(remote_size, local_file)
+                    self._add_skip(local_file)
                     progress.update(
                         copy_task,
                         completed=self._done_count + self._skipped,
@@ -122,13 +122,14 @@ class _DirectoryTransfer:
                     )
                     await self._maybe_report_progress()
 
-        await asyncio.gather(
-            _walk_and_enqueue(),
-            *[_worker() for _ in range(self._max_concurrent)],
-        )
-
-        progress.remove_task(walk_task)
-        progress.remove_task(copy_task)
+        try:
+            await asyncio.gather(
+                _walk_and_enqueue(),
+                *[_worker() for _ in range(self._max_concurrent)],
+            )
+        finally:
+            progress.remove_task(walk_task)
+            progress.remove_task(copy_task)
         await self._print_summary()
 
     # -- remote walk -------------------------------------------------------
@@ -205,19 +206,18 @@ class _DirectoryTransfer:
             except OSError:
                 local_size = -1
             if local_size != remote_size:
+                _logger.warning(
+                    "Local file %s has size %d but remote size is %d — "
+                    "will re-download",
+                    local_file, local_size, remote_size,
+                )
                 return False
         return True
 
-    def _add_skip(self, remote_size, local_file):
+    def _add_skip(self, local_file):
         """Record a skipped file in the counters."""
         self._skipped += 1
-        if remote_size is not None:
-            self._skipped_bytes += remote_size
-        else:
-            try:
-                self._skipped_bytes += os.path.getsize(local_file)
-            except OSError:
-                pass
+        self._skipped_bytes += os.path.getsize(local_file)
         if self._skipped == 1 or self._skipped % 1000 == 0:
             _logger.info(
                 "Skipping already-downloaded files: %d so far", self._skipped,
