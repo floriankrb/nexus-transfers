@@ -597,7 +597,7 @@ class Client:
                             f"{_fmt_binary(rate)}/s)",
                             status="progress",
                             progress={
-                                "total_transferred": total_bytes,
+                                "total_transferred": total_bytes + skipped_bytes,
                                 "files_done": done_count,
                                 "files_skipped": skipped,
                                 "rate": rate,
