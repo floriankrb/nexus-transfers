@@ -596,6 +596,12 @@ class Client:
                             f"({_fmt_binary(total_bytes)}, "
                             f"{_fmt_binary(rate)}/s)",
                             status="progress",
+                            progress={
+                                "total_transferred": total_bytes,
+                                "files_done": done_count,
+                                "files_skipped": skipped,
+                                "rate": rate,
+                            },
                         )
 
         walk_coro = _walk_and_enqueue()
