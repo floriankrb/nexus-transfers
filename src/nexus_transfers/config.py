@@ -28,18 +28,25 @@ def _load() -> dict:
     global _config
     if _config is not None:
         return _config
-    if _CONFIG_PATH.exists():
-        with open(_CONFIG_PATH, "rb") as f:
-            _config = tomllib.load(f)
-    elif _LEGACY_CONFIG_PATH.exists():
-        _logger.warning(
-            "Reading config from deprecated %s — please move it to %s",
-            _LEGACY_CONFIG_PATH, _CONFIG_PATH,
-        )
-        with open(_LEGACY_CONFIG_PATH, "rb") as f:
-            _config = tomllib.load(f)
-    else:
-        _config = {}
+    for path, legacy in [(_CONFIG_PATH, False), (_LEGACY_CONFIG_PATH, True)]:
+        if not path.exists():
+            continue
+        if legacy:
+            _logger.warning(
+                "Reading config from deprecated %s — please move it to %s",
+                path, _CONFIG_PATH,
+            )
+        try:
+            with open(path, "rb") as f:
+                _config = tomllib.load(f)
+        except PermissionError:
+            _logger.warning("Cannot read config file %s (permission denied)", path)
+            _config = {}
+        except tomllib.TOMLDecodeError as exc:
+            _logger.warning("Invalid TOML in %s: %s", path, exc)
+            _config = {}
+        return _config
+    _config = {}
     return _config
 
 
