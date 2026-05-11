@@ -83,12 +83,15 @@ class _DirectoryTransfer:
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _walk_and_enqueue():
+            nonlocal walk_task
             await self._walk_remote(
                 self._remote_path, self._local_path, queue,
                 walk_task=walk_task,
             )
             for _ in range(self._max_concurrent):
                 await queue.put(None)
+            progress.remove_task(walk_task)
+            walk_task = None
 
         sem = asyncio.Semaphore(self._max_concurrent)
 
@@ -128,7 +131,8 @@ class _DirectoryTransfer:
                 *[_worker() for _ in range(self._max_concurrent)],
             )
         finally:
-            progress.remove_task(walk_task)
+            if walk_task is not None:
+                progress.remove_task(walk_task)
             progress.remove_task(copy_task)
         await self._print_summary()
 
