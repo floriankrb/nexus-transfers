@@ -44,3 +44,19 @@ We start with the following events
 - Data transfer progress (only top level progress)
 - Errors
 - Warnings
+
+
+## `on_monitor` callback
+
+Both `copy` and `copy_ssh` accept an optional `on_monitor` async callback.
+This allows callers to receive monitor events locally without subscribing
+to the broker broadcast.
+
+The callback signature is `async def on_monitor(message, status=None, **kwargs)`.
+
+`status` is one of `"progress"`, `"ok"`, `"warning"`, or `None`.
+
+When `status` is `"progress"`, `kwargs` contains a `progress` dict with
+`total_transferred`, `files_done`, `files_skipped`, and `rate`.
+
+Progress events are throttled (not emitted on every file).

@@ -1,6 +1,7 @@
 """asyncssh-backed SSH connection pool and SFTP helpers."""
 
 import logging
+import uuid
 from pathlib import PurePosixPath
 
 import asyncssh
@@ -96,8 +97,18 @@ async def write_file(sftp, local_path: str, remote_path: str) -> None:
         Remote destination file path (POSIX).
     """
     remote_dir = str(PurePosixPath(remote_path).parent)
+    remote_name = PurePosixPath(remote_path).name
+    tmp_path = f"{remote_dir}/{remote_name}.{uuid.uuid4().hex[:8]}.tmp"
     await sftp.makedirs(remote_dir, exist_ok=True)
-    await sftp.put(local_path, remote_path)
+    try:
+        await sftp.put(local_path, tmp_path)
+        await sftp.posix_rename(tmp_path, remote_path)
+    except BaseException:
+        try:
+            await sftp.remove(tmp_path)
+        except asyncssh.SFTPError:
+            pass
+        raise
 
 
 async def stat_remote(sftp, remote_path: str) -> int | None:

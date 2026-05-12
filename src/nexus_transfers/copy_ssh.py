@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from pathlib import PurePosixPath
+from typing import Callable
 
 from rich.console import Console
 from rich.progress import (
@@ -88,8 +89,11 @@ async def _walk_local(source_path: str, queue: asyncio.Queue) -> None:
         return entries
 
     items = await loop.run_in_executor(None, _scan, source_path, "")
+    total_size = sum(size for _, _, size in items)
+    total_count = len(items)
     for item in items:
         await queue.put(item)
+    return total_count, total_size
 
 
 async def _copy_to_ssh(
@@ -104,6 +108,8 @@ async def _copy_to_ssh(
     ssh_connections: int,
     track_bytes: bool,
     ssl_verify: bool,
+    on_monitor: Callable | None = None,
+    quiet: bool = False,
 ) -> None:
     """Copy the local *source* directory to the SSH *target*.
 
@@ -131,16 +137,25 @@ async def _copy_to_ssh(
         Show byte-based progress instead of file count.
     ssl_verify : bool
         Verify TLS certificate for the relay connection.
+    on_monitor : callable, optional
+        Async callback invoked with ``(message, status=..., **kwargs)`` for
+        every monitor event, mirroring the hook in
+        :func:`nexus_transfers.copy.copy`.  Receives the same structured
+        ``progress`` dict the relay does, regardless of whether
+        ``broker_url`` is set.
+    quiet : bool
+        If True, suppress rich console output (monitor events still fire).
     """
     user, host, remote_base = _parse_target(target)
     source = os.path.expanduser(source)
-    console = Console()
+    console = Console(quiet=quiet)
 
     label = os.path.basename(source.rstrip("/")) or source
     dest_label = f"{site}:{remote_base}" if site else f"{host}:{remote_base}"
-    console.print(
-        f"Copying [yellow]{source}[/yellow] -> [yellow]{dest_label}[/yellow]"
-    )
+    if not quiet:
+        console.print(
+            f"Copying [yellow]{source}[/yellow] -> [yellow]{dest_label}[/yellow]"
+        )
 
     monitor_client: Client | None = None
     if broker_url:
@@ -150,15 +165,28 @@ async def _copy_to_ssh(
                 ssl_verify=ssl_verify, reconnect_retries=0,
             )
             await monitor_client.connect()
-            await monitor_client.monitor(
-                f"{name}: starting copy {source} -> {dest_label}",
-                status="progress",
-            )
         except Exception as exc:
             _logger.warning(
                 "Relay unavailable (%s), continuing without monitor", exc,
             )
             monitor_client = None
+
+    async def _emit(message, status=None, **kw):
+        if monitor_client is not None:
+            try:
+                await monitor_client.monitor(message, status=status, **kw)
+            except Exception as exc:
+                _logger.warning("Failed to send monitor event: %s", exc)
+        if on_monitor is not None:
+            try:
+                await on_monitor(message, status=status, **kw)
+            except Exception as exc:
+                _logger.warning("on_monitor callback failed: %s", exc)
+
+    await _emit(
+        f"{name}: starting copy {source} -> {dest_label}",
+        status="progress",
+    )
 
     progress = Progress(
         SpinnerColumn(),
@@ -191,7 +219,11 @@ async def _copy_to_ssh(
         progress.start()
 
         async def _walk_and_enqueue() -> None:
-            await _walk_local(source, queue)
+            total_count, total_size = await _walk_local(source, queue)
+            if track_bytes:
+                progress.update(copy_task_id, total=total_size)
+            else:
+                progress.update(copy_task_id, total=total_count)
             for _ in range(max_concurrent):
                 await queue.put(None)
             progress.remove_task(walk_task_id)
@@ -210,9 +242,47 @@ async def _copy_to_ssh(
                 # Resume: skip if remote size already matches local size.
                 remote_size = await stat_remote(sftp, remote_path)
                 if remote_size is not None and remote_size == size:
+                    _logger.debug("Skipping %s (remote=%d == local=%d)", rel_posix, remote_size, size)
                     skipped += 1
                     skipped_bytes += size
+                    if skipped == 1 or skipped % 1000 == 0:
+                        _logger.info(
+                            "Skipping already-uploaded files: %d so far", skipped,
+                        )
+                    progress.update(
+                        copy_task_id,
+                        completed=(done_count + skipped) if not track_bytes else None,
+                        description=(
+                            f"[cyan]Copying {label}[/cyan] "
+                            f"[dim]({skipped} skipped)[/dim]"
+                        ),
+                    )
+                    if track_bytes:
+                        progress.advance(copy_task_id, size)
+
+                    now = loop.time()
+                    elapsed = now - start
+                    rate = total_bytes / elapsed if elapsed > 0 else 0
+                    if now - last_monitor_time >= 30 or skipped % 1000 == 0:
+                        last_monitor_time = now
+                        await _emit(
+                            f"{name}: {skipped} files skipped "
+                            f"({_fmt_binary(skipped_bytes)}), "
+                            f"{done_count} uploaded "
+                            f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)",
+                            status="progress",
+                            progress={
+                                "total_transferred": total_bytes + skipped_bytes,
+                                "files_done": done_count,
+                                "files_skipped": skipped,
+                                "rate": rate,
+                            },
+                        )
                     continue
+                elif remote_size is None:
+                    _logger.debug("Uploading %s (not found on remote)", rel_posix)
+                else:
+                    _logger.debug("Re-uploading %s (remote=%d != local=%d)", rel_posix, remote_size, size)
 
                 await write_file(sftp, local_file, remote_path)
                 total_bytes += size
@@ -221,17 +291,23 @@ async def _copy_to_ssh(
                 if track_bytes:
                     progress.advance(copy_task_id, size)
                 else:
-                    progress.update(copy_task_id, completed=done_count)
+                    progress.update(copy_task_id, completed=done_count + skipped)
 
                 now = loop.time()
-                if monitor_client and now - last_monitor_time >= 30:
+                if now - last_monitor_time >= 30:
                     last_monitor_time = now
                     elapsed = now - start
                     rate = total_bytes / elapsed if elapsed > 0 else 0
-                    await monitor_client.monitor(
+                    await _emit(
                         f"{name}: {done_count} files "
                         f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)",
                         status="progress",
+                        progress={
+                            "total_transferred": total_bytes + skipped_bytes,
+                            "files_done": done_count,
+                            "files_skipped": skipped,
+                            "rate": rate,
+                        },
                     )
 
         await asyncio.gather(
@@ -245,10 +321,11 @@ async def _copy_to_ssh(
             "Skipped %d already-complete file(s) (%s)",
             skipped, _fmt_binary(skipped_bytes),
         )
-        console.print(
-            f"Skipped [bold]{skipped}[/bold] already-complete file(s) "
-            f"([bold]{_fmt_binary(skipped_bytes)}[/bold])"
-        )
+        if not quiet:
+            console.print(
+                f"Skipped [bold]{skipped}[/bold] already-complete file(s) "
+                f"([bold]{_fmt_binary(skipped_bytes)}[/bold])"
+            )
 
     elapsed = loop.time() - start
     rate = total_bytes / elapsed if elapsed > 0 else 0
@@ -256,14 +333,25 @@ async def _copy_to_ssh(
         f"Transferred {_fmt_binary(total_bytes)} "
         f"in {elapsed:.1f}s ({_fmt_binary(rate)}/s)"
     )
-    console.print(
-        f"Transferred [bold]{_fmt_binary(total_bytes)}[/bold] "
-        f"in [bold]{elapsed:.1f}s[/bold] "
-        f"([bold]{_fmt_binary(rate)}/s[/bold])"
+    if not quiet:
+        console.print(
+            f"Transferred [bold]{_fmt_binary(total_bytes)}[/bold] "
+            f"in [bold]{elapsed:.1f}s[/bold] "
+            f"([bold]{_fmt_binary(rate)}/s[/bold])"
+        )
+
+    await _emit(
+        f"{name}: {summary}",
+        status="ok",
+        progress={
+            "total_transferred": total_bytes + skipped_bytes,
+            "files_done": done_count,
+            "files_skipped": skipped,
+            "rate": rate,
+        },
     )
 
     if monitor_client:
-        await monitor_client.monitor(f"{name}: {summary}", status="ok")
         await monitor_client.close()
 
 

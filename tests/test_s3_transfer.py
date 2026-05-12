@@ -86,7 +86,7 @@ def test_upload_download_round_trip(tmp_path, shared_store):
     bucket, s3_key, size, checksum = _s3.upload_file(str(src))
     assert size == src.stat().st_size
 
-    data = _s3.download_bytes(s3_key, expected_checksum=checksum, bucket=bucket)
+    data = _s3.download_bytes(s3_key, target_path=str(tmp_path / "downloaded.bin"), expected_checksum=checksum, bucket=bucket)
     assert data == src.read_bytes()
 
     _s3.delete(s3_key)
@@ -124,4 +124,4 @@ def test_download_checksum_mismatch_raises(tmp_path, shared_store):
     src.write_bytes(b"abc")
     bucket, s3_key, _, _ = _s3.upload_file(str(src))
     with pytest.raises(ValueError, match="checksum mismatch"):
-        _s3.download_bytes(s3_key, expected_checksum="0" * 64, bucket=bucket)
+        _s3.download_bytes(s3_key, target_path=str(tmp_path / "bad.bin"), expected_checksum="0" * 64, bucket=bucket)

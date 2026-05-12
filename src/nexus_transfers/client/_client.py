@@ -502,10 +502,10 @@ class Client:
         """
         from nexus_transfers import s3 as _s3
 
-        s3_key = info.get("s3_key")
-        size = int(info.get("size", 0))
+        s3_key = info["s3_key"]
+        size = int(info["size"])
         checksum = info.get("checksum")
-        bucket = info.get("bucket")
+        bucket = info["bucket"]
         fname = s3_key.rsplit("/", 1)[-1] if s3_key else "file"
         task_id = self._progress.add_task(f"↓ {fname} (s3)", total=size)
         loop = asyncio.get_running_loop()
@@ -520,11 +520,10 @@ class Client:
                 None,
                 lambda: _s3.download_file(
                     s3_key,
+                    target_path=local_target,
                     expected_checksum=checksum,
                     progress_callback=_on_progress,
-                    target=None,
                     bucket=bucket,
-                    target_path=local_target,
                 ),
             )
         except Exception as exc:
