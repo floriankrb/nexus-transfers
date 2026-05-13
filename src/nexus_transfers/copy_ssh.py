@@ -298,9 +298,14 @@ async def _copy_to_ssh(
                     last_monitor_time = now
                     elapsed = now - start
                     rate = total_bytes / elapsed if elapsed > 0 else 0
+                    skip_suffix = (
+                        f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
+                        if skipped else ""
+                    )
                     await _emit(
                         f"{name}: {done_count} files "
-                        f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)",
+                        f"({_fmt_binary(total_bytes)}, "
+                        f"{_fmt_binary(rate)}/s)" + skip_suffix,
                         status="progress",
                         progress={
                             "total_transferred": total_bytes + skipped_bytes,
@@ -329,9 +334,13 @@ async def _copy_to_ssh(
 
     elapsed = loop.time() - start
     rate = total_bytes / elapsed if elapsed > 0 else 0
+    skip_suffix = (
+        f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
+        if skipped else ""
+    )
     summary = (
         f"Transferred {_fmt_binary(total_bytes)} "
-        f"in {elapsed:.1f}s ({_fmt_binary(rate)}/s)"
+        f"in {elapsed:.1f}s ({_fmt_binary(rate)}/s)" + skip_suffix
     )
     if not quiet:
         console.print(
