@@ -112,6 +112,7 @@ class Client:
         self._binary_hashes: dict = {}
         self._binary_checksums: dict = {}
         self._reconnect_lock = asyncio.Lock()
+        self._connected = asyncio.Event()
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -139,8 +140,13 @@ class Client:
             extra_headers["Authorization"] = f"Basic {credentials}"
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
-        connect_kwargs: dict = {"additional_headers": extra_headers,
-                                "max_size": 10_485_760}  # 10 MiB
+        connect_kwargs: dict = {
+            "additional_headers": extra_headers,
+            "max_size": 10_485_760,  # 10 MiB
+            "ping_interval": 30,
+            "ping_timeout": 60,
+            "close_timeout": 10,
+        }
         if not self.ssl_verify and self.url.startswith("wss://"):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
@@ -163,6 +169,7 @@ class Client:
                 raise RuntimeError(f"Registration failed: {error_msg}")
             case _:
                 raise RuntimeError(f"Unexpected registration response: {msg_name!r}")
+        self._connected.set()
 
     async def connect(self):
         """Connect to the broker and register, with optional retries."""
@@ -196,6 +203,7 @@ class Client:
     async def close(self):
         """Disconnect from the broker."""
         self._closed = True
+        self._connected.set()
         if self._ws is not None:
             await self.monitor(
                 f"{self.name}: disconnecting from {self.url}",
@@ -261,6 +269,57 @@ class Client:
                 raise
             except Exception as exc:
                 _logger.warning("Reconnection attempt %d failed: %s", attempt, exc)
+
+    async def _safe_send(self, frame: bytes) -> None:
+        """Send a frame, waiting for ``_listener`` to reconnect on failure.
+
+        Retries up to ``reconnect_retries`` times after the initial attempt
+        (``-1`` means infinite). Raises ``ConnectionError`` if the client has
+        been closed or the retry budget is exhausted.
+
+        Intended for use inside fire-and-forget Tasks (``_upload_and_reply``,
+        ``_send_file_chunks``) whose frames would otherwise be lost when the
+        websocket dies mid-send.
+        """
+        attempt = 0
+        while True:
+            if self._closed:
+                raise ConnectionError("client is closed")
+            try:
+                await self._ws.send(frame)
+                return
+            except ConnectionClosedError as exc:
+                self._connected.clear()
+                _logger.warning(
+                    "send failed (%s); waiting for reconnect …", exc,
+                )
+                await self._connected.wait()
+                if self._closed:
+                    raise ConnectionError(
+                        "client closed while waiting for reconnect",
+                    ) from exc
+                attempt += 1
+                if (
+                    self.reconnect_retries != -1
+                    and attempt > self.reconnect_retries
+                ):
+                    raise ConnectionError("send retries exhausted") from exc
+
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        """Surface exceptions from fire-and-forget Tasks.
+
+        Attached as a done-callback so a failure inside a background Task
+        produces a single log line instead of asyncio's full
+        ``Task exception was never retrieved`` traceback.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _logger.warning(
+                "Background task %s failed: %s", task.get_name(), exc,
+            )
 
     # ======================================================================
     # Outgoing calls
@@ -479,8 +538,8 @@ class Client:
             body = {"msg_id": msg_id,
                     "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc()}
-            await self._ws.send(encode_frame(self.name, "reply", sender, "J",
-                                             json.dumps(body).encode()))
+            await self._safe_send(encode_frame(self.name, "reply", sender, "J",
+                                               json.dumps(body).encode()))
             return
 
         self._progress.remove_task(task_id)
@@ -491,8 +550,8 @@ class Client:
                        "checksum": checksum, "bucket": bucket},
             "s3_transfer": True,
         }
-        await self._ws.send(encode_frame(self.name, "reply", sender, "J",
-                                         json.dumps(body).encode()))
+        await self._safe_send(encode_frame(self.name, "reply", sender, "J",
+                                           json.dumps(body).encode()))
 
     async def _handle_s3_download(self, msg_id: str, source: str, info: dict):
         """Download an S3-staged file then ask the source to delete it.
@@ -577,7 +636,7 @@ class Client:
                 hdr_bytes = json.dumps(hdr).encode()
                 raw_payload = len(hdr_bytes).to_bytes(2, "big") + hdr_bytes + chunk
                 frame = encode_frame(self.name, "chunk", target, "R", raw_payload)
-                await self._ws.send(frame)
+                await self._safe_send(frame)
                 self._progress.advance(task_id, len(chunk))
                 await asyncio.sleep(0)
         self._progress.remove_task(task_id)
@@ -735,9 +794,11 @@ class Client:
             }
             await self._ws.send(encode_frame(self.name, "reply", sender, "J",
                                              json.dumps(body).encode()))
-            asyncio.create_task(self._send_file_chunks(sender, msg_id, result))
+            task = asyncio.create_task(self._send_file_chunks(sender, msg_id, result))
+            task.add_done_callback(self._log_task_exception)
         elif isinstance(result, S3Transfer):
-            asyncio.create_task(self._upload_and_reply(sender, msg_id, result))
+            task = asyncio.create_task(self._upload_and_reply(sender, msg_id, result))
+            task.add_done_callback(self._log_task_exception)
         else:
             body = {"msg_id": msg_id, "result": result}
             await self._ws.send(encode_frame(self.name, "reply", sender, "J",
@@ -783,10 +844,11 @@ class Client:
                                     if future and not future.done():
                                         future.set_result(b"")
                             elif data.get("s3_transfer"):
-                                asyncio.create_task(
+                                task = asyncio.create_task(
                                     self._handle_s3_download(msg_id, source,
                                                              data.get("result", {}))
                                 )
+                                task.add_done_callback(self._log_task_exception)
                             else:
                                 future = self._pending.pop(msg_id, None)
                                 if future and not future.done():
@@ -846,21 +908,28 @@ class Client:
                     return
                 _logger.warning("Connection closed by broker")
                 self._clear_buffers()
+                self._connected.clear()
                 try:
                     await self._reconnect()
                 except (NameTakenError, ConnectionError):
+                    self._closed = True
+                    self._connected.set()
                     raise
                 except Exception:
                     _logger.error(
                         "Listener exiting: reconnection failed after "
                         "clean disconnect", exc_info=True,
                     )
+                    self._closed = True
+                    self._connected.set()
                     return
 
             except asyncio.CancelledError:
+                self._connected.set()
                 return
             except Exception as exc:
                 if self._closed:
+                    self._connected.set()
                     return
                 # Close code 1009 = message too big — do not reconnect
                 # (reconnecting would reproduce the same oversized reply).
@@ -874,15 +943,22 @@ class Client:
                         "Increase max_size or reduce payload."
                     )
                     self._clear_buffers()
+                    self._closed = True
+                    self._connected.set()
                     raise
                 _logger.warning("Connection lost: %s", exc)
                 self._clear_buffers()
+                self._connected.clear()
                 try:
                     await self._reconnect()
                 except (NameTakenError, ConnectionError):
+                    self._closed = True
+                    self._connected.set()
                     raise
                 except Exception:
                     _logger.error(
                         "Listener exiting: reconnection failed", exc_info=True,
                     )
+                    self._closed = True
+                    self._connected.set()
                     return
