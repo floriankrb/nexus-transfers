@@ -186,6 +186,14 @@ async def _run_monitor(name, url, raw_json=False, **client_kwargs):
             f"[bold green]Monitor[/bold green] connected to "
             f"[cyan]{client.url}[/cyan]"
         )
+        clients = await client.list_clients()
+        if clients:
+            console.print(
+                f"[bold]Connected clients ({len(clients)}):[/bold] "
+                f"[magenta]{', '.join(clients)}[/magenta]"
+            )
+        else:
+            console.print("[dim]No connected clients.[/dim]")
         console.print("[dim]Waiting for events… (Ctrl+C to quit)[/dim]")
         try:
             await client._listener_task
