@@ -205,6 +205,7 @@ async def _copy_to_ssh(
     done_count = 0
     skipped = 0
     skipped_bytes = 0
+    total_size = 0
 
     async with SSHPool(host, ssh_port, user, ssh_key, ssh_connections) as pool:
         queue: asyncio.Queue = asyncio.Queue()
@@ -219,6 +220,7 @@ async def _copy_to_ssh(
         progress.start()
 
         async def _walk_and_enqueue() -> None:
+            nonlocal total_size
             total_count, total_size = await _walk_local(source, queue)
             if track_bytes:
                 progress.update(copy_task_id, total=total_size)
@@ -229,7 +231,7 @@ async def _copy_to_ssh(
             progress.remove_task(walk_task_id)
 
         async def _worker() -> None:
-            nonlocal total_bytes, done_count, last_monitor_time, skipped, skipped_bytes
+            nonlocal total_bytes, done_count, last_monitor_time, skipped, skipped_bytes, total_size
             sftp = pool.get_sftp()
             while True:
                 item = await queue.get()
@@ -272,6 +274,10 @@ async def _copy_to_ssh(
                             f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)",
                             status="progress",
                             progress={
+                                "label": f"{name}: {done_count} uploaded",
+                                "value": total_bytes + skipped_bytes,
+                                "maximum": total_size or None,
+                                "unit": "byte",
                                 "total_transferred": total_bytes + skipped_bytes,
                                 "files_done": done_count,
                                 "files_skipped": skipped,
@@ -308,6 +314,10 @@ async def _copy_to_ssh(
                         f"{_fmt_binary(rate)}/s)" + skip_suffix,
                         status="progress",
                         progress={
+                            "label": f"{name}: {done_count} files",
+                            "value": total_bytes + skipped_bytes,
+                            "maximum": total_size or None,
+                            "unit": "byte",
                             "total_transferred": total_bytes + skipped_bytes,
                             "files_done": done_count,
                             "files_skipped": skipped,
@@ -353,6 +363,10 @@ async def _copy_to_ssh(
         f"{name}: {summary}",
         status="ok",
         progress={
+            "label": f"{name}: {done_count} files",
+            "value": total_bytes + skipped_bytes,
+            "maximum": total_size or None,
+            "unit": "byte",
             "total_transferred": total_bytes + skipped_bytes,
             "files_done": done_count,
             "files_skipped": skipped,

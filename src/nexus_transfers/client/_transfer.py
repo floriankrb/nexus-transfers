@@ -289,6 +289,9 @@ class _DirectoryTransfer:
             f"{_fmt_binary(rate)}/s)",
             status="progress",
             progress={
+                "label": f"{self._client.name}: {self._done_count} files",
+                "value": self._total_bytes + self._skipped_bytes,
+                "unit": "byte",
                 "total_transferred": self._total_bytes + self._skipped_bytes,
                 "files_done": self._done_count,
                 "files_skipped": self._skipped,
