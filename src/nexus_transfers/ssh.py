@@ -1,12 +1,39 @@
 """asyncssh-backed SSH connection pool and SFTP helpers."""
 
+import glob as _glob
 import logging
+import os
 import uuid
 from pathlib import PurePosixPath
 
 import asyncssh
 
 _logger = logging.getLogger(__name__)
+
+
+def _ssh_config_files(path: str = "~/.ssh/config") -> list[str]:
+    """Expand ``Include`` directives in an OpenSSH config file.
+
+    asyncssh does not follow ``Include`` directives itself, so this
+    function reads the top-level config, collects every ``Include``
+    target (resolved relative to ``~/.ssh/``), and returns a flat list
+    of existing config file paths suitable for ``asyncssh.connect(config=...)``.
+    """
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return []
+    ssh_dir = os.path.dirname(path)
+    files = [path]
+    with open(path) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if stripped.lower().startswith("include "):
+                pattern = stripped.split(None, 1)[1]
+                if not os.path.isabs(pattern):
+                    pattern = os.path.join(ssh_dir, pattern)
+                pattern = os.path.expanduser(pattern)
+                files.extend(sorted(_glob.glob(pattern)))
+    return [f for f in files if os.path.isfile(f)]
 
 
 class SSHPool:
@@ -46,7 +73,11 @@ class SSHPool:
     async def connect(self) -> None:
         """Open SSH connections and start one SFTP client per connection."""
         for _ in range(self._num_connections):
-            kwargs: dict = {"port": self._port, "known_hosts": None}
+            kwargs: dict = {
+                "port": self._port,
+                "known_hosts": None,
+                "config": _ssh_config_files(),
+            }
             if self._user:
                 kwargs["username"] = self._user
             if self._key_path:
