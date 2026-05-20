@@ -160,9 +160,13 @@ async def _copy_to_ssh(
     monitor_client: Client | None = None
     if broker_url:
         try:
+            # Monitoring is best-effort: keep retrying forever so a dropped
+            # relay connection (e.g. a keepalive timeout) silently reconnects
+            # instead of permanently losing live progress for the rest of the
+            # copy.
             monitor_client = Client(
                 name, broker_url, dispatch={},
-                ssl_verify=ssl_verify, reconnect_retries=0,
+                ssl_verify=ssl_verify, reconnect_retries=-1,
             )
             await monitor_client.connect()
         except Exception as exc:
