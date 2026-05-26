@@ -8,7 +8,11 @@ Usage::
 import argparse
 import asyncio
 import logging
+import multiprocessing as mp
 import os
+import queue as _queue
+import sys
+import threading
 import uuid
 from pathlib import PurePosixPath
 from typing import Callable
@@ -59,18 +63,17 @@ def _parse_target(target: str) -> tuple[str | None, str, str]:
     return user, host, remote_path
 
 
-async def _walk_local(source_path: str, queue: asyncio.Queue) -> None:
-    """Walk *source_path* and push ``(local_file, rel_path, size)`` onto *queue*.
+async def _list_local(source_path: str) -> tuple[list[tuple[str, str, int]], int, int]:
+    """Walk *source_path* and return ``(items, total_count, total_size)``.
 
-    Runs ``os.scandir`` in a thread-pool executor so NFS stat calls do not
-    block the event loop.
+    Each item is a ``(local_path, relative_path, size)`` tuple. Runs
+    ``os.scandir`` in a thread-pool executor so NFS stat calls do not block the
+    event loop.
 
     Parameters
     ----------
     source_path : str
         Root directory to walk.
-    queue : asyncio.Queue
-        Destination queue for ``(local_path, relative_path, size)`` tuples.
     """
     loop = asyncio.get_running_loop()
 
@@ -90,10 +93,279 @@ async def _walk_local(source_path: str, queue: asyncio.Queue) -> None:
 
     items = await loop.run_in_executor(None, _scan, source_path, "")
     total_size = sum(size for _, _, size in items)
-    total_count = len(items)
-    for item in items:
-        await queue.put(item)
-    return total_count, total_size
+    return items, len(items), total_size
+
+
+def _partition_by_bytes(
+    items: list[tuple[str, str, int]], n: int,
+) -> list[list[tuple[str, str, int]]]:
+    """Split *items* into *n* shards balanced by total byte size.
+
+    Greedy longest-processing-time bin-packing: largest files first, each
+    assigned to the currently-lightest shard. Balancing by bytes rather than
+    file count matters because chunk sizes vary widely (the statistics arrays
+    are tiny next to ``data/`` chunks).
+
+    Parameters
+    ----------
+    items : list of tuple
+        ``(local_path, relative_path, size)`` tuples to distribute.
+    n : int
+        Number of shards.
+    """
+    shards: list[list[tuple[str, str, int]]] = [[] for _ in range(n)]
+    loads = [0] * n
+    for item in sorted(items, key=lambda it: it[2], reverse=True):
+        idx = min(range(n), key=loads.__getitem__)
+        shards[idx].append(item)
+        loads[idx] += item[2]
+    return shards
+
+
+async def _run_shard(
+    pool: SSHPool,
+    items: list[tuple[str, str, int]],
+    remote_base: str,
+    report: Callable[[str, int, int], None],
+    max_concurrent: int,
+    stat_concurrency: int,
+) -> None:
+    """Stat-classify *items* then upload the ones that need it.
+
+    The resume scan (remote ``stat`` per file) runs at ``stat_concurrency``
+    depth — much deeper than the upload concurrency — and feeds an upload queue
+    consumed by ``max_concurrent`` workers, so latency-bound stats overlap with
+    bandwidth-bound uploads instead of serialising 8-deep.
+
+    Parameters
+    ----------
+    pool : SSHPool
+        Connection pool to draw SFTP clients from.
+    items : list of tuple
+        ``(local_path, relative_path, size)`` tuples for this shard.
+    remote_base : str
+        Remote destination root; ``rel_path`` is appended to it.
+    report : callable
+        ``report(kind, n_bytes, n_files)`` with ``kind`` in
+        ``{"uploaded", "skipped"}``; called as work completes.
+    max_concurrent : int
+        Number of parallel upload workers.
+    stat_concurrency : int
+        Maximum number of concurrent remote ``stat`` calls.
+    """
+    upload_queue: asyncio.Queue = asyncio.Queue()
+    sem = asyncio.Semaphore(stat_concurrency)
+
+    async def _classify(item: tuple[str, str, int]) -> None:
+        local_file, rel_path, size = item
+        rel_posix = PurePosixPath(rel_path).as_posix()
+        remote_path = f"{remote_base}/{rel_posix}"
+        async with sem:
+            remote_size = await stat_remote(pool.get_sftp(), remote_path)
+        if remote_size is not None and remote_size == size:
+            _logger.debug("Skipping %s (remote=%d == local=%d)", rel_posix, remote_size, size)
+            report("skipped", size, 1)
+        else:
+            if remote_size is None:
+                _logger.debug("Uploading %s (not found on remote)", rel_posix)
+            else:
+                _logger.debug("Re-uploading %s (remote=%d != local=%d)", rel_posix, remote_size, size)
+            await upload_queue.put((local_file, remote_path, size))
+
+    async def _classify_all() -> None:
+        await asyncio.gather(*[_classify(it) for it in items])
+        for _ in range(max_concurrent):
+            await upload_queue.put(None)
+
+    async def _upload_worker() -> None:
+        sftp = pool.get_sftp()
+        while True:
+            entry = await upload_queue.get()
+            if entry is None:
+                return
+            local_file, remote_path, size = entry
+            await write_file(sftp, local_file, remote_path)
+            report("uploaded", size, 1)
+
+    await asyncio.gather(
+        _classify_all(),
+        *[_upload_worker() for _ in range(max_concurrent)],
+    )
+
+
+def _shard_main_sync(
+    shard: list[tuple[str, str, int]],
+    host: str,
+    port: int,
+    user: str | None,
+    key_path: str | None,
+    ssh_connections: int,
+    remote_base: str,
+    encryption_algs: list[str] | None,
+    max_concurrent: int,
+    stat_concurrency: int,
+    progress_queue,
+) -> None:
+    """Worker-process entry point: copy *shard* and report deltas upstream.
+
+    Runs its own event loop and :class:`SSHPool` (one process per core), pushing
+    batched ``("delta", n_bytes, n_files, is_skip)`` tuples onto *progress_queue*
+    and exactly one terminal ``("done",)`` or ``("error", repr)`` before exit.
+    """
+    rc = 0
+    try:
+        asyncio.run(
+            _shard_worker(
+                shard, host, port, user, key_path, ssh_connections,
+                remote_base, encryption_algs, max_concurrent, stat_concurrency,
+                progress_queue,
+            )
+        )
+        progress_queue.put(("done",))
+    except BaseException as exc:  # noqa: BLE001 - report any failure upstream
+        progress_queue.put(("error", repr(exc)))
+        rc = 1
+    finally:
+        progress_queue.close()
+        progress_queue.join_thread()
+    sys.exit(rc)
+
+
+async def _shard_worker(
+    shard: list[tuple[str, str, int]],
+    host: str,
+    port: int,
+    user: str | None,
+    key_path: str | None,
+    ssh_connections: int,
+    remote_base: str,
+    encryption_algs: list[str] | None,
+    max_concurrent: int,
+    stat_concurrency: int,
+    progress_queue,
+) -> None:
+    """Async body of a worker process; see :func:`_shard_main_sync`."""
+    loop = asyncio.get_running_loop()
+    pending = {"up_b": 0, "up_f": 0, "sk_b": 0, "sk_f": 0}
+    last_flush = loop.time()
+
+    def _flush() -> None:
+        if pending["up_f"] or pending["up_b"]:
+            progress_queue.put(("delta", pending["up_b"], pending["up_f"], False))
+        if pending["sk_f"] or pending["sk_b"]:
+            progress_queue.put(("delta", pending["sk_b"], pending["sk_f"], True))
+        pending.update(up_b=0, up_f=0, sk_b=0, sk_f=0)
+
+    def _report(kind: str, n_bytes: int, n_files: int) -> None:
+        nonlocal last_flush
+        if kind == "uploaded":
+            pending["up_b"] += n_bytes
+            pending["up_f"] += n_files
+        else:
+            pending["sk_b"] += n_bytes
+            pending["sk_f"] += n_files
+        # Coalesce updates to ~1/s so the queue is not flooded per file.
+        if loop.time() - last_flush >= 1.0:
+            _flush()
+            last_flush = loop.time()
+
+    async with SSHPool(
+        host, port, user, key_path, ssh_connections, encryption_algs,
+    ) as pool:
+        await _run_shard(pool, shard, remote_base, _report, max_concurrent, stat_concurrency)
+    _flush()
+
+
+async def _run_multiprocess(
+    *,
+    items: list[tuple[str, str, int]],
+    processes: int,
+    host: str,
+    ssh_port: int,
+    user: str | None,
+    ssh_key: str | None,
+    ssh_connections: int,
+    remote_base: str,
+    encryption_algs: list[str] | None,
+    max_concurrent: int,
+    stat_concurrency: int,
+    advance: Callable[[bool, int, int], None],
+) -> None:
+    """Shard *items* across *processes* worker processes and aggregate progress.
+
+    Each child runs :func:`_shard_main_sync` with its own SSH connection(s) so
+    encryption spreads across cores. Progress deltas flow back over a shared
+    queue drained by a background thread into *advance*. Surviving children are
+    terminated on any exit; a non-zero child raises ``RuntimeError`` so the
+    caller treats the whole copy as failed.
+
+    Parameters
+    ----------
+    items : list of tuple
+        ``(local_path, relative_path, size)`` tuples to distribute.
+    processes : int
+        Number of worker processes to spawn.
+    advance : callable
+        ``advance(is_skip, n_bytes, n_files)`` applied for each progress delta;
+        must be thread-safe (it is called from a background drain thread).
+    """
+    loop = asyncio.get_running_loop()
+    ctx = mp.get_context("spawn")
+    progress_queue = ctx.Queue()
+
+    shards = [s for s in _partition_by_bytes(items, processes) if s]
+    procs: list = []
+    for shard in shards:
+        p = ctx.Process(
+            target=_shard_main_sync,
+            args=(
+                shard, host, ssh_port, user, ssh_key, ssh_connections,
+                remote_base, encryption_algs, max_concurrent, stat_concurrency,
+                progress_queue,
+            ),
+        )
+        p.start()
+        procs.append(p)
+
+    n_procs = len(procs)
+    errors: list[str] = []
+
+    def _drain() -> None:
+        finished = 0
+        while finished < n_procs:
+            try:
+                msg = progress_queue.get(timeout=1.0)
+            except _queue.Empty:
+                continue
+            kind = msg[0]
+            if kind == "delta":
+                _, n_bytes, n_files, is_skip = msg
+                advance(is_skip, n_bytes, n_files)
+            elif kind == "done":
+                finished += 1
+            elif kind == "error":
+                errors.append(msg[1])
+                finished += 1
+
+    try:
+        await loop.run_in_executor(None, _drain)
+        for p in procs:
+            await loop.run_in_executor(None, p.join)
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            if p.is_alive():
+                await loop.run_in_executor(None, p.join)
+
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} transfer worker(s) failed: " + "; ".join(errors[:5])
+        )
+    bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
+    if bad:
+        raise RuntimeError(f"{len(bad)} transfer worker(s) exited non-zero: {bad}")
 
 
 async def _copy_to_ssh(
@@ -110,6 +382,9 @@ async def _copy_to_ssh(
     ssl_verify: bool,
     on_monitor: Callable | None = None,
     quiet: bool = False,
+    processes: int = 1,
+    stat_concurrency: int = 64,
+    encryption_algs: list[str] | None = None,
 ) -> None:
     """Copy the local *source* directory to the SSH *target*.
 
@@ -145,6 +420,15 @@ async def _copy_to_ssh(
         ``broker_url`` is set.
     quiet : bool
         If True, suppress rich console output (monitor events still fire).
+    processes : int
+        Number of OS worker processes to shard the file set across. ``<= 1``
+        keeps the single-process path; ``> 1`` spreads SSH encryption across
+        cores (each process opens its own SSH connection(s)).
+    stat_concurrency : int
+        Maximum concurrent remote ``stat`` calls during the resume scan.
+    encryption_algs : list of str or None
+        SSH cipher preference list; None uses the GCM-first default in
+        :data:`nexus_transfers.ssh.DEFAULT_ENCRYPTION_ALGS`.
     """
     user, host, remote_base = _parse_target(target)
     source = os.path.expanduser(source)
@@ -204,135 +488,114 @@ async def _copy_to_ssh(
 
     loop = asyncio.get_running_loop()
     start = loop.time()
-    last_monitor_time = start
     total_bytes = 0
     done_count = 0
     skipped = 0
     skipped_bytes = 0
-    total_size = 0
+    lock = threading.Lock()
 
-    async with SSHPool(host, ssh_port, user, ssh_key, ssh_connections) as pool:
-        queue: asyncio.Queue = asyncio.Queue()
+    unit = "bytes" if track_bytes else "files"
+    walk_task_id = progress.add_task(
+        f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
+    )
+    copy_task_id = progress.add_task(
+        f"[cyan]Copying {label}[/cyan]", total=None, unit=unit,
+    )
+    progress.start()
 
-        unit = "bytes" if track_bytes else "files"
-        walk_task_id = progress.add_task(
-            f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
-        )
-        copy_task_id = progress.add_task(
-            f"[cyan]Copying {label}[/cyan]", total=None, unit=unit,
-        )
-        progress.start()
+    items, total_count, total_size = await _list_local(source)
+    progress.update(copy_task_id, total=total_size if track_bytes else total_count)
+    progress.remove_task(walk_task_id)
 
-        async def _walk_and_enqueue() -> None:
-            nonlocal total_size
-            total_count, total_size = await _walk_local(source, queue)
-            if track_bytes:
-                progress.update(copy_task_id, total=total_size)
+    def _advance(is_skip: bool, n_bytes: int, n_files: int) -> None:
+        """Update shared counters and the rich bar (thread-safe)."""
+        nonlocal total_bytes, done_count, skipped, skipped_bytes
+        with lock:
+            if is_skip:
+                skipped += n_files
+                skipped_bytes += n_bytes
             else:
-                progress.update(copy_task_id, total=total_count)
-            for _ in range(max_concurrent):
-                await queue.put(None)
-            progress.remove_task(walk_task_id)
+                total_bytes += n_bytes
+                done_count += n_files
+            if track_bytes:
+                progress.advance(copy_task_id, n_bytes)
+            else:
+                progress.update(copy_task_id, completed=done_count + skipped)
+            if skipped:
+                progress.update(
+                    copy_task_id,
+                    description=(
+                        f"[cyan]Copying {label}[/cyan] "
+                        f"[dim]({skipped} skipped)[/dim]"
+                    ),
+                )
 
-        async def _worker() -> None:
-            nonlocal total_bytes, done_count, last_monitor_time, skipped, skipped_bytes, total_size
-            sftp = pool.get_sftp()
-            while True:
-                item = await queue.get()
-                if item is None:
-                    return
-                local_file, rel_path, size = item
-                rel_posix = PurePosixPath(rel_path).as_posix()
-                remote_path = f"{remote_base}/{rel_posix}"
+    def _payload() -> tuple[float, dict]:
+        with lock:
+            elapsed = loop.time() - start
+            rate = total_bytes / elapsed if elapsed > 0 else 0
+            return rate, {
+                "label": f"{name}: {done_count} files",
+                "value": total_bytes + skipped_bytes,
+                "maximum": total_size or None,
+                "unit": "byte",
+                "total_transferred": total_bytes + skipped_bytes,
+                "files_done": done_count,
+                "files_skipped": skipped,
+                "rate": rate,
+            }
 
-                # Resume: skip if remote size already matches local size.
-                remote_size = await stat_remote(sftp, remote_path)
-                if remote_size is not None and remote_size == size:
-                    _logger.debug("Skipping %s (remote=%d == local=%d)", rel_posix, remote_size, size)
-                    skipped += 1
-                    skipped_bytes += size
-                    if skipped == 1 or skipped % 1000 == 0:
-                        _logger.info(
-                            "Skipping already-uploaded files: %d so far", skipped,
-                        )
-                    progress.update(
-                        copy_task_id,
-                        completed=(done_count + skipped) if not track_bytes else None,
-                        description=(
-                            f"[cyan]Copying {label}[/cyan] "
-                            f"[dim]({skipped} skipped)[/dim]"
-                        ),
-                    )
-                    if track_bytes:
-                        progress.advance(copy_task_id, size)
+    async def _ticker(stop_event: asyncio.Event) -> None:
+        """Emit aggregated progress every 30s until *stop_event* is set."""
+        while True:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=30)
+                return
+            except asyncio.TimeoutError:
+                pass
+            rate, payload = _payload()
+            skip_suffix = (
+                f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
+                if skipped else ""
+            )
+            await _emit(
+                f"{name}: {done_count} files "
+                f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)" + skip_suffix,
+                status="progress",
+                progress=payload,
+            )
 
-                    now = loop.time()
-                    elapsed = now - start
-                    rate = total_bytes / elapsed if elapsed > 0 else 0
-                    if now - last_monitor_time >= 30 or skipped % 1000 == 0:
-                        last_monitor_time = now
-                        await _emit(
-                            f"{name}: {skipped} files skipped "
-                            f"({_fmt_binary(skipped_bytes)}), "
-                            f"{done_count} uploaded "
-                            f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)",
-                            status="progress",
-                            progress={
-                                "label": f"{name}: {done_count} uploaded",
-                                "value": total_bytes + skipped_bytes,
-                                "maximum": total_size or None,
-                                "unit": "byte",
-                                "total_transferred": total_bytes + skipped_bytes,
-                                "files_done": done_count,
-                                "files_skipped": skipped,
-                                "rate": rate,
-                            },
-                        )
-                    continue
-                elif remote_size is None:
-                    _logger.debug("Uploading %s (not found on remote)", rel_posix)
-                else:
-                    _logger.debug("Re-uploading %s (remote=%d != local=%d)", rel_posix, remote_size, size)
+    stop_event = asyncio.Event()
+    ticker = asyncio.create_task(_ticker(stop_event))
 
-                await write_file(sftp, local_file, remote_path)
-                total_bytes += size
-                done_count += 1
-
-                if track_bytes:
-                    progress.advance(copy_task_id, size)
-                else:
-                    progress.update(copy_task_id, completed=done_count + skipped)
-
-                now = loop.time()
-                if now - last_monitor_time >= 30:
-                    last_monitor_time = now
-                    elapsed = now - start
-                    rate = total_bytes / elapsed if elapsed > 0 else 0
-                    skip_suffix = (
-                        f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
-                        if skipped else ""
-                    )
-                    await _emit(
-                        f"{name}: {done_count} files "
-                        f"({_fmt_binary(total_bytes)}, "
-                        f"{_fmt_binary(rate)}/s)" + skip_suffix,
-                        status="progress",
-                        progress={
-                            "label": f"{name}: {done_count} files",
-                            "value": total_bytes + skipped_bytes,
-                            "maximum": total_size or None,
-                            "unit": "byte",
-                            "total_transferred": total_bytes + skipped_bytes,
-                            "files_done": done_count,
-                            "files_skipped": skipped,
-                            "rate": rate,
-                        },
-                    )
-
-        await asyncio.gather(
-            _walk_and_enqueue(),
-            *[_worker() for _ in range(max_concurrent)],
-        )
+    try:
+        if processes <= 1:
+            async with SSHPool(
+                host, ssh_port, user, ssh_key, ssh_connections, encryption_algs,
+            ) as pool:
+                await _run_shard(
+                    pool, items, remote_base,
+                    lambda kind, nb, nf: _advance(kind == "skipped", nb, nf),
+                    max_concurrent, stat_concurrency,
+                )
+        else:
+            await _run_multiprocess(
+                items=items,
+                processes=processes,
+                host=host,
+                ssh_port=ssh_port,
+                user=user,
+                ssh_key=ssh_key,
+                ssh_connections=ssh_connections,
+                remote_base=remote_base,
+                encryption_algs=encryption_algs,
+                max_concurrent=max_concurrent,
+                stat_concurrency=stat_concurrency,
+                advance=_advance,
+            )
+    finally:
+        stop_event.set()
+        await ticker
         progress.stop()
 
     if skipped:
@@ -424,7 +687,22 @@ def main() -> None:
     parser.add_argument(
         "--ssh-connections", type=int,
         default=cli_default("ssh_connections", "copy_ssh", default=2, type_fn=int),
-        help="Number of SSH connections to open (default: 2)",
+        help="Number of SSH connections to open per process (default: 2)",
+    )
+    parser.add_argument(
+        "--processes", type=int,
+        default=cli_default("processes", "copy_ssh", default=1, type_fn=int),
+        help="Number of worker processes to shard files across; >1 spreads SSH "
+             "encryption over cores (default: 1)",
+    )
+    parser.add_argument(
+        "--stat-concurrency", type=int,
+        default=cli_default("stat_concurrency", "copy_ssh", default=64, type_fn=int),
+        help="Max concurrent remote stat calls during the resume scan (default: 64)",
+    )
+    parser.add_argument(
+        "--cipher", nargs="+", default=None, metavar="ALG",
+        help="SSH cipher preference list (default: aes128-gcm@openssh.com first)",
     )
     parser.add_argument(
         "--size", action="store_true",
@@ -463,6 +741,9 @@ def main() -> None:
             ssh_connections=args.ssh_connections,
             track_bytes=args.size,
             ssl_verify=not args.no_verify,
+            processes=args.processes,
+            stat_concurrency=args.stat_concurrency,
+            encryption_algs=args.cipher,
         )
     )
 

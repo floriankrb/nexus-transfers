@@ -10,6 +10,15 @@ import asyncssh
 
 _logger = logging.getLogger(__name__)
 
+# Hardware-accelerated ciphers preferred for bulk WAN transfers. AES-GCM uses
+# AES-NI (2-3x the single-core throughput of aes*-ctr); chacha20-poly1305 is the
+# fast fallback on hosts without AES-NI. Ordered by preference.
+DEFAULT_ENCRYPTION_ALGS = [
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+    "chacha20-poly1305@openssh.com",
+]
+
 
 def _ssh_config_files(path: str = "~/.ssh/config") -> list[str]:
     """Expand ``Include`` directives in an OpenSSH config file.
@@ -51,6 +60,9 @@ class SSHPool:
         Path to the private key file; None uses the SSH agent or default keys.
     num_connections : int
         Number of SSH connections (and SFTP clients) to open.
+    encryption_algs : list of str or None
+        SSH cipher preference list passed to ``asyncssh.connect``; None uses
+        :data:`DEFAULT_ENCRYPTION_ALGS` (hardware-accelerated GCM first).
     """
 
     def __init__(
@@ -60,12 +72,14 @@ class SSHPool:
         user: str | None,
         key_path: str | None,
         num_connections: int,
+        encryption_algs: list[str] | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._user = user
         self._key_path = key_path
         self._num_connections = num_connections
+        self._encryption_algs = encryption_algs or DEFAULT_ENCRYPTION_ALGS
         self._conns: list = []
         self._sftp_clients: list = []
         self._counter = 0
@@ -77,6 +91,7 @@ class SSHPool:
                 "port": self._port,
                 "known_hosts": None,
                 "config": _ssh_config_files(),
+                "encryption_algs": self._encryption_algs,
             }
             if self._user:
                 kwargs["username"] = self._user
