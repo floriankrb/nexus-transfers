@@ -11,6 +11,7 @@ def main():
         "server": "nexus_transfers.client:main",
         "copy": "nexus_transfers.copy:main",
         "copy-ssh": "nexus_transfers.copy_ssh:main",
+        "check": "nexus_transfers.check:main",
     }
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
@@ -21,6 +22,7 @@ def main():
         print("  server     Run a peer awaiting messages (runs forever)")
         print("  copy       Copy a remote directory to local via relay")
         print("  copy-ssh   Copy a local directory to a remote SSH target")
+        print("  check      Verify S3 credentials (put/get/delete a test object)")
         sys.exit(0)
 
     command = sys.argv[1]
