@@ -3,6 +3,10 @@
 import os
 import tempfile
 
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+_FILE_MODE = 0o666 & ~_UMASK
+
 
 def _trunc(s, limit=200):
     s = str(s)
@@ -13,6 +17,7 @@ def _write_file(path, data):
     """Write *data* to *path* atomically via a temp file + rename."""
     dirpath = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(dir=dirpath)
+    os.fchmod(fd, _FILE_MODE)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)

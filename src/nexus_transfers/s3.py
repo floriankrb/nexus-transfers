@@ -44,6 +44,10 @@ _STREAM_CHUNK = 1024 * 1024
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # seconds; doubled each attempt
 
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+_FILE_MODE = 0o666 & ~_UMASK
+
 
 def is_configured() -> bool:
     """Return True if the bucket env var or config is set."""
@@ -277,6 +281,7 @@ def download_file(
                 dir=target_dir,
                 prefix=os.path.basename(target_path) + ".tmp.",
             )
+            os.fchmod(fd, _FILE_MODE)
             try:
                 hasher = hashlib.sha256()
                 with os.fdopen(fd, "wb") as fh:
