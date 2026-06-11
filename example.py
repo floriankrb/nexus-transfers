@@ -3,17 +3,21 @@
 
 Prerequisites
 -------------
-1. Start the server::
+1. Start the broker::
 
-       transfer-server
+       nexus-transfers broker
 
-2. Start a client named "a" in another terminal::
+2. Start a client named "a" in another terminal, exposing a directory::
 
-       transfer-client --name a
+       nexus-transfers server --name a --allow-path .
 
 3. Run this script::
 
        python example.py
+
+The directory copy at the end uses ``use_s3=False`` so no S3 bucket is
+needed; drop that argument to stage the transfer through S3 (requires
+``NEXUS_TRANSFER_S3_BUCKET`` on client "a").
 """
 
 import asyncio
@@ -45,7 +49,7 @@ async def main():
 
         # Recursive directory copy (resumes interrupted transfers)
         out_dir = os.path.expanduser("~/work/transfers/example/mirror")
-        await client.get_directory("a", "src", out_dir)
+        await client.get_directory("a", "src", out_dir, use_s3=False)
         print(f"Copied remote 'src' -> {out_dir}")
 
 if __name__ == "__main__":

@@ -1,12 +1,11 @@
 """Tests for nexus_transfers.copy_ssh and nexus_transfers.ssh."""
 
-import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nexus_transfers.copy_ssh import _parse_target, _walk_local
+from nexus_transfers.copy_ssh import _list_local, _parse_target
 from nexus_transfers.ssh import SSHPool, stat_remote, write_file
 
 
@@ -40,31 +39,28 @@ def test_parse_target_no_user():
 # Local walk
 # ---------------------------------------------------------------------------
 
-async def test_walk_local(tmp_path):
+async def test_list_local(tmp_path):
     (tmp_path / "a.txt").write_bytes(b"hello")
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "b.txt").write_bytes(b"world!")
 
-    queue: asyncio.Queue = asyncio.Queue()
-    await _walk_local(str(tmp_path), queue)
-
-    items = []
-    while not queue.empty():
-        items.append(queue.get_nowait())
+    items, total_count, total_size = await _list_local(str(tmp_path))
 
     rel_paths = {rel for _, rel, _ in items}
-    assert "a.txt" in rel_paths
-    assert os.path.join("sub", "b.txt") in rel_paths
+    assert rel_paths == {"a.txt", os.path.join("sub", "b.txt")}
+    assert total_count == 2
+    assert total_size == 11
 
     sizes = {rel: size for _, rel, size in items}
     assert sizes["a.txt"] == 5
     assert sizes[os.path.join("sub", "b.txt")] == 6
 
 
-async def test_walk_local_empty_dir(tmp_path):
-    queue: asyncio.Queue = asyncio.Queue()
-    await _walk_local(str(tmp_path), queue)
-    assert queue.empty()
+async def test_list_local_empty_dir(tmp_path):
+    items, total_count, total_size = await _list_local(str(tmp_path))
+    assert items == []
+    assert total_count == 0
+    assert total_size == 0
 
 
 # ---------------------------------------------------------------------------
@@ -91,18 +87,34 @@ async def test_stat_remote_not_found():
 # write_file
 # ---------------------------------------------------------------------------
 
-async def test_write_file_calls_makedirs_and_put():
+async def test_write_file_uploads_via_tmp_and_renames():
     sftp = AsyncMock()
     await write_file(sftp, "/local/data/file.txt", "/remote/dir/file.txt")
     sftp.makedirs.assert_awaited_once_with("/remote/dir", exist_ok=True)
-    sftp.put.assert_awaited_once_with("/local/data/file.txt", "/remote/dir/file.txt")
+    (local, tmp), _ = sftp.put.await_args
+    assert local == "/local/data/file.txt"
+    assert tmp.startswith("/remote/dir/file.txt.")
+    assert tmp.endswith(".tmp")
+    sftp.posix_rename.assert_awaited_once_with(tmp, "/remote/dir/file.txt")
 
 
 async def test_write_file_root_dir():
     sftp = AsyncMock()
     await write_file(sftp, "/local/file.txt", "/file.txt")
     sftp.makedirs.assert_awaited_once_with("/", exist_ok=True)
-    sftp.put.assert_awaited_once_with("/local/file.txt", "/file.txt")
+    (_, tmp), _ = sftp.put.await_args
+    sftp.posix_rename.assert_awaited_once_with(tmp, "/file.txt")
+
+
+async def test_write_file_removes_tmp_on_failure():
+    import asyncssh
+
+    sftp = AsyncMock()
+    sftp.put.side_effect = asyncssh.SFTPError(asyncssh.FX_FAILURE, "boom")
+    with pytest.raises(asyncssh.SFTPError):
+        await write_file(sftp, "/local/f", "/remote/f")
+    sftp.remove.assert_awaited_once()
+    sftp.posix_rename.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

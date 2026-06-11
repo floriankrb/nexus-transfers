@@ -19,14 +19,14 @@ def shared_store(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_s3_file_transfer(server, tmp_path, shared_store):
+async def test_s3_file_transfer(broker, tmp_path, shared_store):
     src_file = tmp_path / "data.bin"
     content = bytes(range(256)) * 50
     src_file.write_bytes(content)
 
     async with (
-        Client("sender", url=server, allowed_paths=[str(tmp_path)]) as sender,
-        Client("receiver", url=server) as receiver,
+        Client("sender", url=broker, allowed_paths=[str(tmp_path)]) as sender,
+        Client("receiver", url=broker) as receiver,
     ):
         result = await receiver.send("sender.get_file", str(src_file))
         # S3 path returns a temp file path; read and verify contents.
@@ -49,7 +49,7 @@ async def test_s3_file_transfer(server, tmp_path, shared_store):
 
 
 @pytest.mark.asyncio
-async def test_s3_directory_transfer(server, tmp_path, shared_store):
+async def test_s3_directory_transfer(broker, tmp_path, shared_store):
     src = tmp_path / "remote"
     src.mkdir()
     (src / "a.txt").write_text("hello")
@@ -59,8 +59,8 @@ async def test_s3_directory_transfer(server, tmp_path, shared_store):
     dest = tmp_path / "local"
 
     async with (
-        Client("srv", url=server, allowed_paths=[str(src)]) as srv,
-        Client("cli", url=server) as cli,
+        Client("srv", url=broker, allowed_paths=[str(src)]) as srv,
+        Client("cli", url=broker) as cli,
     ):
         await cli.get_directory("srv", str(src), str(dest))
 
@@ -69,10 +69,10 @@ async def test_s3_directory_transfer(server, tmp_path, shared_store):
 
 
 @pytest.mark.asyncio
-async def test_s3_cleanup_rejects_unknown_key(server, tmp_path, shared_store):
+async def test_s3_cleanup_rejects_unknown_key(broker, tmp_path, shared_store):
     async with (
-        Client("a", url=server, allowed_paths=[str(tmp_path)]) as a,
-        Client("b", url=server) as b,
+        Client("a", url=broker, allowed_paths=[str(tmp_path)]) as a,
+        Client("b", url=broker) as b,
     ):
         with pytest.raises(RemoteError, match="unknown S3 key"):
             await b.send("a.s3_cleanup", "nexus-transfers/fake/key")

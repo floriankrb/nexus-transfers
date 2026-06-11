@@ -19,6 +19,9 @@ DEFAULT_ENCRYPTION_ALGS = [
     "chacha20-poly1305@openssh.com",
 ]
 
+# Emit the host-key warning only once per process, not once per connection.
+_warned_no_host_key_check = False
+
 
 def _ssh_config_files(path: str = "~/.ssh/config") -> list[str]:
     """Expand ``Include`` directives in an OpenSSH config file.
@@ -86,6 +89,14 @@ class SSHPool:
 
     async def connect(self) -> None:
         """Open SSH connections and start one SFTP client per connection."""
+        global _warned_no_host_key_check
+        if not _warned_no_host_key_check:
+            _warned_no_host_key_check = True
+            _logger.warning(
+                "SSH host key verification is disabled (known_hosts=None); "
+                "the connection to %s is vulnerable to machine-in-the-middle "
+                "interception", self._host,
+            )
         for _ in range(self._num_connections):
             kwargs: dict = {
                 "port": self._port,
@@ -142,9 +153,12 @@ async def write_file(sftp, local_path: str, remote_path: str) -> None:
     remote_path : str
         Remote destination file path (POSIX).
     """
-    remote_dir = str(PurePosixPath(remote_path).parent)
-    remote_name = PurePosixPath(remote_path).name
-    tmp_path = f"{remote_dir}/{remote_name}.{uuid.uuid4().hex[:8]}.tmp"
+    target = PurePosixPath(remote_path)
+    remote_dir = str(target.parent)
+    # with_name (rather than f"{remote_dir}/…") avoids a double slash when
+    # the target sits directly under the remote root ("//x" is
+    # implementation-defined in POSIX and breaks chrooted SFTP servers).
+    tmp_path = str(target.with_name(f"{target.name}.{uuid.uuid4().hex[:8]}.tmp"))
     await sftp.makedirs(remote_dir, exist_ok=True)
     try:
         await sftp.put(local_path, tmp_path)

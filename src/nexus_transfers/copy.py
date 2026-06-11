@@ -235,7 +235,7 @@ async def copy(name, broker_url, remote_client, source, target, site=None,
 
             client.monitor = _hooked_monitor
         if not quiet:
-            console.print(f"[bold green]Connected[/bold green] to [cyan]{broker_url}[/cyan] as '[magenta]{name}[/magenta]'")
+            console.print(f"[bold green]Connected[/bold green] to [cyan]{client.url}[/cyan] as '[magenta]{name}[/magenta]'")
         via = "" if use_s3 else " [dim](via broker)[/dim]"
         dest_label = f"{site}:{target}" if site else target
         if not quiet:

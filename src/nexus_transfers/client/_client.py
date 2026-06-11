@@ -125,6 +125,12 @@ class Client:
         self._progress_task_ids: dict = {}
         self._listener_task = None
         self._closed = False
+        self._is_monitor = False
+        # Frames relayed by the broker before the registration ack arrived;
+        # drained by the listener (see _register).
+        self._early_frames: list[bytes] = []
+        self._warned_plaintext_auth = False
+        self._warned_no_tls_verify = False
 
     # ======================================================================
     # Connection lifecycle
@@ -138,6 +144,12 @@ class Client:
         if user and password:
             credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
             extra_headers["Authorization"] = f"Basic {credentials}"
+            if not self.url.startswith("wss://") and not self._warned_plaintext_auth:
+                self._warned_plaintext_auth = True
+                _logger.warning(
+                    "Sending basic-auth credentials over an unencrypted "
+                    "connection (%s) — use wss:// in production", self.url,
+                )
 
         _logger.debug("Connecting to %s as '%s'", self.url, self.name)
         connect_kwargs: dict = {
@@ -148,6 +160,11 @@ class Client:
             "close_timeout": 10,
         }
         if not self.ssl_verify and self.url.startswith("wss://"):
+            if not self._warned_no_tls_verify:
+                self._warned_no_tls_verify = True
+                _logger.warning(
+                    "TLS certificate verification is disabled for %s", self.url,
+                )
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
@@ -156,19 +173,38 @@ class Client:
 
         reg = encode_frame(self.name, "register", "", "J", b"{}")
         await self._ws.send(reg)
-        ack = await asyncio.wait_for(self._ws.recv(), timeout=30)
 
-        _, _src, msg_name, _tgt, _enc, payload = decode_frame(ack)
-        match msg_name:
-            case "register":
-                pass
-            case "error":
-                error_msg = json.loads(payload).get("error", "")
+        # The broker publishes the name to its routing table before sending
+        # the ack, so a frame relayed from another client can arrive ahead
+        # of the ack.  Buffer such frames for the listener instead of
+        # misreading them as the registration response.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30
+        while True:
+            ack = await asyncio.wait_for(
+                self._ws.recv(), timeout=max(deadline - loop.time(), 0.1))
+            if not isinstance(ack, bytes):
+                continue
+            try:
+                _, _src, msg_name, _tgt, _enc, payload = decode_frame(ack)
+            except ValueError:
+                continue
+            if msg_name == "register":
+                break
+            if msg_name == "error":
+                try:
+                    body = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    body = {}
+                if body.get("msg_id"):
+                    # Error for an in-flight call, not for the registration.
+                    self._early_frames.append(ack)
+                    continue
+                error_msg = body.get("error", "")
                 if "already taken" in error_msg:
                     raise NameTakenError(error_msg)
                 raise RuntimeError(f"Registration failed: {error_msg}")
-            case _:
-                raise RuntimeError(f"Unexpected registration response: {msg_name!r}")
+            self._early_frames.append(ack)
         self._connected.set()
 
     async def connect(self):
@@ -193,6 +229,7 @@ class Client:
         """
         if callback is not None:
             self.on_monitor_event = callback
+        self._is_monitor = True
         frame = encode_frame(self.name, "register_monitor", "", "J", b"{}")
         await self._ws.send(frame)
         # Wait for ack
@@ -258,6 +295,14 @@ class Client:
             await asyncio.sleep(self.reconnect_delay)
             try:
                 await self._register()
+                if self._is_monitor:
+                    # Restore the monitor subscription lost with the old
+                    # connection.  Fire-and-forget: the ack cannot be awaited
+                    # here because _reconnect runs inside the listener task,
+                    # which is the only consumer of incoming frames.
+                    await self._ws.send(
+                        encode_frame(self.name, "register_monitor", "", "J", b"{}")
+                    )
                 _logger.info("Reconnected successfully")
                 await self.monitor(
                     f"{self.name}: reconnected to {self.url} "
@@ -664,11 +709,32 @@ class Client:
         chunk_idx = hdr.get("chunk", 0)
         total = hdr.get("total_chunks", 1)
 
+        # Reject malformed headers instead of letting an IndexError escape
+        # into the listener, where it would be treated as a connection loss.
+        if (
+            not msg_id
+            or not isinstance(chunk_idx, int)
+            or not isinstance(total, int)
+            or total < 1
+            or not 0 <= chunk_idx < total
+        ):
+            _logger.warning("Ignoring malformed chunk header: %r", hdr)
+            return None
+
         if msg_id not in self._binary_buffers:
             self._binary_buffers[msg_id] = [None] * total
             self._binary_received[msg_id] = 0
             self._binary_hashes[msg_id] = hashlib.sha256()
-        self._binary_buffers[msg_id][chunk_idx] = chunk_data
+        buffer = self._binary_buffers[msg_id]
+        if len(buffer) != total or buffer[chunk_idx] is not None:
+            # total_chunks inconsistent with the first chunk, or duplicate
+            # chunk index — ignore rather than corrupt the transfer state.
+            _logger.warning(
+                "Ignoring inconsistent chunk %d/%d for transfer %s",
+                chunk_idx, total, msg_id,
+            )
+            return None
+        buffer[chunk_idx] = chunk_data
         self._binary_received[msg_id] += 1
         self._binary_hashes[msg_id].update(chunk_data)
 
@@ -693,7 +759,7 @@ class Client:
         return None
 
     def _clear_buffers(self):
-        """Fail all pending futures and clear binary transfer state."""
+        """Fail all pending futures and clear per-transfer state."""
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(ConnectionError("connection lost"))
@@ -702,6 +768,14 @@ class Client:
         self._binary_received.clear()
         self._binary_hashes.clear()
         self._binary_checksums.clear()
+        self._local_targets.clear()
+        self._early_frames.clear()
+        for task_id in self._progress_task_ids.values():
+            try:
+                self._progress.remove_task(task_id)
+            except Exception:
+                pass
+        self._progress_task_ids.clear()
 
     # ======================================================================
     # RPC dispatch and background listener
@@ -804,6 +878,118 @@ class Client:
             await self._ws.send(encode_frame(self.name, "reply", sender, "J",
                                              json.dumps(body).encode()))
 
+    async def _process_raw(self, raw) -> None:
+        """Decode one raw websocket message and dispatch it safely.
+
+        A malformed frame (bad JSON, inconsistent chunk header, …) is logged
+        and dropped: it must not abort the connection and kill every other
+        in-flight transfer.
+        """
+        if not isinstance(raw, bytes):
+            return
+        try:
+            _, source, msg_name, _target, encoding, payload = decode_frame(raw)
+        except ValueError:
+            return
+
+        _logger.debug("[recv] %s from %s", msg_name, source or "broker")
+
+        try:
+            await self._handle_frame(source, msg_name, payload)
+        except Exception:
+            _logger.warning(
+                "Error handling %r frame from %s",
+                msg_name, source or "broker", exc_info=True,
+            )
+
+    async def _handle_frame(self, source, msg_name: str, payload: bytes):
+        """Handle one decoded incoming frame.
+
+        Called from ``_listener``, which catches and logs any exception so
+        that a single malformed frame cannot be mistaken for a connection
+        loss.
+        """
+        match msg_name:
+            case "call":
+                data = json.loads(payload)
+                await self._dispatch_call(source, data.get("msg_id"), payload)
+
+            case "reply":
+                data = json.loads(payload)
+                msg_id = data.get("msg_id")
+                if data.get("binary_transfer"):
+                    result_info = data.get("result", {})
+                    total_size = result_info.get("size", 0)
+                    total = result_info.get("total_chunks", 0)
+                    fname = result_info.get("name", "file")
+                    if total > 0:
+                        self._progress_task_ids[msg_id] = self._progress.add_task(
+                            f"↓ {fname}", total=total_size
+                        )
+                    else:
+                        future = self._pending.pop(msg_id, None)
+                        if future and not future.done():
+                            future.set_result(b"")
+                elif data.get("s3_transfer"):
+                    task = asyncio.create_task(
+                        self._handle_s3_download(msg_id, source,
+                                                 data.get("result", {}))
+                    )
+                    task.add_done_callback(self._log_task_exception)
+                else:
+                    future = self._pending.pop(msg_id, None)
+                    if future and not future.done():
+                        if "error" in data:
+                            future.set_exception(
+                                RemoteError(data["error"], data.get("traceback"))
+                            )
+                        else:
+                            future.set_result(data.get("result"))
+
+            case "chunk":
+                completed = self._receive_chunk_payload(payload)
+                if completed:
+                    msg_id, data, error = completed
+                    future = self._pending.pop(msg_id, None)
+                    if future and not future.done():
+                        if error:
+                            future.set_exception(RemoteError(error))
+                        else:
+                            future.set_result(data)
+
+            case "list_clients":
+                data = json.loads(payload)
+                future = self._pending.pop("__list_clients__", None)
+                if future and not future.done():
+                    future.set_result(data.get("clients", []))
+
+            case "register_monitor":
+                future = self._pending.pop("__register_monitor__", None)
+                if future and not future.done():
+                    future.set_result(True)
+
+            case "monitor_event":
+                if self.on_monitor_event is not None:
+                    try:
+                        event = json.loads(payload)
+                        self.on_monitor_event(event)
+                    except Exception:
+                        _logger.debug("on_monitor_event failed", exc_info=True)
+
+            case "error":
+                data = json.loads(payload)
+                error = data.get("error", "unknown error")
+                msg_id = data.get("msg_id")
+                future = self._pending.pop(msg_id, None)
+                if future and not future.done():
+                    if "unknown target" in error or "disconnected" in error:
+                        future.set_exception(PeerNotFoundError(error))
+                    else:
+                        future.set_exception(RemoteError(error))
+
+            case _:
+                _logger.debug("[recv] unhandled msg_name=%r from %s", msg_name, source)
+
     async def _listener(self):
         """Background task that handles incoming frames.
 
@@ -812,96 +998,12 @@ class Client:
         """
         while True:
             try:
+                # Frames the broker relayed before the registration ack
+                # (buffered by _register) are handled first.
+                while self._early_frames:
+                    await self._process_raw(self._early_frames.pop(0))
                 async for raw in self._ws:
-                    if not isinstance(raw, bytes):
-                        continue
-                    try:
-                        _, source, msg_name, _target, encoding, payload = decode_frame(raw)
-                    except ValueError:
-                        continue
-
-                    _logger.debug("[recv] %s from %s", msg_name, source or "broker")
-
-                    match msg_name:
-                        case "call":
-                            data = json.loads(payload)
-                            await self._dispatch_call(source, data.get("msg_id"), payload)
-
-                        case "reply":
-                            data = json.loads(payload)
-                            msg_id = data.get("msg_id")
-                            if data.get("binary_transfer"):
-                                result_info = data.get("result", {})
-                                total_size = result_info.get("size", 0)
-                                total = result_info.get("total_chunks", 0)
-                                fname = result_info.get("name", "file")
-                                if total > 0:
-                                    self._progress_task_ids[msg_id] = self._progress.add_task(
-                                        f"↓ {fname}", total=total_size
-                                    )
-                                else:
-                                    future = self._pending.pop(msg_id, None)
-                                    if future and not future.done():
-                                        future.set_result(b"")
-                            elif data.get("s3_transfer"):
-                                task = asyncio.create_task(
-                                    self._handle_s3_download(msg_id, source,
-                                                             data.get("result", {}))
-                                )
-                                task.add_done_callback(self._log_task_exception)
-                            else:
-                                future = self._pending.pop(msg_id, None)
-                                if future and not future.done():
-                                    if "error" in data:
-                                        future.set_exception(
-                                            RemoteError(data["error"], data.get("traceback"))
-                                        )
-                                    else:
-                                        future.set_result(data.get("result"))
-
-                        case "chunk":
-                            completed = self._receive_chunk_payload(payload)
-                            if completed:
-                                msg_id, data, error = completed
-                                future = self._pending.pop(msg_id, None)
-                                if future and not future.done():
-                                    if error:
-                                        future.set_exception(RemoteError(error))
-                                    else:
-                                        future.set_result(data)
-
-                        case "list_clients":
-                            data = json.loads(payload)
-                            future = self._pending.pop("__list_clients__", None)
-                            if future and not future.done():
-                                future.set_result(data.get("clients", []))
-
-                        case "register_monitor":
-                            future = self._pending.pop("__register_monitor__", None)
-                            if future and not future.done():
-                                future.set_result(True)
-
-                        case "monitor_event":
-                            if self.on_monitor_event is not None:
-                                try:
-                                    event = json.loads(payload)
-                                    self.on_monitor_event(event)
-                                except Exception:
-                                    _logger.debug("on_monitor_event failed", exc_info=True)
-
-                        case "error":
-                            data = json.loads(payload)
-                            error = data.get("error", "unknown error")
-                            msg_id = data.get("msg_id")
-                            future = self._pending.pop(msg_id, None)
-                            if future and not future.done():
-                                if "unknown target" in error or "disconnected" in error:
-                                    future.set_exception(PeerNotFoundError(error))
-                                else:
-                                    future.set_exception(RemoteError(error))
-
-                        case _:
-                            _logger.debug("[recv] unhandled msg_name=%r from %s", msg_name, source)
+                    await self._process_raw(raw)
 
                 # The async for loop ended normally — clean disconnect.
                 if self._closed:

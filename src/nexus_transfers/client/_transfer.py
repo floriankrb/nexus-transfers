@@ -146,9 +146,9 @@ class _DirectoryTransfer:
         os.makedirs(local_path, exist_ok=True)
         offset = 0
         limit = 1000
+        dirs = []
         while True:
             page = await self._list_dir_with_retry(remote_path, offset=offset)
-            dirs = []
             for entry in page:
                 name = entry["name"]
                 remote_child = (
@@ -240,9 +240,11 @@ class _DirectoryTransfer:
                         _local_target=local_file,
                     )
                 else:
+                    # use_s3=False must be sent explicitly: the remote
+                    # get_file defaults to S3 staging.
                     return await self._client.send(
                         f"{self._target}.get_file", remote_file,
-                        chunk_size=self._chunk_size,
+                        chunk_size=self._chunk_size, use_s3=False,
                     )
             except (PeerNotFoundError, ConnectionError,
                     asyncio.TimeoutError) as exc:

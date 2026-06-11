@@ -30,6 +30,11 @@ monitors_lock = threading.Lock()
 pending_calls: dict[str, list[tuple[str, str]]] = {}
 pending_calls_lock = threading.Lock()
 
+# Clients already warned about for sending frames with a spoofed source.
+# Peers are trusted: the frame is still relayed, but the mismatch is logged
+# once per client so it is visible without flooding the logs.
+_spoof_warned: set[str] = set()
+
 
 def _utcnow() -> str:
     """Return current UTC time in ISO 8601 format."""
@@ -103,6 +108,16 @@ async def relay_handler(websocket):
                     "message": f"Client '{client_name}' connected",
                 })
                 continue
+
+            # Peers are trusted, but make spoofed source names visible
+            # (one warning per offending client, frames relayed unchanged).
+            if source != client_name and client_name not in _spoof_warned:
+                _spoof_warned.add(client_name)
+                logger.warning(
+                    "Client '%s' sent a frame claiming source '%s' — "
+                    "frames are relayed as-is (peers are trusted)",
+                    client_name, source,
+                )
 
             # ----------------------------------------------------------------
             # Route to another client without decoding the payload

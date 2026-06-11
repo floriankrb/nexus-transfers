@@ -31,7 +31,7 @@ from nexus_transfers._progress import (
     _CountOrBytesColumn,
     _fmt_binary,
 )
-from nexus_transfers.client import _DEFAULT_URL, Client
+from nexus_transfers.client import Client
 from nexus_transfers.config import cli_default
 from nexus_transfers.ssh import SSHPool, stat_remote, write_file
 
@@ -658,7 +658,7 @@ def main() -> None:
     parser.add_argument(
         "--broker-url",
         default=cli_default("broker_url", "copy_ssh", default=None),
-        help=f"Relay WebSocket URL for monitoring (default: ${_DEFAULT_URL!r})",
+        help="Relay WebSocket URL for monitoring (default: none — monitoring disabled)",
     )
     parser.add_argument(
         "--name", default=cli_default("name", "copy_ssh", default=None),

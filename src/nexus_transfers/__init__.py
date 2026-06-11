@@ -21,9 +21,16 @@ from nexus_transfers.dispatch import (
 __all__ = [
     "copy",
     "list_dir",
+    "adder",
     "echo",
     "Client",
     "NameTakenError",
     "PeerNotFoundError",
     "RemoteError",
+    "DISPATCH",
+    "FileTransfer",
+    "S3Transfer",
+    "make_get_file",
+    "make_list_dir",
+    "resolve_safe_path",
 ]

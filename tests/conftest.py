@@ -1,9 +1,11 @@
 """Shared fixtures for nexus-transfers tests."""
 
+import os
 
 import pytest
 from websockets.asyncio.server import serve
 
+from nexus_transfers import config as _config
 from nexus_transfers.broker import (
     clients,
     clients_lock,
@@ -13,6 +15,20 @@ from nexus_transfers.broker import (
     pending_calls_lock,
     relay_handler,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_real_config(monkeypatch):
+    """Keep tests away from the developer's real environment.
+
+    ``client._client`` and ``s3`` load ``~/.env`` at import time, so a
+    developer's real S3 credentials and broker settings would otherwise leak
+    into the test run (and tests could write to a real bucket).  Scrub all
+    ``NEXUS_TRANSFER*`` variables and blank the TOML config cache.
+    """
+    for var in [v for v in os.environ if v.startswith("NEXUS_TRANSFER")]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(_config, "_config", {})
 
 
 @pytest.fixture()

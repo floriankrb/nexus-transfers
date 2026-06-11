@@ -435,6 +435,71 @@ async def test_multiple_monitors(broker):
 
 
 @pytest.mark.asyncio
+async def test_malformed_frame_does_not_kill_listener(broker):
+    """A malformed frame must not abort other in-flight transfers (BUG 5)."""
+    from nexus_transfers.protocol import encode_frame
+
+    async with Client("victim", url=broker) as victim, \
+               Client("evil", url=broker) as evil:
+        # Bad JSON in a reply frame, and a chunk with an out-of-range index.
+        await evil._ws.send(
+            encode_frame("evil", "reply", "victim", "J", b"{not json"))
+        bad_hdr = b'{"msg_id": "zz", "chunk": 5, "total_chunks": 2}'
+        await evil._ws.send(
+            encode_frame("evil", "chunk", "victim", "R",
+                         len(bad_hdr).to_bytes(2, "big") + bad_hdr + b"x"))
+        await asyncio.sleep(0.2)
+
+        # The victim's listener must still be alive and able to do RPC.
+        assert not victim._listener_task.done()
+        assert await victim.send("evil.adder", 1) == 2
+
+
+@pytest.mark.asyncio
+async def test_monitor_resubscribes_after_reconnect(free_port):
+    """Monitor subscription survives a broker restart (BUG 4)."""
+    from websockets.asyncio.server import serve
+
+    from nexus_transfers.broker import clients, monitors, relay_handler
+
+    url = f"ws://localhost:{free_port}"
+    clients.clear()
+    monitors.clear()
+    server = await serve(relay_handler, "localhost", free_port)
+
+    events = []
+    mon = Client("mon", url=url, reconnect_retries=-1, reconnect_delay=0.1)
+    try:
+        await mon.connect()
+        await mon.register_monitor(callback=events.append)
+
+        # Simulate a broker restart: stop it, wipe state, start a new one.
+        server.close()
+        await server.wait_closed()
+        clients.clear()
+        monitors.clear()
+        server = await serve(relay_handler, "localhost", free_port)
+
+        # Wait until the client has re-registered with the new broker.
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if "mon" in clients:
+                break
+        assert "mon" in clients, "client did not reconnect"
+
+        async with Client("worker", url=url) as worker:
+            await worker.monitor("after-restart", status="ok")
+            await asyncio.sleep(0.2)
+
+        assert any(e.get("message") == "after-restart" for e in events), \
+            "monitor did not receive events after reconnect"
+    finally:
+        await mon.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_dead_peer_sends_error_reply(broker):
     """When a peer disconnects before replying, the caller gets an error."""
     import threading

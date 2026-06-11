@@ -241,7 +241,7 @@ def upload_file(
 def download_file(
     s3_key: str,
     *,
-    target_path: str,
+    target_path: str | None = None,
     bucket: str,
     expected_checksum: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
@@ -259,7 +259,8 @@ def download_file(
     target_path
         The temp file is created next to this path with a
         ``.tmp.<random>`` suffix.  This ensures the rename to
-        ``target_path`` is always same-filesystem.
+        ``target_path`` is always same-filesystem.  If None, the temp
+        file is created in the system temporary directory.
     bucket
         Bucket name (plain name or ``s3://bucket`` URI).
     expected_checksum
@@ -275,12 +276,14 @@ def download_file(
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             result = obs.get(store, s3_key)
-            target_dir = os.path.dirname(target_path) or "."
+            if target_path is not None:
+                target_dir = os.path.dirname(target_path) or "."
+                prefix = os.path.basename(target_path) + ".tmp."
+            else:
+                target_dir = tempfile.gettempdir()
+                prefix = (s3_key.rsplit("/", 1)[-1] or "download") + ".tmp."
             os.makedirs(target_dir, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=target_dir,
-                prefix=os.path.basename(target_path) + ".tmp.",
-            )
+            fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=prefix)
             os.fchmod(fd, _FILE_MODE)
             try:
                 hasher = hashlib.sha256()
@@ -324,7 +327,7 @@ def download_file(
 def download_bytes(
     s3_key: str,
     *,
-    target_path: str,
+    target_path: str | None = None,
     bucket: str,
     expected_checksum: str | None = None,
     progress_callback: Callable[[int], None] | None = None,

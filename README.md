@@ -31,17 +31,18 @@ nexus-transfers server --name a --broker-url ws://localhost:8766 --allow-path /p
 From another terminal (or from Python):
 
 ```bash
-nexus-transfers server --name b --broker-url ws://localhost:8766
+nexus-transfers server --name b --broker-url ws://localhost:8766 --interactive
 ```
 
-Then in the interactive prompt:
+Then in the interactive prompt (without `--interactive` the client runs as a
+headless RPC worker):
 
 ```
-/send a.echo hello
-/send a.adder 42
-/send a.list_dir .
-/clients
-/quit
+send a.echo hello
+send a.adder 42
+send a.list_dir "."
+clients
+quit
 ```
 
 ## Python API
@@ -61,10 +62,14 @@ async def main():
         # List a remote directory
         entries = await client.send("a.list_dir", ".")
 
-        # Transfer a single file (returns bytes)
-        data = await client.send("a.get_file", "data.bin")
+        # Transfer a single file over the relay (returns bytes).
+        # Without use_s3=False the transfer is staged through S3, which
+        # requires NEXUS_TRANSFER_S3_BUCKET to be set on the remote side.
+        data = await client.send("a.get_file", "data.bin", use_s3=False)
 
-        # Recursively copy a remote directory (resumes interrupted transfers)
+        # Recursively copy a remote directory (resumes interrupted
+        # transfers).  Staged through S3 by default; pass use_s3=False to
+        # send the data over the relay instead.
         await client.get_directory("a", "src", "./local-copy")
 
 asyncio.run(main())
@@ -84,13 +89,13 @@ async with Client("worker", allowed_paths=["/data", "/models"]) as client:
 Both CLI commands have importable async counterparts:
 
 ```python
-from nexus_transfers.copy import _copy
+from nexus_transfers.copy import copy
 from nexus_transfers.copy_ssh import _copy_to_ssh
 
 # Equivalent to: nexus-transfers copy --from a /remote/src ./local-copy
-asyncio.run(_copy(
+asyncio.run(copy(
     name="my-copy",
-    url="ws://localhost:8766",
+    broker_url="ws://localhost:8766",
     remote_client="a",
     source="/remote/src",
     target="./local-copy",
@@ -172,18 +177,19 @@ size already matches the local size.
 
 - **Named routing** — clients register with a unique name; messages are routed by name
 - **RPC dispatch** — clients expose functions that other clients can call remotely
-- **Binary file transfer** — files are sent as raw binary WebSocket frames (no base64), chunked with tqdm progress bars
-- **Optional S3 staging** — pass `use_s3=True` (or `--use-s3` to `nexus-transfers copy`) to relay through an S3-compatible bucket instead of the WebSocket
+- **Binary file transfer** — files are sent as raw binary WebSocket frames (no base64), chunked with rich progress bars
+- **S3 staging (default)** — transfers are staged through an S3-compatible bucket; pass `use_s3=False` (or `--use-broker` to `nexus-transfers copy`) to send the data over the WebSocket relay instead
 - **SHA-256 checksums** — computed incrementally during transfer and verified on completion
 - **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
 - **Direct SSH copy** — `nexus-transfers copy-ssh` uploads a local directory via SFTP without any relay involvement in the data path
 - **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
-- **Shared memory** — key-value store on the broker, accessible from any client via `/mem` commands
-- **Client discovery** — `list_clients` / `/clients` returns all connected client names
+- **Client discovery** — `list_clients` (or `clients` in the interactive prompt) returns all connected client names
 
 ## S3 staging
 
-Configure on both clients:
+S3 staging is the **default** transfer mode. Configure on the providing
+client (the receiving side learns the bucket name from the provider's
+reply):
 
 ```bash
 export NEXUS_TRANSFER_S3_BUCKET=my-bucket
@@ -195,7 +201,13 @@ export NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY=...                 # optional
 Then:
 
 ```bash
-nexus-transfers copy --from a /remote/path ./local-path --use-s3
+nexus-transfers copy --from a /remote/path ./local-path
+```
+
+To bypass S3 and send the data over the WebSocket relay instead:
+
+```bash
+nexus-transfers copy --from a /remote/path ./local-path --use-broker
 ```
 
 Flow: provider uploads → returns key/size/sha256 → initiator downloads
@@ -218,6 +230,7 @@ on the provider's disk is untouched.
 | `--name`        | (required)               | Unique client ID                                 |
 | `--broker-url`  | `ws://localhost:8766`    | Broker WebSocket URL                             |
 | `--allow-path`  | (none)                   | Directory to expose for file operations (repeatable) |
+| `--interactive` | off                      | Start an interactive prompt instead of a headless worker |
 
 ### `nexus-transfers copy`
 
@@ -227,8 +240,8 @@ on the provider's disk is untouched.
 | `source target`    | (required)            | Remote source dir, local target dir                    |
 | `--broker-url`     | `ws://localhost:8766` | Broker WebSocket URL                                   |
 | `--max-concurrent` | `4`                   | Maximum parallel file transfers                        |
-| `--chunk-size`     | `65536`               | Binary chunk size (ignored with `--use-s3`)            |
-| `--use-s3`         | off                   | Stage transfers through S3 (needs `NEXUS_TRANSFER_S3_*`) |
+| `--chunk-size`     | `65536`               | Binary chunk size (only used with `--use-broker`)      |
+| `--use-broker`     | off                   | Send data over the relay instead of S3 staging (S3 is the default and needs `NEXUS_TRANSFER_S3_*`) |
 
 ### `nexus-transfers copy-ssh`
 
@@ -236,7 +249,7 @@ on the provider's disk is untouched.
 |--------------------|------------------------|-----------------------------------------------------|
 | `--source`         | (required)             | Local directory to copy                             |
 | `--target`         | (required)             | `[user@]host:/remote/path`                          |
-| `--broker-url`     | `$NEXUS_TRANSFERS_URL` | Relay URL for monitoring only (optional)            |
+| `--broker-url`     | (none — monitoring disabled) | Relay URL for monitoring only (optional)      |
 | `--name`           | auto-generated         | Client name on the relay                            |
 | `--site`           | (none)                 | Site label for monitor messages                     |
 | `--max-concurrent` | `4`                    | Number of parallel SFTP uploads                     |
