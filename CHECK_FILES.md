@@ -68,12 +68,13 @@ relay monitoring exactly like `copy-ssh`.
   the command exits with status 1 — it fails loudly, nothing is modified.
 - `--fix`: corrupt and missing files are transferred again from the
   reference.
-- `--delete-extra`: deliberately narrow — it only deletes extra files that
-  are clearly debris from an interrupted transfer: the name must end in
+- `--delete-extra`: deliberately narrow — it only deletes whitelisted
+  extras: (a) debris from an interrupted transfer — the name ends in
   `.<hex>` (6–12 hex chars, optionally followed by `.tmp`, the pattern of
-  the atomic-upload temp files) **and** the corresponding base file must
-  exist on the reference. Any other extra file is reported but never
-  deleted, whatever the options.
+  the atomic-upload temp files) **and** the corresponding base file exists
+  on the reference; (b) anything under the dataset's top-level `_build/`
+  directory (scratch space from dataset creation). Any other extra file is
+  reported but never deleted, whatever the options.
 - Safety invariants (always on): the check refuses to run when the
   reference contains no files or (SSH mode) the `--source` directory is
   missing — an empty reference is far more likely a wrong path or a

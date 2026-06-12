@@ -70,6 +70,26 @@ def is_failed_transfer_leftover(rel: str, reference_files) -> bool:
     return base_rel in reference_files
 
 
+def is_deletable_extra(rel: str, reference_files) -> bool:
+    """True when an extra file may be removed by ``--delete-extra``.
+
+    Whitelist of exactly two cases: debris from an interrupted transfer
+    (:func:`is_failed_transfer_leftover`) and anything under the dataset's
+    top-level ``_build/`` directory (scratch space used while a dataset is
+    being created). Every other extra file is reported but never deleted.
+
+    Parameters
+    ----------
+    rel : str
+        Path of the extra file, relative to the checked root (POSIX).
+    reference_files :
+        Set-like container of the reference's relative file paths.
+    """
+    if rel.startswith("_build/"):
+        return True
+    return is_failed_transfer_leftover(rel, reference_files)
+
+
 _AGE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdw]?)$")
 _AGE_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
@@ -314,9 +334,8 @@ class _DirectoryCheck:
     fix : bool
         Re-download corrupt or missing files instead of failing.
     delete_extra : bool
-        Delete extra local files that are failed-transfer leftovers
-        (see :func:`is_failed_transfer_leftover`); other extras are only
-        reported.
+        Delete whitelisted extra local files (see
+        :func:`is_deletable_extra`); other extras are only reported.
     fix_permissions : int or None
         Explicit permission bits (e.g. ``0o600``) to enforce on every local
         file. ``None`` (default) only reports drift against the reference.
@@ -610,9 +629,9 @@ class _DirectoryCheck:
             fix = None
             detail = "not on the reference"
             if self._delete_extra:
-                # Only ever delete debris from an interrupted transfer;
-                # any other extra file is kept and reported.
-                if is_failed_transfer_leftover(rel, self._remote_rel):
+                # Only ever delete whitelisted extras (failed-transfer
+                # debris, _build/*); anything else is kept and reported.
+                if is_deletable_extra(rel, self._remote_rel):
                     try:
                         os.remove(os.path.join(self._local_path, rel))
                         fix = "deleted"
@@ -620,7 +639,7 @@ class _DirectoryCheck:
                         _logger.warning("Could not delete extra file %s: %s",
                                         rel, exc)
                 else:
-                    detail += " (kept: not a failed-transfer leftover)"
+                    detail += " (kept: not a deletable extra)"
             self._report.add("extra", rel, detail, fix=fix)
             await self._report.maybe_report()
 
@@ -758,9 +777,10 @@ def main() -> None:
     parser.add_argument(
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files", default=False),
-        help="Delete extra local files left over by an interrupted transfer "
-             "(<base>.<hex>[.tmp] with <base> on the reference); other "
-             "extras are only reported, never deleted",
+        help="Delete whitelisted extra local files: failed-transfer "
+             "leftovers (<base>.<hex>[.tmp] with <base> on the reference) "
+             "and files under _build/; other extras are only reported, "
+             "never deleted",
     )
     parser.add_argument(
         "--fix-permissions", metavar="MODE", type=_parse_mode,

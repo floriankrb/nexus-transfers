@@ -37,7 +37,7 @@ from nexus_transfers.check_files import (
     CheckFailedError,
     CheckReport,
     _parse_mode,
-    is_failed_transfer_leftover,
+    is_deletable_extra,
     scan_local_files,
 )
 from nexus_transfers.client import Client
@@ -178,9 +178,9 @@ async def _check_ssh(
     fix : bool
         Re-upload corrupt or missing remote files instead of failing.
     delete_extra : bool
-        Delete extra remote files that are failed-transfer leftovers
-        (``<base>.<hex>[.tmp]`` with ``<base>`` in the local reference);
-        other extras are only reported, never deleted.
+        Delete whitelisted extra remote files (failed-transfer leftovers
+        and ``_build/*``, see :func:`is_deletable_extra`); other extras
+        are only reported, never deleted.
     fix_permissions : int or None
         Explicit permission bits (e.g. ``0o600``) to enforce on every remote
         file; None (default) only reports drift against the local reference.
@@ -331,9 +331,9 @@ async def _check_ssh(
                 fix_label = None
                 detail = "not in the local reference"
                 if delete_extra:
-                    # Only ever delete debris from an interrupted transfer;
-                    # any other extra file is kept and reported.
-                    if is_failed_transfer_leftover(rel, local_files):
+                    # Only ever delete whitelisted extras (failed-transfer
+                    # debris, _build/*); anything else is kept and reported.
+                    if is_deletable_extra(rel, local_files):
                         try:
                             await pool.get_sftp().remove(f"{remote_base}/{rel}")
                             fix_label = "deleted"
@@ -343,7 +343,7 @@ async def _check_ssh(
                                 rel, exc,
                             )
                     else:
-                        detail += " (kept: not a failed-transfer leftover)"
+                        detail += " (kept: not a deletable extra)"
                 report.add("extra", rel, detail, fix=fix_label)
                 await report.maybe_report()
     finally:
@@ -394,9 +394,10 @@ def main() -> None:
     parser.add_argument(
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files_ssh", default=False),
-        help="Delete extra remote files left over by an interrupted transfer "
-             "(<base>.<hex>[.tmp] with <base> in the local reference); other "
-             "extras are only reported, never deleted",
+        help="Delete whitelisted extra remote files: failed-transfer "
+             "leftovers (<base>.<hex>[.tmp] with <base> in the local "
+             "reference) and files under _build/; other extras are only "
+             "reported, never deleted",
     )
     parser.add_argument(
         "--fix-permissions", metavar="MODE", type=_parse_mode,

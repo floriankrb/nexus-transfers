@@ -38,7 +38,7 @@ from nexus_transfers._progress import (
 from nexus_transfers.check_files import (
     CheckFailedError,
     CheckReport,
-    is_failed_transfer_leftover,
+    is_deletable_extra,
     scan_local_files,
 )
 from nexus_transfers.client import Client
@@ -172,9 +172,9 @@ async def _check_s3(
     fix : bool
         Re-upload corrupt or missing objects instead of failing.
     delete_extra : bool
-        Delete extra objects that are failed-transfer leftovers
-        (``<base>.<hex>[.tmp]`` with ``<base>`` in the local reference);
-        other extras are only reported, never deleted.
+        Delete whitelisted extra objects (failed-transfer leftovers and
+        ``_build/*``, see :func:`is_deletable_extra`); other extras are
+        only reported, never deleted.
     max_concurrent : int
         Maximum number of files checked in parallel.
     ssl_verify : bool
@@ -316,15 +316,15 @@ async def _check_s3(
             fix_label = None
             detail = "not in the local reference"
             if delete_extra:
-                # Only ever delete debris from an interrupted transfer;
-                # any other extra object is kept and reported.
-                if is_failed_transfer_leftover(rel, local_files):
+                # Only ever delete whitelisted extras (failed-transfer
+                # debris, _build/*); anything else is kept and reported.
+                if is_deletable_extra(rel, local_files):
                     await loop.run_in_executor(
                         None, lambda k=key: s3.delete(k, bucket=bucket),
                     )
                     fix_label = "deleted"
                 else:
-                    detail += " (kept: not a failed-transfer leftover)"
+                    detail += " (kept: not a deletable extra)"
             report.add("extra", rel, detail, fix=fix_label)
             await report.maybe_report()
     finally:
@@ -379,9 +379,10 @@ def main() -> None:
     parser.add_argument(
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files_s3", default=False),
-        help="Delete extra objects left over by an interrupted transfer "
-             "(<base>.<hex>[.tmp] with <base> in the local reference); other "
-             "extras are only reported, never deleted",
+        help="Delete whitelisted extra objects: failed-transfer leftovers "
+             "(<base>.<hex>[.tmp] with <base> in the local reference) and "
+             "objects under _build/; other extras are only reported, "
+             "never deleted",
     )
     parser.add_argument(
         "--max-concurrent", type=int,

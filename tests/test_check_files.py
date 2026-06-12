@@ -11,6 +11,7 @@ from nexus_transfers.check_files import (
     CheckFailedError,
     _parse_age,
     check_files,
+    is_deletable_extra,
     is_failed_transfer_leftover,
 )
 from nexus_transfers.client import RemoteError
@@ -147,6 +148,19 @@ def test_is_failed_transfer_leftover():
     assert not is_failed_transfer_leftover("a.txt.zzzzzz", ref)
 
 
+def test_is_deletable_extra():
+    ref = {"a.txt"}
+    # _build/ scratch space is deletable wholesale, any depth, any name.
+    assert is_deletable_extra("_build/temp.json", ref)
+    assert is_deletable_extra("_build/sub/deep/file", ref)
+    # Not the top-level _build directory: kept.
+    assert not is_deletable_extra("sub/_build/temp.json", ref)
+    assert not is_deletable_extra("_buildx/file", ref)
+    # Failed-transfer leftovers still deletable; plain strays still kept.
+    assert is_deletable_extra("a.txt.3fa9c2d1.tmp", ref)
+    assert not is_deletable_extra("stray.txt", ref)
+
+
 @pytest.mark.asyncio
 async def test_check_delete_extra_only_leftovers(broker, tmp_path):
     remote = _make_tree(tmp_path / "remote")
@@ -154,15 +168,23 @@ async def test_check_delete_extra_only_leftovers(broker, tmp_path):
     _clone_tree(remote, local)
     # Failed-transfer debris: deletable.
     (local / "sub" / "b.txt.3fa9c2d1.tmp").write_text("partial")
+    # Dataset-creation scratch space: deletable.
+    (local / "_build").mkdir()
+    (local / "_build" / "state.json").write_text("{}")
     # Unexplained extra: must never be deleted.
     (local / "stray.txt").write_text("oops")
 
     report = await _run_check(broker, remote, local, delete_extra=True)
     assert not report.ok  # the stray remains an unfixed discrepancy
     assert not (local / "sub" / "b.txt.3fa9c2d1.tmp").exists()
+    assert not (local / "_build" / "state.json").exists()
     assert (local / "stray.txt").exists()
     extras = {rel: fix for rel, _d, fix in report.discrepancies["extra"]}
-    assert extras == {"sub/b.txt.3fa9c2d1.tmp": "deleted", "stray.txt": None}
+    assert extras == {
+        "sub/b.txt.3fa9c2d1.tmp": "deleted",
+        "_build/state.json": "deleted",
+        "stray.txt": None,
+    }
 
 
 @pytest.mark.asyncio
