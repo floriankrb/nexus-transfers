@@ -17,6 +17,8 @@ nexus-transfers monitor    — Run a monitoring client (runs forever)
 nexus-transfers server     — Run a peer awaiting messages (runs forever)
 nexus-transfers copy       — Copy a remote directory to local via relay (terminates)
 nexus-transfers copy-ssh   — Copy a local directory to a remote SSH target (terminates)
+nexus-transfers check-files     — Verify a local copy against a remote nexus reference (terminates)
+nexus-transfers check-files-ssh — Verify a remote SSH copy against the local reference (terminates)
 ```
 
 Legacy standalone commands are preserved for backward compatibility.

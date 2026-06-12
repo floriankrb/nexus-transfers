@@ -3,6 +3,8 @@
 import glob as _glob
 import logging
 import os
+import shlex
+import stat
 import uuid
 from pathlib import PurePosixPath
 
@@ -123,6 +125,12 @@ class SSHPool:
         self._counter += 1
         return self._sftp_clients[idx]
 
+    def get_conn(self):
+        """Return an SSH connection from the pool using round-robin selection."""
+        idx = self._counter % len(self._conns)
+        self._counter += 1
+        return self._conns[idx]
+
     async def close(self) -> None:
         """Close all SFTP clients and SSH connections."""
         for sftp in self._sftp_clients:
@@ -186,3 +194,87 @@ async def stat_remote(sftp, remote_path: str) -> int | None:
         return attrs.size
     except asyncssh.SFTPError:
         return None
+
+
+async def remote_hash(conn, remote_path: str, algo: str = "md5") -> str | None:
+    """Compute the hash of *remote_path* by running ``<algo>sum`` over SSH.
+
+    Returns None when the remote file does not exist.
+
+    Parameters
+    ----------
+    conn :
+        asyncssh SSH connection.
+    remote_path : str
+        Remote file path (POSIX).
+    algo : str
+        ``md5``, ``sha256``, … — anything with a ``<algo>sum`` coreutils
+        binary on the remote host.
+
+    Raises
+    ------
+    RuntimeError
+        If the remote command fails for a reason other than a missing file.
+    """
+    command = f"{algo}sum -b -- {shlex.quote(remote_path)}"
+    result = await conn.run(command, check=False)
+    if result.exit_status == 0:
+        return result.stdout.split()[0].lstrip("\\")
+    stderr = (result.stderr or "").strip()
+    if "No such file" in stderr:
+        return None
+    raise RuntimeError(
+        f"remote hash failed for {remote_path!r} "
+        f"(exit {result.exit_status}): {stderr}"
+    )
+
+
+async def stat_mode_remote(sftp, remote_path: str) -> int | None:
+    """Return the permission bits of *remote_path*, or None if missing.
+
+    Parameters
+    ----------
+    sftp :
+        asyncssh SFTP client.
+    remote_path : str
+        Remote file path to stat.
+    """
+    try:
+        attrs = await sftp.stat(remote_path)
+        return stat.S_IMODE(attrs.permissions)
+    except asyncssh.SFTPError:
+        return None
+
+
+async def walk_remote(sftp, remote_path: str) -> list[tuple[str, int]]:
+    """Recursively list the files under *remote_path*.
+
+    Returns a list of ``(relative_posix_path, size)`` tuples. Symlinks are
+    not followed. Returns an empty list when *remote_path* does not exist.
+
+    Parameters
+    ----------
+    sftp :
+        asyncssh SFTP client.
+    remote_path : str
+        Remote directory to walk (POSIX).
+    """
+    files: list[tuple[str, int]] = []
+
+    async def _walk(path: str, prefix: str) -> None:
+        try:
+            entries = await sftp.readdir(path)
+        except asyncssh.SFTPError:
+            return
+        for entry in entries:
+            if entry.filename in (".", ".."):
+                continue
+            rel = f"{prefix}/{entry.filename}" if prefix else entry.filename
+            mode = entry.attrs.permissions or 0
+            if stat.S_ISDIR(mode):
+                await _walk(f"{path}/{entry.filename}", rel)
+            elif stat.S_ISREG(mode):
+                files.append((rel, entry.attrs.size or 0))
+
+    await _walk(remote_path.rstrip("/"), "")
+    return files

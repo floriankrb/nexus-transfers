@@ -12,6 +12,8 @@ def main():
         "copy": "nexus_transfers.copy:main",
         "copy-ssh": "nexus_transfers.copy_ssh:main",
         "check": "nexus_transfers.check:main",
+        "check-files": "nexus_transfers.check_files:main",
+        "check-files-ssh": "nexus_transfers.check_files_ssh:main",
     }
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
@@ -23,6 +25,8 @@ def main():
         print("  copy       Copy a remote directory to local via relay")
         print("  copy-ssh   Copy a local directory to a remote SSH target")
         print("  check      Verify S3 credentials (put/get/delete a test object)")
+        print("  check-files      Verify a local copy against a remote nexus reference")
+        print("  check-files-ssh  Verify a remote SSH copy against the local reference")
         sys.exit(0)
 
     command = sys.argv[1]

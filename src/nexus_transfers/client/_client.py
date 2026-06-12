@@ -30,6 +30,7 @@ from nexus_transfers.dispatch import (
     FileTransfer,
     S3Transfer,
     make_get_file,
+    make_hash_file,
     make_list_dir,
 )
 from nexus_transfers.protocol import decode_frame, encode_frame
@@ -103,6 +104,7 @@ class Client:
         if self.allowed_paths:
             self.dispatch["get_file"] = make_get_file(self.allowed_paths)
             self.dispatch["list_dir"] = make_list_dir(self.allowed_paths)
+            self.dispatch["hash_file"] = make_hash_file(self.allowed_paths)
             self.dispatch["s3_cleanup"] = self._s3_cleanup
         self._ws = None
         self._pending: dict[str, asyncio.Future] = {}

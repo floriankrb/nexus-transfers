@@ -1,8 +1,10 @@
 """Dispatch table – functions exposed by every client."""
 
+import hashlib
 import logging
 import math
 import os
+import stat as _stat
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,62 @@ def make_get_file(allowed_paths):
         return FileTransfer(resolved, chunk_size=chunk_size)
 
     return get_file
+
+
+def compute_file_hash(path, algo="md5", chunk_size=1024 * 1024):
+    """Compute the hex digest of a file, reading it in chunks.
+
+    Parameters
+    ----------
+    path
+        Path to the file to hash.
+    algo
+        Any algorithm name accepted by :func:`hashlib.new` (default md5,
+        used for corruption detection, not security).
+    chunk_size
+        Read size in bytes.
+    """
+    hasher = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def make_hash_file(allowed_paths):
+    """Create a ``hash_file`` function bound to allowed paths.
+
+    Parameters
+    ----------
+    allowed_paths
+        List of allowed base directories.
+    """
+    def hash_file(path, algo="md5"):
+        """Return the hash, size and permission bits of a file.
+
+        Parameters
+        ----------
+        path
+            Path to the file to hash.
+        algo
+            Hash algorithm name accepted by :func:`hashlib.new`
+            (default md5 — corruption detection, not security).
+        """
+        resolved = resolve_safe_path(path, allowed_paths)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"not a file: {path}")
+        st = os.stat(resolved)
+        return {
+            "hash": compute_file_hash(resolved, algo=algo),
+            "algo": algo,
+            "size": st.st_size,
+            "mode": _stat.S_IMODE(st.st_mode),
+        }
+
+    return hash_file
 
 
 def make_list_dir(allowed_paths):

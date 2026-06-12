@@ -173,6 +173,21 @@ nexus-transfers copy-ssh \
 Interrupted transfers resume automatically: a file is skipped when its remote
 size already matches the local size.
 
+## Integrity check
+
+`nexus-transfers check-files` verifies a local copy against a remote nexus
+reference (hashes are computed on each side; no file content is transferred),
+and `nexus-transfers check-files-ssh` verifies a remote SSH copy against the
+local reference. Both detect corruption, missing files, extra files and
+permission drift, exit non-zero on unfixed discrepancies, and can repair with
+`--fix`, `--delete-extra` and `--fix-permissions MODE` (explicit octal mode,
+e.g. `600`). See [CHECK_FILES.md](CHECK_FILES.md).
+
+```bash
+nexus-transfers check-files --from a /remote/path ./local-path --fix
+nexus-transfers check-files-ssh --source /data --target user@host:/remote --fix
+```
+
 ## Features
 
 - **Named routing** — clients register with a unique name; messages are routed by name
