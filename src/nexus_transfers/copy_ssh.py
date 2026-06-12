@@ -17,7 +17,6 @@ import uuid
 from pathlib import PurePosixPath
 from typing import Callable
 
-from rich.console import Console
 from rich.progress import (
     BarColumn,
     Progress,
@@ -30,6 +29,8 @@ from nexus_transfers._progress import (
     _BinarySpeedColumn,
     _CountOrBytesColumn,
     _fmt_binary,
+    make_console,
+    setup_cli_logging,
 )
 from nexus_transfers.client import Client
 from nexus_transfers.config import cli_default
@@ -432,7 +433,7 @@ async def _copy_to_ssh(
     """
     user, host, remote_base = _parse_target(target)
     source = os.path.expanduser(source)
-    console = Console(quiet=quiet)
+    console = make_console(quiet=quiet)
 
     label = os.path.basename(source.rstrip("/")) or source
     dest_label = f"{site}:{remote_base}" if site else f"{host}:{remote_base}"
@@ -719,11 +720,7 @@ def main() -> None:
                         help="Enable debug logging")
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     tag = args.site or "ssh-copy"
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"

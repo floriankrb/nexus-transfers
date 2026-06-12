@@ -20,7 +20,6 @@ import uuid
 from typing import Callable
 
 import obstore as obs
-from rich.console import Console
 from rich.progress import (
     BarColumn,
     Progress,
@@ -30,8 +29,18 @@ from rich.progress import (
 )
 
 from nexus_transfers import s3
-from nexus_transfers._progress import _BinarySpeedColumn, _CountOrBytesColumn
-from nexus_transfers.check_files import CheckReport, scan_local_files
+from nexus_transfers._progress import (
+    _BinarySpeedColumn,
+    _CountOrBytesColumn,
+    make_console,
+    setup_cli_logging,
+)
+from nexus_transfers.check_files import (
+    CheckFailedError,
+    CheckReport,
+    is_failed_transfer_leftover,
+    scan_local_files,
+)
 from nexus_transfers.client import Client
 from nexus_transfers.config import cli_default
 from nexus_transfers.dispatch import compute_file_hash
@@ -163,7 +172,9 @@ async def _check_s3(
     fix : bool
         Re-upload corrupt or missing objects instead of failing.
     delete_extra : bool
-        Delete objects under the prefix that are not in the local reference.
+        Delete extra objects that are failed-transfer leftovers
+        (``<base>.<hex>[.tmp]`` with ``<base>`` in the local reference);
+        other extras are only reported, never deleted.
     max_concurrent : int
         Maximum number of files checked in parallel.
     ssl_verify : bool
@@ -182,7 +193,15 @@ async def _check_s3(
     """
     bucket, prefix = s3.parse_s3_url(target)
     source = os.path.expanduser(source)
-    console = Console(quiet=quiet)
+    # The local tree is the reference here: a missing or empty source is
+    # far more likely a typo or filesystem problem than a real dataset,
+    # and with --delete-extra it would classify every object under the
+    # prefix as extra. Refuse before touching anything.
+    if not os.path.isdir(source):
+        raise CheckFailedError(
+            f"reference {source} is not a directory — refusing to check"
+        )
+    console = make_console(quiet=quiet)
     loop = asyncio.get_running_loop()
 
     label = os.path.basename(source.rstrip("/")) or source
@@ -244,6 +263,12 @@ async def _check_s3(
         loop.run_in_executor(None, scan_local_files, source),
         loop.run_in_executor(None, s3.list_objects, bucket, prefix),
     )
+    if not local_files:
+        progress.stop()
+        raise CheckFailedError(
+            f"reference {source} contains no files — refusing to check "
+            "(wrong path or filesystem issue?)"
+        )
     skip = len(prefix) + 1 if prefix else 0
     remote_sizes = {
         key[skip:]: size for key, size in listing if key[skip:]
@@ -289,13 +314,18 @@ async def _check_s3(
                 continue
             key = f"{prefix}/{rel}" if prefix else rel
             fix_label = None
+            detail = "not in the local reference"
             if delete_extra:
-                await loop.run_in_executor(
-                    None, lambda k=key: s3.delete(k, bucket=bucket),
-                )
-                fix_label = "deleted"
-            report.add("extra", rel, "not in the local reference",
-                       fix=fix_label)
+                # Only ever delete debris from an interrupted transfer;
+                # any other extra object is kept and reported.
+                if is_failed_transfer_leftover(rel, local_files):
+                    await loop.run_in_executor(
+                        None, lambda k=key: s3.delete(k, bucket=bucket),
+                    )
+                    fix_label = "deleted"
+                else:
+                    detail += " (kept: not a failed-transfer leftover)"
+            report.add("extra", rel, detail, fix=fix_label)
             await report.maybe_report()
     finally:
         progress.stop()
@@ -349,7 +379,9 @@ def main() -> None:
     parser.add_argument(
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files_s3", default=False),
-        help="Delete objects that are not in the local reference",
+        help="Delete extra objects left over by an interrupted transfer "
+             "(<base>.<hex>[.tmp] with <base> in the local reference); other "
+             "extras are only reported, never deleted",
     )
     parser.add_argument(
         "--max-concurrent", type=int,
@@ -369,29 +401,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     tag = args.site or "check-s3"
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
 
-    report = asyncio.run(
-        _check_s3(
-            source=args.source,
-            target=args.target,
-            broker_url=args.broker_url,
-            name=name,
-            site=args.site,
-            algo=args.algo,
-            fix=args.fix,
-            delete_extra=args.delete_extra,
-            max_concurrent=args.max_concurrent,
-            ssl_verify=not args.no_verify,
+    try:
+        report = asyncio.run(
+            _check_s3(
+                source=args.source,
+                target=args.target,
+                broker_url=args.broker_url,
+                name=name,
+                site=args.site,
+                algo=args.algo,
+                fix=args.fix,
+                delete_extra=args.delete_extra,
+                max_concurrent=args.max_concurrent,
+                ssl_verify=not args.no_verify,
+            )
         )
-    )
+    except CheckFailedError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
     if not report.ok:
         sys.exit(1)
 

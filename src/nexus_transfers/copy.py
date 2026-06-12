@@ -9,12 +9,11 @@ Usage::
 import argparse
 import asyncio
 import datetime
-import logging
 import os
 import uuid
 
-from rich.console import Console
 
+from nexus_transfers._progress import make_console, setup_cli_logging
 from nexus_transfers.client import _DEFAULT_URL, Client
 from nexus_transfers.config import cli_default
 
@@ -155,11 +154,7 @@ def main():
     )
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     tag = args.site or "copy"
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
@@ -224,7 +219,7 @@ async def copy(name, broker_url, remote_client, source, target, site=None,
         Forwarded to :class:`~nexus_transfers.client.Client`.
     """
     target = os.path.expanduser(target)
-    console = Console()
+    console = make_console()
     async with Client(name, broker_url, **client_kwargs) as client:
         if on_monitor is not None:
             _original_monitor = client.monitor

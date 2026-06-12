@@ -24,6 +24,7 @@ import uuid
 
 from rich.console import Console
 
+from nexus_transfers._progress import make_console, setup_cli_logging
 from nexus_transfers.client import (
     _DEFAULT_URL,
     Client,
@@ -39,6 +40,34 @@ _logger = logging.getLogger(__name__)
 
 class CheckFailedError(Exception):
     """Raised when the check cannot run (e.g. an incompatible reference)."""
+
+
+# Leftover of an interrupted transfer: "<base>.<hex>" or "<base>.<hex>.tmp"
+# (ssh.write_file uploads to "<name>.<8 hex>.tmp" before its atomic rename).
+_LEFTOVER_RE = re.compile(r"^(?P<base>.+)\.[0-9a-f]{6,12}(\.tmp)?$")
+
+
+def is_failed_transfer_leftover(rel: str, reference_files) -> bool:
+    """True when *rel* looks like debris from an interrupted transfer.
+
+    Deliberately strict — this is the only thing ``--delete-extra`` is
+    allowed to remove: the name must end in ``.<hex>`` (optionally
+    ``.tmp``) **and** the corresponding base file must exist on the
+    reference. Anything else is reported but never deleted.
+
+    Parameters
+    ----------
+    rel : str
+        Path of the extra file, relative to the checked root (POSIX).
+    reference_files :
+        Set-like container of the reference's relative file paths.
+    """
+    dirname, _, name = rel.rpartition("/")
+    match = _LEFTOVER_RE.match(name)
+    if not match:
+        return False
+    base_rel = f"{dirname}/{match.group('base')}" if dirname else match.group("base")
+    return base_rel in reference_files
 
 
 _AGE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdw]?)$")
@@ -285,7 +314,9 @@ class _DirectoryCheck:
     fix : bool
         Re-download corrupt or missing files instead of failing.
     delete_extra : bool
-        Delete local files absent from the reference.
+        Delete extra local files that are failed-transfer leftovers
+        (see :func:`is_failed_transfer_leftover`); other extras are only
+        reported.
     fix_permissions : int or None
         Explicit permission bits (e.g. ``0o600``) to enforce on every local
         file. ``None`` (default) only reports drift against the reference.
@@ -375,6 +406,16 @@ class _DirectoryCheck:
             if walk_task is not None:
                 progress.remove_task(walk_task)
             progress.remove_task(check_task)
+
+        if self._walked == 0:
+            # An empty reference is far more likely a filesystem problem
+            # (wrong path, half-mounted NFS) than a genuinely empty
+            # dataset. Refuse before the extras scan: with --delete-extra
+            # it would otherwise classify the entire local tree as extra.
+            raise CheckFailedError(
+                f"reference {self._target}:{self._remote_path} contains no "
+                "files — refusing to check (wrong path or filesystem issue?)"
+            )
 
         await self._scan_extras()
         await self._report.final_report()
@@ -567,14 +608,20 @@ class _DirectoryCheck:
         )
         for rel in sorted(set(local_files) - self._remote_rel):
             fix = None
+            detail = "not on the reference"
             if self._delete_extra:
-                try:
-                    os.remove(os.path.join(self._local_path, rel))
-                    fix = "deleted"
-                except OSError as exc:
-                    _logger.warning("Could not delete extra file %s: %s",
-                                    rel, exc)
-            self._report.add("extra", rel, "not on the reference", fix=fix)
+                # Only ever delete debris from an interrupted transfer;
+                # any other extra file is kept and reported.
+                if is_failed_transfer_leftover(rel, self._remote_rel):
+                    try:
+                        os.remove(os.path.join(self._local_path, rel))
+                        fix = "deleted"
+                    except OSError as exc:
+                        _logger.warning("Could not delete extra file %s: %s",
+                                        rel, exc)
+                else:
+                    detail += " (kept: not a failed-transfer leftover)"
+            self._report.add("extra", rel, detail, fix=fix)
             await self._report.maybe_report()
 
 
@@ -606,7 +653,9 @@ async def check_files(name, broker_url, remote_client, source, target,
     fix:
         If True, re-download corrupt or missing files.
     delete_extra:
-        If True, delete local files that are not on the reference.
+        If True, delete extra local files that are failed-transfer
+        leftovers (``<base>.<hex>[.tmp]`` with ``<base>`` on the
+        reference); other extras are only reported, never deleted.
     fix_permissions:
         Explicit permission bits (e.g. ``0o600``) to enforce on every local
         file; None (default) only reports drift against the reference.
@@ -632,7 +681,7 @@ async def check_files(name, broker_url, remote_client, source, target,
         discrepancies remain.
     """
     target = os.path.expanduser(target)
-    console = Console(quiet=quiet)
+    console = make_console(quiet=quiet)
     async with Client(name, broker_url, **client_kwargs) as client:
 
         async def _emit(message, status=None, **kw):
@@ -709,7 +758,9 @@ def main() -> None:
     parser.add_argument(
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files", default=False),
-        help="Delete local files that are not on the reference",
+        help="Delete extra local files left over by an interrupted transfer "
+             "(<base>.<hex>[.tmp] with <base> on the reference); other "
+             "extras are only reported, never deleted",
     )
     parser.add_argument(
         "--fix-permissions", metavar="MODE", type=_parse_mode,
@@ -772,11 +823,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     tag = args.site or "check"
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"

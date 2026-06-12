@@ -10,6 +10,7 @@ import shutil
 
 import pytest
 
+from nexus_transfers.check_files import CheckFailedError
 from nexus_transfers.check_files_ssh import _check_ssh
 
 
@@ -106,15 +107,39 @@ async def test_ssh_check_extra_remote(tmp_path):
     local = _make_tree(tmp_path / "local")
     remote = tmp_path / "remote"
     shutil.copytree(local, remote)
+    # Failed-transfer debris: deletable.
+    (remote / "sub" / "b.txt.3fa9c2d1.tmp").write_text("partial")
+    # Unexplained extra: must never be deleted.
     (remote / "sub" / "stray.txt").write_text("oops")
 
     report = await _run_check(local, remote)
     assert not report.ok
-    assert [e[0] for e in report.discrepancies["extra"]] == ["sub/stray.txt"]
+    assert [e[0] for e in sorted(report.discrepancies["extra"])] == [
+        "sub/b.txt.3fa9c2d1.tmp", "sub/stray.txt",
+    ]
 
     report = await _run_check(local, remote, delete_extra=True)
-    assert report.ok
-    assert not (remote / "sub" / "stray.txt").exists()
+    assert not report.ok  # the stray remains an unfixed discrepancy
+    assert not (remote / "sub" / "b.txt.3fa9c2d1.tmp").exists()
+    assert (remote / "sub" / "stray.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_ssh_check_refuses_missing_or_empty_source(tmp_path):
+    remote = _make_tree(tmp_path / "remote")
+
+    with pytest.raises(CheckFailedError, match="not a directory"):
+        await _run_check(tmp_path / "does-not-exist", remote,
+                         delete_extra=True)
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(CheckFailedError, match="contains no files"):
+        await _run_check(empty, remote, delete_extra=True)
+
+    # Nothing on the remote was touched.
+    assert (remote / "a.txt").exists()
+    assert (remote / "sub" / "b.txt").exists()
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,49 @@
-"""Shared progress-bar helpers used by client.py and copy_ssh.py."""
+"""Shared progress-bar and console helpers for the CLI tools."""
 
+import logging
+import sys
+
+from rich.console import Console
 from rich.progress import ProgressColumn
 from rich.text import Text
+
+
+def make_console(quiet: bool = False) -> Console:
+    """Build a console suitable for both terminals and log files.
+
+    When stdout is not a terminal (output piped or redirected to a log
+    file), soft wrap is enabled so long lines — dataset paths in
+    particular — are never wrapped at an assumed terminal width.
+
+    Parameters
+    ----------
+    quiet : bool
+        If True, the console discards all output.
+    """
+    return Console(quiet=quiet, soft_wrap=not sys.stdout.isatty())
+
+
+def setup_cli_logging(debug: bool = False) -> None:
+    """Configure logging for a CLI run.
+
+    Uses ``RichHandler`` on a terminal; plain unwrapped log lines when the
+    output is piped or redirected to a file.
+
+    Parameters
+    ----------
+    debug : bool
+        If True, set the DEBUG level instead of INFO.
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    if sys.stdout.isatty():
+        from rich.logging import RichHandler
+        logging.basicConfig(level=level,
+                            handlers=[RichHandler(rich_tracebacks=True)])
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
 
 
 def _fmt_binary(n: float) -> str:

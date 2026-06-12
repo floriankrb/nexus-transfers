@@ -72,15 +72,43 @@ async def test_hash_catches_same_size_corruption(tree, shared_store):
 async def test_missing_and_extra(tree, shared_store):
     await copy_to_s3(str(tree), "s3://bucket/pre", quiet=True)
     obs.delete(shared_store, "pre/sub/b.bin")
+    # Failed-transfer debris: deletable.
+    obs.put(shared_store, "pre/a.txt.3fa9c2d1.tmp", b"partial")
+    # Unexplained extra: must never be deleted.
     obs.put(shared_store, "pre/stray.txt", b"stray")
 
     report = await _check(tree)
     assert not report.ok
     assert [rel for rel, _, _ in report.discrepancies["missing"]] == ["sub/b.bin"]
-    assert [rel for rel, _, _ in report.discrepancies["extra"]] == ["stray.txt"]
+    assert sorted(rel for rel, _, _ in report.discrepancies["extra"]) == [
+        "a.txt.3fa9c2d1.tmp", "stray.txt",
+    ]
 
     report = await _check(tree, fix=True, delete_extra=True)
-    assert report.ok
+    assert not report.ok  # the stray remains an unfixed discrepancy
+    keys = {
+        meta["path"]
+        for batch in shared_store.list()
+        for meta in batch
+    }
+    assert keys == {"pre/a.txt", "pre/sub/b.bin", "pre/stray.txt"}
+
+
+@pytest.mark.asyncio
+async def test_refuses_missing_or_empty_source(tree, shared_store, tmp_path):
+    from nexus_transfers.check_files import CheckFailedError
+
+    await copy_to_s3(str(tree), "s3://bucket/pre", quiet=True)
+
+    with pytest.raises(CheckFailedError, match="not a directory"):
+        await _check(tmp_path / "does-not-exist", delete_extra=True)
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(CheckFailedError, match="contains no files"):
+        await _check(empty, delete_extra=True)
+
+    # Nothing under the prefix was touched.
     keys = {
         meta["path"]
         for batch in shared_store.list()

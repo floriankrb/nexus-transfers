@@ -19,7 +19,6 @@ import sys
 import uuid
 from typing import Callable
 
-from rich.console import Console
 from rich.progress import (
     BarColumn,
     Progress,
@@ -28,10 +27,17 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from nexus_transfers._progress import _BinarySpeedColumn, _CountOrBytesColumn
+from nexus_transfers._progress import (
+    _BinarySpeedColumn,
+    _CountOrBytesColumn,
+    make_console,
+    setup_cli_logging,
+)
 from nexus_transfers.check_files import (
+    CheckFailedError,
     CheckReport,
     _parse_mode,
+    is_failed_transfer_leftover,
     scan_local_files,
 )
 from nexus_transfers.client import Client
@@ -172,7 +178,9 @@ async def _check_ssh(
     fix : bool
         Re-upload corrupt or missing remote files instead of failing.
     delete_extra : bool
-        Delete remote files that are not in the local reference.
+        Delete extra remote files that are failed-transfer leftovers
+        (``<base>.<hex>[.tmp]`` with ``<base>`` in the local reference);
+        other extras are only reported, never deleted.
     fix_permissions : int or None
         Explicit permission bits (e.g. ``0o600``) to enforce on every remote
         file; None (default) only reports drift against the local reference.
@@ -203,7 +211,15 @@ async def _check_ssh(
     user, host, remote_base = _parse_target(target)
     source = os.path.expanduser(source)
     remote_base = remote_base.rstrip("/")
-    console = Console(quiet=quiet)
+    # The local tree is the reference here: a missing or empty source is
+    # far more likely a typo or filesystem problem than a real dataset,
+    # and with --delete-extra it would classify the entire remote tree as
+    # extra. Refuse before touching anything.
+    if not os.path.isdir(source):
+        raise CheckFailedError(
+            f"reference {source} is not a directory — refusing to check"
+        )
+    console = make_console(quiet=quiet)
     loop = asyncio.get_running_loop()
 
     label = os.path.basename(source.rstrip("/")) or source
@@ -262,6 +278,12 @@ async def _check_ssh(
         f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
     )
     local_files = await loop.run_in_executor(None, scan_local_files, source)
+    if not local_files:
+        progress.stop()
+        raise CheckFailedError(
+            f"reference {source} contains no files — refusing to check "
+            "(wrong path or filesystem issue?)"
+        )
     report.total = len(local_files)
     progress.remove_task(walk_task_id)
     check_task_id = progress.add_task(
@@ -307,17 +329,22 @@ async def _check_ssh(
                 if rel in local_files:
                     continue
                 fix_label = None
+                detail = "not in the local reference"
                 if delete_extra:
-                    try:
-                        await pool.get_sftp().remove(f"{remote_base}/{rel}")
-                        fix_label = "deleted"
-                    except Exception as exc:
-                        _logger.warning(
-                            "Could not delete extra remote file %s: %s",
-                            rel, exc,
-                        )
-                report.add("extra", rel, "not in the local reference",
-                           fix=fix_label)
+                    # Only ever delete debris from an interrupted transfer;
+                    # any other extra file is kept and reported.
+                    if is_failed_transfer_leftover(rel, local_files):
+                        try:
+                            await pool.get_sftp().remove(f"{remote_base}/{rel}")
+                            fix_label = "deleted"
+                        except Exception as exc:
+                            _logger.warning(
+                                "Could not delete extra remote file %s: %s",
+                                rel, exc,
+                            )
+                    else:
+                        detail += " (kept: not a failed-transfer leftover)"
+                report.add("extra", rel, detail, fix=fix_label)
                 await report.maybe_report()
     finally:
         progress.stop()
@@ -367,7 +394,9 @@ def main() -> None:
     parser.add_argument(
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files_ssh", default=False),
-        help="Delete remote files that are not in the local reference",
+        help="Delete extra remote files left over by an interrupted transfer "
+             "(<base>.<hex>[.tmp] with <base> in the local reference); other "
+             "extras are only reported, never deleted",
     )
     parser.add_argument(
         "--fix-permissions", metavar="MODE", type=_parse_mode,
@@ -415,34 +444,34 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     tag = args.site or "check-ssh"
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
 
-    report = asyncio.run(
-        _check_ssh(
-            source=args.source,
-            target=args.target,
-            broker_url=args.broker_url,
-            name=name,
-            site=args.site,
-            algo=args.algo,
-            fix=args.fix,
-            delete_extra=args.delete_extra,
-            fix_permissions=args.fix_permissions,
-            max_concurrent=args.max_concurrent,
-            ssh_port=args.ssh_port,
-            ssh_key=args.ssh_key,
-            ssh_connections=args.ssh_connections,
-            ssl_verify=not args.no_verify,
-            encryption_algs=args.cipher,
+    try:
+        report = asyncio.run(
+            _check_ssh(
+                source=args.source,
+                target=args.target,
+                broker_url=args.broker_url,
+                name=name,
+                site=args.site,
+                algo=args.algo,
+                fix=args.fix,
+                delete_extra=args.delete_extra,
+                fix_permissions=args.fix_permissions,
+                max_concurrent=args.max_concurrent,
+                ssh_port=args.ssh_port,
+                ssh_key=args.ssh_key,
+                ssh_connections=args.ssh_connections,
+                ssl_verify=not args.no_verify,
+                encryption_algs=args.cipher,
+            )
         )
-    )
+    except CheckFailedError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
     if not report.ok:
         sys.exit(1)
 
