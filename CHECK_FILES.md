@@ -38,6 +38,11 @@ files absent from the reference.
 Fix downloads use the same path as `nexus-copy`: S3 staging by default,
 `--use-broker` for chunked relay transfer.
 
+`--max-age AGE` restricts the check to local files modified within the
+given duration (`30d`, `1h`, `45m`, or a bare number of seconds); older
+files are skipped and counted separately in the summary. Missing files
+are always reported — they have no age.
+
 ## SSH mode
 
 ```bash

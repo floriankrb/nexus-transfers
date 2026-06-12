@@ -1,11 +1,17 @@
 """Tests for the relay-mode integrity check (``check-files``)."""
 
+import argparse
 import os
+import time
 
 import pytest
 
 from nexus_transfers import Client
-from nexus_transfers.check_files import CheckFailedError, check_files
+from nexus_transfers.check_files import (
+    CheckFailedError,
+    _parse_age,
+    check_files,
+)
 from nexus_transfers.client import RemoteError
 
 
@@ -155,6 +161,40 @@ async def test_check_permissions(broker, tmp_path):
     assert report.ok
     for f in ("a.txt", "sub/b.txt", "sub/deep/c.bin"):
         assert (os.stat(local / f).st_mode & 0o7777) == 0o600
+
+
+def test_parse_age():
+    assert _parse_age("30d") == 30 * 86400
+    assert _parse_age("1h") == 3600
+    assert _parse_age("45m") == 2700
+    assert _parse_age("2w") == 2 * 604800
+    assert _parse_age("4") == 4
+    assert _parse_age("4s") == 4
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_age("yesterday")
+
+
+@pytest.mark.asyncio
+async def test_check_max_age_skips_old_files(broker, tmp_path):
+    remote = _make_tree(tmp_path / "remote")
+    local = tmp_path / "local"
+    _clone_tree(remote, local)
+    # Corrupt two local files; make one of them look 10 days old.
+    (local / "a.txt").write_text("BAD")
+    (local / "sub" / "b.txt").write_text("BAD")
+    old = time.time() - 10 * 86400
+    os.utime(local / "sub" / "b.txt", (old, old))
+
+    report = await _run_check(broker, remote, local, max_age=86400)
+    assert report.skipped == 1
+    assert report.checked == 2
+    # Only the recent corruption is detected; the old file was skipped.
+    assert [e[0] for e in report.discrepancies["corrupt"]] == ["a.txt"]
+
+    # Without max_age, both corruptions are found.
+    report = await _run_check(broker, remote, local)
+    assert report.skipped == 0
+    assert len(report.discrepancies["corrupt"]) == 2
 
 
 @pytest.mark.asyncio

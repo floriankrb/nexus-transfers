@@ -16,8 +16,10 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import stat as _stat
 import sys
+import time
 import uuid
 
 from rich.console import Console
@@ -37,6 +39,21 @@ _logger = logging.getLogger(__name__)
 
 class CheckFailedError(Exception):
     """Raised when the check cannot run (e.g. an incompatible reference)."""
+
+
+_AGE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdw]?)$")
+_AGE_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _parse_age(value) -> float:
+    """Parse a duration such as ``30d``, ``1h``, ``45m`` or ``4`` (seconds)."""
+    match = _AGE_RE.match(str(value).strip().lower())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid age {value!r}: expected e.g. 30d, 1h, 45m or 4 (seconds)"
+        )
+    number, unit = match.groups()
+    return float(number) * _AGE_UNITS[unit]
 
 
 def _parse_mode(value) -> int:
@@ -75,6 +92,7 @@ class CheckReport:
         self._last_report = self._start
 
         self.checked = 0
+        self.skipped = 0  # files not checked because older than --max-age
         self.total: int | None = None
         # kind -> list of (rel_path, detail, fix_applied_or_None)
         self.discrepancies: dict[str, list[tuple[str, str, str | None]]] = {
@@ -132,10 +150,13 @@ class CheckReport:
             for kind, v in self.discrepancies.items() if v
         ]
         if not parts:
-            return "no discrepancy"
-        joined = ", ".join(parts)
-        if self.n_fixed:
-            joined += f" ({self.n_fixed} fixed)"
+            joined = "no discrepancy"
+        else:
+            joined = ", ".join(parts)
+            if self.n_fixed:
+                joined += f" ({self.n_fixed} fixed)"
+        if self.skipped:
+            joined += f", {self.skipped} skipped (too old)"
         return joined
 
     async def maybe_report(self) -> None:
@@ -156,6 +177,7 @@ class CheckReport:
                 "unit": "file",
                 "discrepancies": self.n_found,
                 "fixed": self.n_fixed,
+                "skipped": self.skipped,
             },
         )
 
@@ -176,6 +198,7 @@ class CheckReport:
                 "unit": "file",
                 "discrepancies": self.n_found,
                 "fixed": self.n_fixed,
+                "skipped": self.skipped,
             },
         )
 
@@ -272,12 +295,15 @@ class _DirectoryCheck:
         S3 key prefix for fix downloads.
     chunk_size : int
         Binary chunk size for fix downloads when ``use_s3`` is False.
+    max_age : float or None
+        Only check local files modified within the last ``max_age``
+        seconds; older files are skipped. ``None`` checks everything.
     """
 
     def __init__(self, client, target, remote_path, local_path, report, *,
                  max_concurrent=4, algo="md5", fix=False, delete_extra=False,
                  fix_permissions=None, use_s3=True, s3_prefix=None,
-                 chunk_size=65536):
+                 chunk_size=65536, max_age=None):
         self._client = client
         self._target = target
         self._remote_path = remote_path
@@ -291,6 +317,7 @@ class _DirectoryCheck:
         self._use_s3 = use_s3
         self._s3_prefix = s3_prefix
         self._chunk_size = chunk_size
+        self._max_age = max_age
 
         self._label = os.path.basename(remote_path.rstrip("/")) or remote_path
         self._loop = asyncio.get_running_loop()
@@ -328,9 +355,15 @@ class _DirectoryCheck:
                 if item is None:
                     return
                 remote_file, local_file, rel = item
-                await self._check_one(remote_file, local_file, rel)
-                self._report.checked += 1
-                progress.update(check_task, completed=self._report.checked)
+                if self._too_old(local_file):
+                    self._report.skipped += 1
+                else:
+                    await self._check_one(remote_file, local_file, rel)
+                    self._report.checked += 1
+                progress.update(
+                    check_task,
+                    completed=self._report.checked + self._report.skipped,
+                )
                 await self._report.maybe_report()
 
         try:
@@ -398,6 +431,20 @@ class _DirectoryCheck:
                 await asyncio.sleep(self._client.peer_delay)
 
     # -- per-file check ------------------------------------------------------
+
+    def _too_old(self, local_file):
+        """True when *local_file* exists but is older than ``max_age``.
+
+        Missing files are never "too old": they have no mtime and must be
+        reported (or fixed) as missing.
+        """
+        if self._max_age is None:
+            return False
+        try:
+            mtime = os.path.getmtime(local_file)
+        except OSError:
+            return False
+        return time.time() - mtime > self._max_age
 
     async def _check_one(self, remote_file, local_file, rel):
         """Compare one file (hash + permission bits) and apply fixes."""
@@ -534,8 +581,8 @@ class _DirectoryCheck:
 async def check_files(name, broker_url, remote_client, source, target,
                       site=None, max_concurrent=4, algo="md5", fix=False,
                       delete_extra=False, fix_permissions=None, use_s3=True,
-                      chunk_size=65536, quiet=False, on_monitor=None,
-                      **client_kwargs) -> CheckReport:
+                      chunk_size=65536, max_age=None, quiet=False,
+                      on_monitor=None, **client_kwargs) -> CheckReport:
     """Connect to the relay and verify a local copy against the reference.
 
     Parameters
@@ -567,6 +614,9 @@ async def check_files(name, broker_url, remote_client, source, target,
         If True (default), stage fix downloads through S3.
     chunk_size:
         Binary chunk size for fix downloads when ``use_s3`` is False.
+    max_age:
+        Only check local files modified within the last ``max_age``
+        seconds; older files are skipped. None (default) checks everything.
     quiet:
         If True, suppress rich console output.
     on_monitor:
@@ -615,6 +665,7 @@ async def check_files(name, broker_url, remote_client, source, target,
             max_concurrent=max_concurrent, algo=algo, fix=fix,
             delete_extra=delete_extra, fix_permissions=fix_permissions,
             use_s3=use_s3, s3_prefix=s3_prefix, chunk_size=chunk_size,
+            max_age=max_age,
         )
         await check.run()
         report.print_summary(console)
@@ -672,6 +723,13 @@ def main() -> None:
         default=cli_default("max_concurrent", "check_files", default=4,
                             type_fn=int),
         help="Maximum parallel file checks (default: 4)",
+    )
+    parser.add_argument(
+        "--max-age", metavar="AGE", type=_parse_age,
+        default=cli_default("max_age", "check_files", default=None,
+                            type_fn=_parse_age),
+        help="Only check local files modified within AGE — e.g. 30d, 1h, "
+             "45m, 4 (seconds); older files are skipped (default: check all)",
     )
     parser.add_argument(
         "--use-broker", action="store_true",
@@ -739,6 +797,7 @@ def main() -> None:
                 fix_permissions=args.fix_permissions,
                 use_s3=not args.use_broker,
                 chunk_size=args.chunk_size,
+                max_age=args.max_age,
                 reconnect_retries=-1,
                 peer_retries=args.peer_retries,
                 peer_delay=args.peer_delay,
