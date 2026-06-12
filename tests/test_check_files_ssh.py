@@ -125,6 +125,26 @@ async def test_ssh_check_extra_remote(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ssh_check_max_age_skips_old_remote_files(tmp_path):
+    import time
+
+    local = _make_tree(tmp_path / "local")
+    remote = tmp_path / "remote"
+    shutil.copytree(local, remote)
+    # Corrupt two remote files; make one of them look 10 days old.
+    (remote / "a.txt").write_text("BAD")
+    (remote / "sub" / "b.txt").write_text("BAD")
+    old = time.time() - 10 * 86400
+    os.utime(remote / "sub" / "b.txt", (old, old))
+
+    report = await _run_check(local, remote, max_age=86400)
+    assert report.skipped == 1
+    assert report.checked == 1
+    # Only the recently-modified corruption is detected.
+    assert [e[0] for e in report.discrepancies["corrupt"]] == ["a.txt"]
+
+
+@pytest.mark.asyncio
 async def test_ssh_check_refuses_missing_or_empty_source(tmp_path):
     remote = _make_tree(tmp_path / "remote")
 

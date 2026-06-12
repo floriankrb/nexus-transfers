@@ -16,6 +16,7 @@ import logging
 import os
 import stat as _stat
 import sys
+import time
 import uuid
 from typing import Callable
 
@@ -36,6 +37,7 @@ from nexus_transfers._progress import (
 from nexus_transfers.check_files import (
     CheckFailedError,
     CheckReport,
+    _parse_age,
     _parse_mode,
     is_deletable_extra,
     scan_local_files,
@@ -55,8 +57,11 @@ _logger = logging.getLogger(__name__)
 
 
 async def _check_one_ssh(pool, local_root, remote_base, rel, report, *,
-                         algo, fix, fix_permissions, loop):
+                         algo, fix, fix_permissions, max_age, loop):
     """Compare one local reference file against its remote counterpart.
+
+    Returns True when the file was checked, False when it was skipped
+    because the remote copy is older than *max_age*.
 
     Parameters
     ----------
@@ -77,6 +82,10 @@ async def _check_one_ssh(pool, local_root, remote_base, rel, report, *,
     fix_permissions : int or None
         Explicit permission bits (e.g. ``0o600``) to enforce on every remote
         file. ``None`` only reports drift against the local reference.
+    max_age : float or None
+        Only check remote files modified within the last ``max_age``
+        seconds; older files are skipped. Missing remote files are never
+        skipped — they have no mtime and must be reported.
     loop :
         Running event loop (for executor calls).
     """
@@ -84,6 +93,16 @@ async def _check_one_ssh(pool, local_root, remote_base, rel, report, *,
     remote_file = f"{remote_base}/{rel}"
     sftp = pool.get_sftp()
     local_mode = _stat.S_IMODE(os.stat(local_file).st_mode)
+
+    if max_age is not None:
+        try:
+            attrs = await sftp.stat(remote_file)
+        except Exception:
+            attrs = None  # missing remote file: never skip, check it
+        if (attrs is not None and attrs.mtime is not None
+                and time.time() - attrs.mtime > max_age):
+            report.skipped += 1
+            return False
 
     remote_digest, local_digest = await asyncio.gather(
         remote_hash(pool.get_conn(), remote_file, algo=algo),
@@ -115,12 +134,12 @@ async def _check_one_ssh(pool, local_root, remote_base, rel, report, *,
         )
 
     if remote_digest is None and not content_fixed:
-        return  # nothing on the remote to compare permissions against
+        return True  # nothing on the remote to compare permissions against
 
     try:
         attrs = await sftp.stat(remote_file)
     except Exception:
-        return
+        return True
     remote_mode = _stat.S_IMODE(attrs.permissions)
     if fix_permissions is not None:
         # Explicit target mode: enforce it on the remote copy.
@@ -137,6 +156,7 @@ async def _check_one_ssh(pool, local_root, remote_base, rel, report, *,
             "mode", rel,
             f"remote {remote_mode:o} != local {local_mode:o}",
         )
+    return True
 
 
 async def _check_ssh(
@@ -156,6 +176,7 @@ async def _check_ssh(
     ssh_connections: int = 2,
     ssl_verify: bool = True,
     encryption_algs: list[str] | None = None,
+    max_age: float | None = None,
     on_monitor: Callable | None = None,
     quiet: bool = False,
 ) -> CheckReport:
@@ -196,6 +217,9 @@ async def _check_ssh(
         Verify TLS certificate for the relay connection.
     encryption_algs : list of str or None
         SSH cipher preference list.
+    max_age : float or None
+        Only check remote files modified within the last ``max_age``
+        seconds; older files are skipped. None (default) checks everything.
     on_monitor : callable, optional
         Async callback invoked with ``(message, status=..., **kwargs)`` for
         every monitor event.
@@ -310,13 +334,17 @@ async def _check_ssh(
                     rel = await queue.get()
                     if rel is None:
                         return
-                    await _check_one_ssh(
+                    checked = await _check_one_ssh(
                         pool, source, remote_base, rel, report,
                         algo=algo, fix=fix, fix_permissions=fix_permissions,
-                        loop=loop,
+                        max_age=max_age, loop=loop,
                     )
-                    report.checked += 1
-                    progress.update(check_task_id, completed=report.checked)
+                    if checked:
+                        report.checked += 1
+                    progress.update(
+                        check_task_id,
+                        completed=report.checked + report.skipped,
+                    )
                     await report.maybe_report()
 
             await asyncio.gather(
@@ -430,6 +458,13 @@ def main() -> None:
         help="Number of SSH connections to open (default: 2)",
     )
     parser.add_argument(
+        "--max-age", metavar="AGE", type=_parse_age,
+        default=cli_default("max_age", "check_files_ssh", default=None,
+                            type_fn=_parse_age),
+        help="Only check remote files modified within AGE — e.g. 30d, 1h, "
+             "45m, 4 (seconds); older files are skipped (default: check all)",
+    )
+    parser.add_argument(
         "--cipher", nargs="+", default=None, metavar="ALG",
         help="SSH cipher preference list (default: aes128-gcm@openssh.com first)",
     )
@@ -470,6 +505,7 @@ def main() -> None:
                 ssh_connections=args.ssh_connections,
                 ssl_verify=not args.no_verify,
                 encryption_algs=args.cipher,
+                max_age=args.max_age,
             )
         )
     except CheckFailedError as exc:
