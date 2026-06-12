@@ -155,6 +155,65 @@ def _env_bucket() -> str:
     return _split_bucket_spec(raw)[0]
 
 
+def parse_s3_url(raw: str) -> tuple[str, str | None]:
+    """Parse an S3 URL into ``(bucket, prefix_or_None)``.
+
+    Accepts ``s3://bucket``, ``s3://bucket/prefix`` and bare
+    ``bucket[/prefix]`` forms.
+
+    Parameters
+    ----------
+    raw
+        S3 URL or bucket spec.
+
+    Raises
+    ------
+    ValueError
+        If no bucket name can be extracted.
+    """
+    bucket, prefix = _split_bucket_spec(raw)
+    if not bucket:
+        raise ValueError(
+            f"Invalid S3 URL {raw!r}: expected s3://bucket[/prefix]"
+        )
+    return bucket, prefix
+
+
+def list_objects(bucket: str, prefix: str | None = None) -> list[tuple[str, int]]:
+    """List objects under *prefix* and return ``(key, size)`` pairs.
+
+    Parameters
+    ----------
+    bucket
+        Bucket name (plain name or ``s3://bucket`` URI).
+    prefix
+        Key prefix to list under; None lists the whole bucket.
+    """
+    store = get_store(bucket=bucket)
+    out: list[tuple[str, int]] = []
+    for batch in obs.list(store, prefix=prefix):
+        for meta in batch:
+            out.append((meta["path"], meta["size"]))
+    return out
+
+
+def head_object(bucket: str, key: str) -> int | None:
+    """Return the size of the object at *key*, or None if it does not exist.
+
+    Parameters
+    ----------
+    bucket
+        Bucket name (plain name or ``s3://bucket`` URI).
+    key
+        Object key to stat.
+    """
+    store = get_store(bucket=bucket)
+    try:
+        return obs.head(store, key)["size"]
+    except FileNotFoundError:
+        return None
+
+
 def make_key(local_path: str, s3_prefix: str | None = None) -> str:
     """Return the S3 key for ``local_path``.
 
@@ -184,6 +243,9 @@ def upload_file(
     local_path: str,
     progress_callback: Callable[[int], None] | None = None,
     s3_prefix: str | None = None,
+    *,
+    s3_key: str | None = None,
+    bucket: str | None = None,
 ) -> tuple[str, str, int, str]:
     """Upload a local file and return ``(bucket, s3_key, size, sha256_hex)``.
 
@@ -200,10 +262,17 @@ def upload_file(
         Optional callable invoked with the byte count of each chunk read.
     s3_prefix
         Optional prefix prepended to the S3 key.
+    s3_key
+        Explicit object key; when given, ``make_key``/``s3_prefix`` are
+        not used.
+    bucket
+        Bucket name (plain name or ``s3://bucket`` URI); when given it
+        overrides ``NEXUS_TRANSFER_S3_BUCKET``.
     """
-    store = get_store()
-    bucket = _env_bucket()
-    s3_key = make_key(local_path, s3_prefix=s3_prefix)
+    store = get_store(bucket=bucket)
+    bucket = _normalise_bucket(bucket) if bucket else _env_bucket()
+    if s3_key is None:
+        s3_key = make_key(local_path, s3_prefix=s3_prefix)
     size = os.path.getsize(local_path)
     hasher = None
     logger.debug("S3 upload: %s -> s3://%s/%s", local_path, bucket, s3_key)
@@ -350,9 +419,17 @@ def download_bytes(
         os.unlink(tmp_path)
 
 
-def delete(s3_key: str) -> None:
-    """Delete an object from the configured S3 bucket."""
-    store = get_store()
+def delete(s3_key: str, *, bucket: str | None = None) -> None:
+    """Delete an object from the configured S3 bucket.
+
+    Parameters
+    ----------
+    s3_key
+        Object key to delete.
+    bucket
+        Bucket name override; None uses ``NEXUS_TRANSFER_S3_BUCKET``.
+    """
+    store = get_store(bucket=bucket)
     try:
         obs.delete(store, s3_key)
         logger.debug("Deleted s3://%s", s3_key)

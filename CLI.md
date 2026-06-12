@@ -17,8 +17,11 @@ nexus-transfers monitor    — Run a monitoring client (runs forever)
 nexus-transfers server     — Run a peer awaiting messages (runs forever)
 nexus-transfers copy       — Copy a remote directory to local via relay (terminates)
 nexus-transfers copy-ssh   — Copy a local directory to a remote SSH target (terminates)
+nexus-transfers copy-to-s3   — Copy a local file or directory to an S3 bucket (terminates)
+nexus-transfers copy-from-s3 — Copy an S3 object or prefix to the local disk (terminates)
 nexus-transfers check-files     — Verify a local copy against a remote nexus reference (terminates)
 nexus-transfers check-files-ssh — Verify a remote SSH copy against the local reference (terminates)
+nexus-transfers check-files-s3  — Verify an S3 copy against the local reference (terminates)
 ```
 
 Legacy standalone commands are preserved for backward compatibility.

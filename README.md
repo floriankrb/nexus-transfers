@@ -173,6 +173,28 @@ nexus-transfers copy-ssh \
 Interrupted transfers resume automatically: a file is skipped when its remote
 size already matches the local size.
 
+## Direct S3 copy (no relay required)
+
+`nexus-transfers copy-to-s3` and `nexus-transfers copy-from-s3` copy a local
+file or directory straight to/from an S3 bucket using the
+`NEXUS_TRANSFER_S3_*` credentials (the `s3://bucket/...` argument overrides
+only the bucket name). No peer or relay is involved in the data path — as
+with `copy-ssh`, the relay is used only for optional progress monitoring.
+
+```bash
+nexus-transfers copy-to-s3 \
+    --source /data/dataset.zarr \
+    --target s3://my-bucket/datasets/dataset.zarr
+
+nexus-transfers copy-from-s3 \
+    --source s3://my-bucket/datasets/dataset.zarr \
+    --target /data/dataset.zarr
+```
+
+Interrupted transfers resume automatically (files whose size already matches
+are skipped). Empty directories are not represented on S3, so they are not
+recreated on download.
+
 ## Integrity check
 
 `nexus-transfers check-files` verifies a local copy against a remote nexus
@@ -183,9 +205,14 @@ permission drift, exit non-zero on unfixed discrepancies, and can repair with
 `--fix`, `--delete-extra` and `--fix-permissions MODE` (explicit octal mode,
 e.g. `600`). See [CHECK_FILES.md](CHECK_FILES.md).
 
+`nexus-transfers check-files-s3` verifies an S3 copy against the local
+reference: sizes are compared by default (one bucket listing, no data
+transfer); `--hash md5` streams every object back and compares digests.
+
 ```bash
 nexus-transfers check-files --from a /remote/path ./local-path --fix
 nexus-transfers check-files-ssh --source /data --target user@host:/remote --fix
+nexus-transfers check-files-s3 --source /data --target s3://bucket/prefix --fix
 ```
 
 ## Features
@@ -197,6 +224,7 @@ nexus-transfers check-files-ssh --source /data --target user@host:/remote --fix
 - **SHA-256 checksums** — computed incrementally during transfer and verified on completion
 - **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
 - **Direct SSH copy** — `nexus-transfers copy-ssh` uploads a local directory via SFTP without any relay involvement in the data path
+- **Direct S3 copy** — `nexus-transfers copy-to-s3` / `copy-from-s3` move a local file or directory to/from an S3 bucket without any peer or relay
 - **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
 - **Client discovery** — `list_clients` (or `clients` in the interactive prompt) returns all connected client names
 
@@ -284,3 +312,34 @@ single SSH connection cannot fully use (SSH multiplexes all channels over one
 TCP stream, so a single connection is limited by its flow-control window).  Two
 connections is a reasonable default; raise it if the link is fast and latency is
 high.
+
+### `nexus-transfers copy-to-s3` / `copy-from-s3`
+
+| Flag               | Default                | Description                                         |
+|--------------------|------------------------|-----------------------------------------------------|
+| `--source`         | (required)             | Local path (`copy-to-s3`) or `s3://bucket/key-or-prefix` (`copy-from-s3`) |
+| `--target`         | (required)             | `s3://bucket[/prefix]` (`copy-to-s3`) or local path (`copy-from-s3`) |
+| `--broker-url`     | (none — monitoring disabled) | Relay URL for monitoring only (optional)      |
+| `--name`           | auto-generated         | Client name on the relay                            |
+| `--site`           | (none)                 | Site label for monitor messages                     |
+| `--max-concurrent` | `8`                    | Number of parallel S3 transfers                     |
+| `--size`           | off                    | Show byte-based progress instead of file count      |
+| `--quiet`          | off                    | Suppress console output                             |
+| `--no-verify`      | off                    | Skip TLS verification for the relay connection      |
+| `--debug`          | off                    | Enable debug logging                                |
+
+### `nexus-transfers check-files-s3`
+
+| Flag               | Default                | Description                                         |
+|--------------------|------------------------|-----------------------------------------------------|
+| `--source`         | (required)             | Local reference directory                           |
+| `--target`         | (required)             | S3 copy to verify: `s3://bucket[/prefix]`           |
+| `--hash`           | (none — sizes only)    | Hash algorithm (e.g. `md5`); re-downloads every byte |
+| `--fix`            | off                    | Re-upload corrupt or missing objects                |
+| `--delete-extra`   | off                    | Delete objects not in the local reference           |
+| `--max-concurrent` | `8`                    | Maximum parallel file checks                        |
+| `--broker-url`     | (none — monitoring disabled) | Relay URL for monitoring only (optional)      |
+| `--name`           | auto-generated         | Client name on the relay                            |
+| `--site`           | (none)                 | Site label for monitor messages                     |
+| `--no-verify`      | off                    | Skip TLS verification for the relay connection      |
+| `--debug`          | off                    | Enable debug logging                                |
