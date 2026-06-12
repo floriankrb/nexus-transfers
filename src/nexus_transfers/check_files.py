@@ -22,7 +22,12 @@ import uuid
 
 from rich.console import Console
 
-from nexus_transfers.client import _DEFAULT_URL, Client, PeerNotFoundError
+from nexus_transfers.client import (
+    _DEFAULT_URL,
+    Client,
+    PeerNotFoundError,
+    RemoteError,
+)
 from nexus_transfers.client._io import _write_file
 from nexus_transfers.config import cli_default
 from nexus_transfers.dispatch import compute_file_hash
@@ -31,7 +36,7 @@ _logger = logging.getLogger(__name__)
 
 
 class CheckFailedError(Exception):
-    """Raised when discrepancies remain after a check (and were not fixed)."""
+    """Raised when the check cannot run (e.g. an incompatible reference)."""
 
 
 def _parse_mode(value) -> int:
@@ -450,6 +455,15 @@ class _DirectoryCheck:
                 return await self._client.send(
                     f"{self._target}.hash_file", remote_file, algo=self._algo,
                 )
+            except RemoteError as exc:
+                if "unknown function" in str(exc):
+                    raise CheckFailedError(
+                        f"the reference client '{self._target}' does not "
+                        "expose 'hash_file' — it runs an older "
+                        "nexus-transfers. Upgrade nexus-transfers on the "
+                        "reference side and restart its server process."
+                    ) from exc
+                raise
             except (PeerNotFoundError, ConnectionError,
                     asyncio.TimeoutError) as exc:
                 _logger.warning(
@@ -709,28 +723,32 @@ def main() -> None:
     tag = args.site or "check"
     name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
 
-    report = asyncio.run(
-        check_files(
-            name=name,
-            broker_url=args.broker_url,
-            remote_client=args.remote_client,
-            source=args.source,
-            target=args.target,
-            site=args.site,
-            max_concurrent=args.max_concurrent,
-            algo=args.algo,
-            fix=args.fix,
-            delete_extra=args.delete_extra,
-            fix_permissions=args.fix_permissions,
-            use_s3=not args.use_broker,
-            chunk_size=args.chunk_size,
-            reconnect_retries=-1,
-            peer_retries=args.peer_retries,
-            peer_delay=args.peer_delay,
-            call_timeout=args.call_timeout,
-            ssl_verify=not args.no_verify,
+    try:
+        report = asyncio.run(
+            check_files(
+                name=name,
+                broker_url=args.broker_url,
+                remote_client=args.remote_client,
+                source=args.source,
+                target=args.target,
+                site=args.site,
+                max_concurrent=args.max_concurrent,
+                algo=args.algo,
+                fix=args.fix,
+                delete_extra=args.delete_extra,
+                fix_permissions=args.fix_permissions,
+                use_s3=not args.use_broker,
+                chunk_size=args.chunk_size,
+                reconnect_retries=-1,
+                peer_retries=args.peer_retries,
+                peer_delay=args.peer_delay,
+                call_timeout=args.call_timeout,
+                ssl_verify=not args.no_verify,
+            )
         )
-    )
+    except CheckFailedError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
     if not report.ok:
         sys.exit(1)
 

@@ -5,7 +5,7 @@ import os
 import pytest
 
 from nexus_transfers import Client
-from nexus_transfers.check_files import check_files
+from nexus_transfers.check_files import CheckFailedError, check_files
 from nexus_transfers.client import RemoteError
 
 
@@ -155,6 +155,27 @@ async def test_check_permissions(broker, tmp_path):
     assert report.ok
     for f in ("a.txt", "sub/b.txt", "sub/deep/c.bin"):
         assert (os.stat(local / f).st_mode & 0o7777) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_check_old_server_without_hash_file(broker, tmp_path):
+    """A pre-hash_file server must produce a clear error, not a traceback."""
+    remote = _make_tree(tmp_path / "remote")
+    _clone_tree(remote, tmp_path / "local")
+
+    async with Client("ref", url=broker,
+                      allowed_paths=[str(remote)]) as ref:
+        del ref.dispatch["hash_file"]  # simulate an old server
+        with pytest.raises(CheckFailedError, match="older nexus-transfers"):
+            await check_files(
+                name="checker",
+                broker_url=broker,
+                remote_client="ref",
+                source=str(remote),
+                target=str(tmp_path / "local"),
+                quiet=True,
+                use_s3=False,
+            )
 
 
 @pytest.mark.asyncio
