@@ -44,9 +44,9 @@ _STREAM_CHUNK = 1024 * 1024
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # seconds; doubled each attempt
 
-_UMASK = os.umask(0)
-os.umask(_UMASK)
-_FILE_MODE = 0o666 & ~_UMASK
+# Downloaded files always get 644, regardless of the process umask, so
+# transferred datasets end up world-readable on every site.
+_FILE_MODE = 0o644
 
 
 def is_configured() -> bool:

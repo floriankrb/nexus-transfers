@@ -3,9 +3,9 @@
 import os
 import tempfile
 
-_UMASK = os.umask(0)
-os.umask(_UMASK)
-_FILE_MODE = 0o666 & ~_UMASK
+# Downloaded files always get 644, regardless of the process umask, so
+# transferred datasets end up world-readable on every site.
+_FILE_MODE = 0o644
 
 
 def _trunc(s, limit=200):

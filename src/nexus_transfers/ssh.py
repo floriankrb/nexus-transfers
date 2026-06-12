@@ -170,6 +170,9 @@ async def write_file(sftp, local_path: str, remote_path: str) -> None:
     await sftp.makedirs(remote_dir, exist_ok=True)
     try:
         await sftp.put(local_path, tmp_path)
+        # Uploaded files always get 644, regardless of the remote server's
+        # default, so transferred datasets end up world-readable.
+        await sftp.chmod(tmp_path, 0o644)
         await sftp.posix_rename(tmp_path, remote_path)
     except BaseException:
         try:
