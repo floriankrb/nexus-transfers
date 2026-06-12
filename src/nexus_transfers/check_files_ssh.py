@@ -446,8 +446,10 @@ def main() -> None:
 
     setup_cli_logging(debug=args.debug)
 
-    tag = args.site or "check-ssh"
-    name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
+    # e.g. "lumi-00085e89-check-ssh": same prefix as the copy client of
+    # that site, with a suffix telling the monitor what this client does.
+    prefix = f"{args.site}-" if args.site else ""
+    name = args.name or f"{prefix}{uuid.uuid4().hex[:8]}-check-ssh"
 
     try:
         report = asyncio.run(

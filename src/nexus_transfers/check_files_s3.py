@@ -403,8 +403,10 @@ def main() -> None:
 
     setup_cli_logging(debug=args.debug)
 
-    tag = args.site or "check-s3"
-    name = args.name or f"{tag}-{uuid.uuid4().hex[:8]}"
+    # e.g. "lumi-00085e89-check-s3": same prefix as the copy client of
+    # that site, with a suffix telling the monitor what this client does.
+    prefix = f"{args.site}-" if args.site else ""
+    name = args.name or f"{prefix}{uuid.uuid4().hex[:8]}-check-s3"
 
     try:
         report = asyncio.run(
