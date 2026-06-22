@@ -440,6 +440,39 @@ class Client:
                              target, self.peer_delay, attempt)
                 await asyncio.sleep(self.peer_delay)
 
+    async def kill(self, target, reason="", timeout=5.0):
+        """Tell *target* to log and ``exit(1)``, waiting for its acknowledgement.
+
+        The target sends a ``kill_ack`` frame back before exiting, so a
+        returned result confirms the peer received the kill and is going
+        down. Cleanup on the target is **not** performed (hard ``os._exit``).
+
+        Parameters
+        ----------
+        target:
+            Name of the remote client to kill.
+        reason:
+            Free-form reason string, logged by the target.
+        timeout:
+            Seconds to wait for the acknowledgement before giving up.
+
+        Raises
+        ------
+        asyncio.TimeoutError
+            If no acknowledgement arrives within ``timeout`` seconds.
+        """
+        msg_id = str(uuid.uuid4())[:8]
+        future = asyncio.get_running_loop().create_future()
+        self._pending[msg_id] = future
+        body = {"msg_id": msg_id, "reason": reason, "from": self.name}
+        frame = encode_frame(self.name, "kill", target, "J", json.dumps(body).encode())
+        _logger.warning("[kill] %s -> %s: %s", self.name, target, reason)
+        await self._ws.send(frame)
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self._pending.pop(msg_id, None)
+
     async def list_clients(self):
         """Return the list of currently connected client names."""
         future = asyncio.get_running_loop().create_future()
@@ -958,6 +991,33 @@ class Client:
                             future.set_exception(RemoteError(error))
                         else:
                             future.set_result(data)
+
+            case "kill":
+                data = json.loads(payload)
+                msg_id = data.get("msg_id")
+                reason = data.get("reason", "")
+                _logger.critical(
+                    "Kill received from %s: %s — acknowledging and exiting",
+                    source, reason,
+                )
+                ack = {"msg_id": msg_id, "result": "killed", "from": self.name}
+                try:
+                    await self._ws.send(
+                        encode_frame(self.name, "kill_ack", source, "J",
+                                     json.dumps(ack).encode())
+                    )
+                    # Give the ack a moment to reach the wire before the
+                    # hard exit drops the connection.
+                    await asyncio.sleep(0.1)
+                except Exception:
+                    _logger.warning("Failed to send kill_ack", exc_info=True)
+                os._exit(1)
+
+            case "kill_ack":
+                data = json.loads(payload)
+                future = self._pending.pop(data.get("msg_id"), None)
+                if future and not future.done():
+                    future.set_result(data.get("result"))
 
             case "list_clients":
                 data = json.loads(payload)
