@@ -13,6 +13,7 @@ from datetime import datetime
 
 from rich.console import Console
 
+from nexus_transfers._progress import setup_cli_logging
 from nexus_transfers.client import _DEFAULT_URL, Client
 from nexus_transfers.config import cli_default
 
@@ -115,11 +116,7 @@ def main():
     )
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     asyncio.run(
         _run_monitor(

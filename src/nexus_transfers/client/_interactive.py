@@ -5,6 +5,7 @@ import json
 import logging
 import uuid
 
+from nexus_transfers._progress import setup_cli_logging
 from nexus_transfers.config import cli_default
 from nexus_transfers.protocol import decode_frame, encode_frame
 
@@ -232,11 +233,7 @@ def main():
                         default=cli_default("debug", "client", default=False),
                         help="Enable debug logging")
     args = parser.parse_args()
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
     client_kwargs = dict(
         reconnect_retries=args.reconnect_retries,
         reconnect_delay=args.reconnect_delay,

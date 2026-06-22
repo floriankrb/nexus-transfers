@@ -35,6 +35,7 @@ from nexus_transfers._progress import (
     _BinarySpeedColumn,
     _CountOrBytesColumn,
     _fmt_binary,
+    setup_cli_logging,
 )
 from nexus_transfers.client import Client
 from nexus_transfers.config import cli_default
@@ -551,11 +552,7 @@ def _main(direction: str) -> None:
     )
     args = parser.parse_args()
 
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
 
     fn = copy_to_s3 if direction == "up" else copy_from_s3
     try:

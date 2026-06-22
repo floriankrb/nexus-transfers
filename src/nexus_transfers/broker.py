@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from websockets.asyncio.server import serve
 
+from nexus_transfers._progress import setup_cli_logging
 from nexus_transfers.protocol import decode_frame, encode_frame
 
 logger = logging.getLogger(__name__)
@@ -275,11 +276,7 @@ def main():
                         default=cli_default("debug", "broker", default=False),
                         help="Enable debug logging")
     args = parser.parse_args()
-    from rich.logging import RichHandler
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    setup_cli_logging(debug=args.debug)
     asyncio.run(run_broker(args.host, args.port))
 
 
