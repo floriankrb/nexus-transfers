@@ -17,6 +17,7 @@ def main():
         "check-files": "nexus_transfers.check_files:main",
         "check-files-ssh": "nexus_transfers.check_files_ssh:main",
         "check-files-s3": "nexus_transfers.check_files_s3:main",
+        "kill": "nexus_transfers.kill:main",
     }
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
@@ -33,6 +34,7 @@ def main():
         print("  check-files      Verify a local copy against a remote nexus reference")
         print("  check-files-ssh  Verify a remote SSH copy against the local reference")
         print("  check-files-s3   Verify an S3 copy against the local reference")
+        print("  kill       Kill connected clients by name/wildcard, or --all")
         sys.exit(0)
 
     command = sys.argv[1]
