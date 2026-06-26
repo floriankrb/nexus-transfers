@@ -32,7 +32,7 @@ from nexus_transfers._progress import (
     make_console,
     setup_cli_logging,
 )
-from nexus_transfers.client import Client
+from nexus_transfers.client import Client, NameTakenError
 from nexus_transfers.config import cli_default
 from nexus_transfers.ssh import SSHPool, stat_remote, write_file
 
@@ -410,6 +410,7 @@ async def _copy_to_ssh(
     processes: int = 1,
     stat_concurrency: int = 64,
     encryption_algs: list[str] | None = None,
+    steal: bool = False,
 ) -> None:
     """Copy the local *source* directory to the SSH *target*.
 
@@ -454,6 +455,12 @@ async def _copy_to_ssh(
     encryption_algs : list of str or None
         SSH cipher preference list; None uses the GCM-first default in
         :data:`nexus_transfers.ssh.DEFAULT_ENCRYPTION_ALGS`.
+    steal : bool
+        If True (and ``broker_url`` is set), displace any peer already
+        registered under ``name`` before connecting (soft then hard kill), and
+        abort if the name cannot be claimed.  With a task-keyed name this acts
+        as a per-task interlock so only one push for the same task runs at a
+        time.  Requires ``broker_url`` — the relay name is the lock.
     """
     user, host, remote_base = _parse_target(target)
     source = os.path.expanduser(source)
@@ -464,6 +471,16 @@ async def _copy_to_ssh(
     if not quiet:
         console.print(
             f"Copying [yellow]{source}[/yellow] -> [yellow]{dest_label}[/yellow]"
+        )
+
+    # When stealing, the relay name is the per-task lock: displace any
+    # incumbent worker before we register, and treat a lost name race as fatal
+    # (continuing unlocked would allow two pushes for the same task to run).
+    if steal and broker_url:
+        from nexus_transfers.claim import claim_name
+
+        await claim_name(
+            name, broker_url, ssl_verify=ssl_verify, kill_existing=True,
         )
 
     monitor_client: Client | None = None
@@ -478,6 +495,17 @@ async def _copy_to_ssh(
                 ssl_verify=ssl_verify, reconnect_retries=-1,
             )
             await monitor_client.connect()
+        except NameTakenError:
+            # The name is held. Under --steal this means we lost a race to
+            # another worker that grabbed it after our claim — abort rather
+            # than run a second concurrent push. Without --steal, fall back to
+            # monitor-less operation as before.
+            if steal:
+                raise
+            _logger.warning(
+                "Relay name %r already taken, continuing without monitor", name,
+            )
+            monitor_client = None
         except Exception as exc:
             _logger.warning(
                 "Relay unavailable (%s), continuing without monitor", exc,
@@ -747,6 +775,15 @@ def main() -> None:
         default=cli_default("no_verify", "copy_ssh", default=False),
         help="Skip TLS verification for the relay connection",
     )
+    parser.add_argument(
+        "--steal", action="store_true",
+        default=cli_default("steal", "copy_ssh", default=False),
+        help="If a client is already registered under --name, kill it (soft "
+             "kill first, then hard kill if it does not exit) and take over "
+             "the name, aborting if the name cannot be claimed. With a "
+             "task-keyed name this guarantees only one push for the same task "
+             "runs at a time. Requires --broker-url.",
+    )
     parser.add_argument("--debug", action="store_true",
                         default=cli_default("debug", "copy_ssh", default=False),
                         help="Enable debug logging")
@@ -773,6 +810,7 @@ def main() -> None:
             processes=args.processes,
             stat_concurrency=args.stat_concurrency,
             encryption_algs=args.cipher,
+            steal=args.steal,
         )
     )
 

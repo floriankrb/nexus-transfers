@@ -3,10 +3,12 @@
 Usage::
 
     nexus-monitor --broker-url wss://example.com/transfers
+    nexus-monitor --filter '*-<task-id>'   # only events from matching clients
 """
 
 import argparse
 import asyncio
+import fnmatch
 import logging
 import uuid
 from datetime import datetime
@@ -104,6 +106,15 @@ def main():
         help="Skip TLS certificate verification for wss:// connections",
     )
     parser.add_argument(
+        "--filter",
+        dest="source_filter",
+        default=cli_default("filter", "monitor", default=None),
+        metavar="PATTERN",
+        help="Only show events whose source client name matches this "
+             "shell-style wildcard (fnmatch, e.g. '*-<task-id>'). The "
+             "connected-client listing is filtered the same way.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output raw JSON events instead of formatted text",
@@ -123,6 +134,7 @@ def main():
             name=args.name,
             url=args.broker_url,
             raw_json=args.json,
+            source_filter=args.source_filter,
             reconnect_retries=args.reconnect_retries,
             reconnect_delay=args.reconnect_delay,
             ssl_verify=not args.no_verify,
@@ -130,12 +142,25 @@ def main():
     )
 
 
-async def _run_monitor(name, url, raw_json=False, **client_kwargs):
-    """Register as a monitoring service and print broadcast events."""
+async def _run_monitor(name, url, raw_json=False, source_filter=None,
+                       **client_kwargs):
+    """Register as a monitoring service and print broadcast events.
+
+    When ``source_filter`` is given, only events whose ``source`` (the client
+    name that emitted them) matches the shell-style wildcard are shown. The
+    broker stays unaware of any "task" concept — keying client names on a task
+    id (e.g. ``"<site>-transfer-<task-id>"``) lets ``--filter '*-<task-id>'``
+    follow a single task.
+    """
 
     console = Console()
 
     def _on_event(event: dict):
+        if source_filter is not None and not fnmatch.fnmatch(
+            event.get("source", ""), source_filter,
+        ):
+            return
+
         if raw_json:
             console.print_json(data=event)
             return
@@ -184,6 +209,8 @@ async def _run_monitor(name, url, raw_json=False, **client_kwargs):
             f"[cyan]{client.url}[/cyan]"
         )
         clients = await client.list_clients()
+        if source_filter is not None:
+            clients = [c for c in clients if fnmatch.fnmatch(c, source_filter)]
         if clients:
             console.print(
                 f"[bold]Connected clients ({len(clients)}):[/bold] "

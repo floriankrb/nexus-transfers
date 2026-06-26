@@ -147,6 +147,15 @@ def main():
         help="Show transfer progress in bytes and use size to verify resume skips",
     )
     parser.add_argument(
+        "--steal",
+        action="store_true",
+        default=cli_default("steal", "copy", default=False),
+        help="If a client is already registered under --name, kill it (soft "
+             "kill first, then hard kill if it does not exit) and take over "
+             "the name. With a task-keyed name this guarantees only one copy "
+             "for the same task runs at a time.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=cli_default("debug", "copy", default=False),
@@ -177,13 +186,15 @@ def main():
             peer_delay=args.peer_delay,
             call_timeout=args.call_timeout,
             ssl_verify=not args.no_verify,
+            steal=args.steal,
         )
     )
 
 
 async def copy(name, broker_url, remote_client, source, target, site=None,
                max_concurrent=4, chunk_size=65536, use_s3=True,
-               track_bytes=False, quiet=False, on_monitor=None, **client_kwargs):
+               track_bytes=False, quiet=False, on_monitor=None, steal=False,
+               **client_kwargs):
     """Connect to the relay and copy a remote directory.
 
     Parameters
@@ -215,11 +226,24 @@ async def copy(name, broker_url, remote_client, source, target, site=None,
         the same ``(message, status=..., **kwargs)`` signature.  Use this to
         forward progress events to an external system without reimplementing
         the copy loop.
+    steal:
+        If True, displace any peer already registered under ``name`` before
+        connecting (soft kill, then hard kill).  Use a name keyed on the unit
+        of work (e.g. the task id) so this acts as a per-task interlock that
+        guarantees only one copy runs at a time.
     **client_kwargs:
         Forwarded to :class:`~nexus_transfers.client.Client`.
     """
     target = os.path.expanduser(target)
     console = make_console()
+    if steal:
+        from nexus_transfers.claim import claim_name
+
+        await claim_name(
+            name, broker_url,
+            ssl_verify=client_kwargs.get("ssl_verify", True),
+            kill_existing=True,
+        )
     async with Client(name, broker_url, **client_kwargs) as client:
         if on_monitor is not None:
             _original_monitor = client.monitor

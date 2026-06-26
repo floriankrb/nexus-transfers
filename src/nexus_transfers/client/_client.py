@@ -1145,7 +1145,17 @@ class Client:
                 self._connected.clear()
                 try:
                     await self._reconnect()
-                except (NameTakenError, ConnectionError):
+                except NameTakenError:
+                    # Another client registered our name while we were
+                    # reconnecting — we have been displaced (e.g. a newer worker
+                    # for the same task ran with --steal). Stop any child workers
+                    # we were supervising (e.g. ssh upload shards) so they are not
+                    # left running orphaned alongside the new owner's, then exit.
+                    self._terminate_children(signal.SIGTERM)
+                    self._closed = True
+                    self._connected.set()
+                    raise
+                except ConnectionError:
                     self._closed = True
                     self._connected.set()
                     raise
@@ -1185,7 +1195,17 @@ class Client:
                 self._connected.clear()
                 try:
                     await self._reconnect()
-                except (NameTakenError, ConnectionError):
+                except NameTakenError:
+                    # Another client registered our name while we were
+                    # reconnecting — we have been displaced (e.g. a newer worker
+                    # for the same task ran with --steal). Stop any child workers
+                    # we were supervising (e.g. ssh upload shards) so they are not
+                    # left running orphaned alongside the new owner's, then exit.
+                    self._terminate_children(signal.SIGTERM)
+                    self._closed = True
+                    self._connected.set()
+                    raise
+                except ConnectionError:
                     self._closed = True
                     self._connected.set()
                     raise

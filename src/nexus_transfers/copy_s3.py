@@ -140,6 +140,7 @@ async def _copy_s3(
     ssl_verify: bool,
     on_monitor: Callable | None = None,
     quiet: bool = False,
+    steal: bool = False,
 ) -> None:
     """Copy between the local disk and S3 (shared body of both commands).
 
@@ -168,6 +169,11 @@ async def _copy_s3(
         every monitor event, mirroring :func:`nexus_transfers.copy.copy`.
     quiet : bool
         If True, suppress rich console output (monitor events still fire).
+    steal : bool
+        If True, kill any client already registered under ``name`` (soft kill,
+        then hard kill) and take over the name before connecting.  A no-op
+        without ``broker_url``.  Key ``name`` on the unit of work for a
+        per-task interlock.
     """
     console = Console(quiet=quiet)
     loop = asyncio.get_running_loop()
@@ -183,6 +189,13 @@ async def _copy_s3(
     if not quiet:
         console.print(
             f"Copying [yellow]{source}[/yellow] -> [yellow]{target}[/yellow]"
+        )
+
+    if steal:
+        from nexus_transfers.claim import claim_name
+
+        await claim_name(
+            name, broker_url, ssl_verify=ssl_verify, kill_existing=True,
         )
 
     monitor_client: Client | None = None
@@ -420,6 +433,7 @@ async def copy_to_s3(
     ssl_verify: bool = True,
     on_monitor: Callable | None = None,
     quiet: bool = False,
+    steal: bool = False,
 ) -> None:
     """Copy the local *source* file or directory to the S3 *target*.
 
@@ -445,11 +459,14 @@ async def copy_to_s3(
         Async callback invoked for every monitor event.
     quiet : bool
         If True, suppress rich console output (monitor events still fire).
+    steal : bool
+        If True, kill any client already registered under ``name`` and take
+        over the name before connecting (requires ``broker_url``).
     """
     await _copy_s3(
         "up", source, target, broker_url,
         name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}", site,
-        max_concurrent, track_bytes, ssl_verify, on_monitor, quiet,
+        max_concurrent, track_bytes, ssl_verify, on_monitor, quiet, steal,
     )
 
 
@@ -465,6 +482,7 @@ async def copy_from_s3(
     ssl_verify: bool = True,
     on_monitor: Callable | None = None,
     quiet: bool = False,
+    steal: bool = False,
 ) -> None:
     """Copy the S3 *source* object or prefix to the local *target*.
 
@@ -490,11 +508,14 @@ async def copy_from_s3(
         Async callback invoked for every monitor event.
     quiet : bool
         If True, suppress rich console output (monitor events still fire).
+    steal : bool
+        If True, kill any client already registered under ``name`` and take
+        over the name before connecting (requires ``broker_url``).
     """
     await _copy_s3(
         "down", source, target, broker_url,
         name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}", site,
-        max_concurrent, track_bytes, ssl_verify, on_monitor, quiet,
+        max_concurrent, track_bytes, ssl_verify, on_monitor, quiet, steal,
     )
 
 
@@ -546,6 +567,14 @@ def _main(direction: str) -> None:
         help="Skip TLS verification for the relay connection",
     )
     parser.add_argument(
+        "--steal", action="store_true",
+        default=cli_default("steal", "copy_s3", default=False),
+        help="If a client is already registered under --name, kill it (soft "
+             "kill first, then hard kill if it does not exit) and take over "
+             "the name. With a task-keyed name this guarantees only one S3 "
+             "copy for the same task runs at a time. Requires --broker-url.",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         default=cli_default("debug", "copy_s3", default=False),
         help="Enable debug logging",
@@ -567,6 +596,7 @@ def _main(direction: str) -> None:
                 track_bytes=args.size,
                 ssl_verify=not args.no_verify,
                 quiet=args.quiet,
+                steal=args.steal,
             )
         )
     except (FileNotFoundError, ValueError) as exc:
