@@ -44,9 +44,46 @@ _STREAM_CHUNK = 1024 * 1024
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # seconds; doubled each attempt
 
+# Sentinel returned by retried callables to signal "no value" (a missing object
+# or an exhausted listing) without that being mistaken for a transient failure
+# worth retrying.
+_NO_VALUE = object()
+
 # Downloaded files always get 644, regardless of the process umask, so
 # transferred datasets end up world-readable on every site.
 _FILE_MODE = 0o644
+
+
+def _with_retries(operation: Callable[[], object], what: str) -> object:
+    """Run *operation*, retrying transient failures with exponential backoff.
+
+    Mirrors the retry policy of :func:`upload_file`/:func:`download_file`: up to
+    ``_MAX_RETRIES`` attempts with a ``_RETRY_BASE_DELAY``-second base delay,
+    doubled each attempt. The last failure is re-raised. *operation* must be a
+    zero-argument callable performing a single attempt; it should map any
+    definitive non-transient outcome (e.g. "not found") onto a return value
+    rather than an exception so it is not retried.
+
+    Parameters
+    ----------
+    operation
+        Zero-argument callable performing one attempt.
+    what
+        Short human description of the operation for retry log messages.
+    """
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt == _MAX_RETRIES:
+                raise
+            delay = _RETRY_BASE_DELAY * 2 ** (attempt - 1)
+            logger.warning(
+                "S3 %s attempt %d/%d failed (%s), retrying in %.1fs …",
+                what, attempt, _MAX_RETRIES, exc, delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def is_configured() -> bool:
@@ -197,8 +234,54 @@ def list_objects(bucket: str, prefix: str | None = None) -> list[tuple[str, int]
     return out
 
 
+def list_object_batches(bucket: str, prefix: str | None = None):
+    """Return a lazy iterator of object-metadata batches under *prefix*.
+
+    Each yielded batch is a list of obstore metadata mappings (with ``path``
+    and ``size`` keys). Unlike :func:`list_objects`, this does not buffer the
+    whole listing, so callers can stream a very large bucket without holding
+    every key in memory at once.
+
+    Parameters
+    ----------
+    bucket
+        Bucket name (plain name or ``s3://bucket`` URI).
+    prefix
+        Key prefix to list under; None lists the whole bucket.
+    """
+    store = get_store(bucket=bucket)
+    return iter(obs.list(store, prefix=prefix))
+
+
+def next_batch(iterator) -> list | None:
+    """Pull the next listing page from *iterator*, retrying transient failures.
+
+    Returns the next batch (a list of obstore metadata mappings), or ``None``
+    once the listing is exhausted. A transient failure of the underlying page
+    request is retried with exponential backoff (obstore keeps its continuation
+    token, so the retried ``next`` resumes from the same page); a definitive
+    ``StopIteration`` ends the listing without retrying.
+
+    Parameters
+    ----------
+    iterator
+        A listing iterator as returned by :func:`list_object_batches`.
+    """
+    def _once() -> object:
+        try:
+            return next(iterator)
+        except StopIteration:
+            return _NO_VALUE
+
+    result = _with_retries(_once, "list page")
+    return None if result is _NO_VALUE else result
+
+
 def head_object(bucket: str, key: str) -> int | None:
     """Return the size of the object at *key*, or None if it does not exist.
+
+    Transient failures of the ``HEAD`` request are retried with exponential
+    backoff; a genuine "not found" is returned as ``None`` without retrying.
 
     Parameters
     ----------
@@ -208,10 +291,15 @@ def head_object(bucket: str, key: str) -> int | None:
         Object key to stat.
     """
     store = get_store(bucket=bucket)
-    try:
-        return obs.head(store, key)["size"]
-    except FileNotFoundError:
-        return None
+
+    def _once() -> object:
+        try:
+            return obs.head(store, key)["size"]
+        except FileNotFoundError:
+            return _NO_VALUE
+
+    result = _with_retries(_once, f"head {key}")
+    return None if result is _NO_VALUE else result
 
 
 def make_key(local_path: str, s3_prefix: str | None = None) -> str:

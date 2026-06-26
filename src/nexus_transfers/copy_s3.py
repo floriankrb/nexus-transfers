@@ -39,12 +39,21 @@ from nexus_transfers._progress import (
 )
 from nexus_transfers.client import Client
 from nexus_transfers.config import cli_default
-from nexus_transfers.copy_ssh import _list_local
 
 _logger = logging.getLogger(__name__)
 
 # Each item is (local_path, s3_key, size) regardless of direction.
 _Item = tuple[str, str, int]
+
+# Number of files per listing batch. S3 LISTs page 1000 keys at a time, so this
+# matches the natural object-store pagination unit; the local walk is chunked to
+# the same size for symmetry.
+_BATCH_SIZE = 1000
+
+# Default depth of the resume scan (target existence/size checks). These are
+# latency-bound HEAD/stat calls, so they run far deeper than the bandwidth-bound
+# transfers, mirroring ``copy_ssh``'s ``--stat-concurrency``.
+DEFAULT_STAT_CONCURRENCY = 64
 
 
 def _key_for(prefix: str | None, rel: str) -> str:
@@ -53,13 +62,34 @@ def _key_for(prefix: str | None, rel: str) -> str:
     return f"{prefix}/{rel}" if prefix else rel
 
 
-async def _upload_items(
-    source: str, target_url: str,
-) -> tuple[str, list[_Item], int]:
-    """Resolve the upload item list.
+def _scandir_split(dirpath: str, rel_prefix: str):
+    """Scan one directory, returning ``(subdirs, files)``.
 
-    Returns ``(bucket, items, total_size)`` where each item is
-    ``(local_path, s3_key, size)``.
+    ``subdirs`` is a list of ``(path, relative_path)`` for recursion; ``files``
+    is a list of ``(local_path, relative_path, size)``. Runs in an executor
+    thread so the (potentially NFS) ``stat`` calls do not block the event loop.
+    """
+    subdirs: list[tuple[str, str]] = []
+    files: list[tuple[str, str, int]] = []
+    for entry in os.scandir(dirpath):
+        rel = os.path.join(rel_prefix, entry.name) if rel_prefix else entry.name
+        if entry.is_dir(follow_symlinks=False):
+            subdirs.append((entry.path, rel))
+        else:
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = 0
+            files.append((entry.path, rel, size))
+    return subdirs, files
+
+
+async def _iter_upload_batches(source: str, target_url: str):
+    """Yield batches of ``(local_path, s3_key, size)`` items for an upload.
+
+    A single file yields a one-item batch; a directory is walked one level at a
+    time and accumulated into batches of up to :data:`_BATCH_SIZE` so transfers
+    can begin before the whole tree has been enumerated.
 
     Parameters
     ----------
@@ -68,31 +98,42 @@ async def _upload_items(
     target_url : str
         Destination ``s3://bucket[/prefix]`` URL.
     """
-    bucket, prefix = s3.parse_s3_url(target_url)
+    loop = asyncio.get_running_loop()
+    prefix = s3.parse_s3_url(target_url)[1]
     if os.path.isfile(source):
         size = os.path.getsize(source)
         if prefix is None or target_url.rstrip().endswith("/"):
             key = _key_for(prefix, os.path.basename(source))
         else:
             key = prefix
-        return bucket, [(source, key, size)], size
+        yield [(source, key, size)]
+        return
     if not os.path.isdir(source):
         raise FileNotFoundError(f"Source {source!r} does not exist")
-    walked, _count, total_size = await _list_local(source)
-    items = [
-        (local_path, _key_for(prefix, rel), size)
-        for local_path, rel, size in walked
-    ]
-    return bucket, items, total_size
+    stack = [(source, "")]
+    batch: list[_Item] = []
+    while stack:
+        dirpath, rel_prefix = stack.pop()
+        subdirs, files = await loop.run_in_executor(
+            None, _scandir_split, dirpath, rel_prefix,
+        )
+        stack.extend(subdirs)
+        for local_path, rel, size in files:
+            batch.append((local_path, _key_for(prefix, rel), size))
+            if len(batch) >= _BATCH_SIZE:
+                yield batch
+                batch = []
+    if batch:
+        yield batch
 
 
-async def _download_items(
-    source_url: str, target: str,
-) -> tuple[str, list[_Item], int]:
-    """Resolve the download item list.
+async def _iter_download_batches(source_url: str, target: str):
+    """Yield batches of ``(local_path, s3_key, size)`` items for a download.
 
-    Returns ``(bucket, items, total_size)`` where each item is
-    ``(local_path, s3_key, size)``.
+    An object stored at exactly the given key wins over a prefix and yields a
+    single-item batch; otherwise the prefix is listed page by page (S3 pages
+    1000 keys at a time) so downloads can begin before the whole listing is
+    retrieved. Raises ``FileNotFoundError`` if nothing matches.
 
     Parameters
     ----------
@@ -101,8 +142,8 @@ async def _download_items(
     target : str
         Local destination file or directory.
     """
-    bucket, prefix = s3.parse_s3_url(source_url)
     loop = asyncio.get_running_loop()
+    bucket, prefix = s3.parse_s3_url(source_url)
     if prefix is not None:
         # An object stored at exactly the given key wins over a prefix.
         size = await loop.run_in_executor(None, s3.head_object, bucket, prefix)
@@ -111,21 +152,29 @@ async def _download_items(
                 local = os.path.join(target, PurePosixPath(prefix).name)
             else:
                 local = target
-            return bucket, [(local, prefix, size)], size
-    listing = await loop.run_in_executor(None, s3.list_objects, bucket, prefix)
-    if not listing:
+            yield [(local, prefix, size)]
+            return
+    skip = len(prefix) + 1 if prefix else 0
+    found = False
+    pages = s3.list_object_batches(bucket, prefix)
+    while True:
+        page = await loop.run_in_executor(None, s3.next_batch, pages)
+        if page is None:
+            break
+        batch: list[_Item] = []
+        for meta in page:
+            key, size = meta["path"], meta["size"]
+            rel = key[skip:]
+            if not rel:
+                continue  # directory-marker object at the prefix itself
+            batch.append((os.path.join(target, *rel.split("/")), key, size))
+        if batch:
+            found = True
+            yield batch
+    if not found:
         raise FileNotFoundError(
             f"No object found at s3://{bucket}/{prefix or ''}"
         )
-    items: list[_Item] = []
-    skip = len(prefix) + 1 if prefix else 0
-    for key, size in listing:
-        rel = key[skip:]
-        if not rel:
-            continue  # directory-marker object at the prefix itself
-        items.append((os.path.join(target, *rel.split("/")), key, size))
-    total_size = sum(size for _, _, size in items)
-    return bucket, items, total_size
 
 
 async def _copy_s3(
@@ -141,6 +190,7 @@ async def _copy_s3(
     on_monitor: Callable | None = None,
     quiet: bool = False,
     steal: bool = False,
+    stat_concurrency: int = DEFAULT_STAT_CONCURRENCY,
 ) -> None:
     """Copy between the local disk and S3 (shared body of both commands).
 
@@ -174,6 +224,11 @@ async def _copy_s3(
         then hard kill) and take over the name before connecting.  A no-op
         without ``broker_url``.  Key ``name`` on the unit of work for a
         per-task interlock.
+    stat_concurrency : int
+        Depth of the resume scan: the maximum number of concurrent target
+        existence/size checks (S3 ``HEAD`` for uploads, local ``stat`` for
+        downloads). Runs far deeper than ``max_concurrent`` so latency-bound
+        checks overlap with the bandwidth-bound transfers.
     """
     console = Console(quiet=quiet)
     loop = asyncio.get_running_loop()
@@ -248,6 +303,8 @@ async def _copy_s3(
     done_count = 0
     skipped = 0
     skipped_bytes = 0
+    total_size = 0
+    total_items = 0
     lock = threading.Lock()
 
     unit = "bytes" if track_bytes else "files"
@@ -259,20 +316,12 @@ async def _copy_s3(
     )
     progress.start()
 
-    try:
-        if direction == "up":
-            bucket, items, total_size = await _upload_items(source, target)
-            remote = dict(await loop.run_in_executor(
-                None, s3.list_objects, bucket, s3.parse_s3_url(target)[1],
-            ))
-        else:
-            bucket, items, total_size = await _download_items(source, target)
-            remote = {}
-        progress.update(
-            copy_task_id, total=total_size if track_bytes else len(items),
-        )
-        progress.remove_task(walk_task_id)
+    # Resolve the bucket up front (a cheap URL parse, no network/listing) so the
+    # transfer workers can reference it before the streamed listing has produced
+    # any items.
+    bucket = s3.parse_s3_url(target if direction == "up" else source)[0]
 
+    try:
         def _advance(is_skip: bool, n_bytes: int, n_files: int) -> None:
             """Update shared counters and the rich bar (thread-safe)."""
             nonlocal total_bytes, done_count, skipped, skipped_bytes
@@ -333,17 +382,28 @@ async def _copy_s3(
                 )
 
         def _needs_transfer(item: _Item) -> bool:
-            """Size-based resume check (runs in an executor thread)."""
+            """Resume check against the target (runs in an executor thread).
+
+            For uploads this ``HEAD``s the destination object; for downloads it
+            ``stat``s the local file. A size mismatch (or a missing target)
+            means the file must be transferred.
+            """
             local_path, key, size = item
             if direction == "up":
-                return remote.get(key) != size
+                return s3.head_object(bucket, key) != size
             try:
                 return os.path.getsize(local_path) != size
             except OSError:
                 return True
 
         def _transfer(item: _Item) -> None:
-            """Move one file (runs in an executor thread)."""
+            """Move one file (runs in an executor thread).
+
+            Uploads put the object straight at its final key (S3 ``PUT`` is
+            atomic). Downloads stream to a ``<name>.tmp.<random>`` file next to
+            the destination and ``os.replace`` it into place, so a partial
+            download never appears as a complete file.
+            """
             local_path, key, size = item
             if direction == "up":
                 s3.upload_file(local_path, s3_key=key, bucket=bucket)
@@ -351,21 +411,65 @@ async def _copy_s3(
                 tmp = s3.download_file(key, target_path=local_path, bucket=bucket)
                 os.replace(tmp, local_path)
 
-        queue: asyncio.Queue = asyncio.Queue(maxsize=max_concurrent * 4)
+        # Two-stage pipeline, mirroring copy_ssh: the producer lists the source
+        # in batches of up to _BATCH_SIZE and feeds a small batch queue; a
+        # classifier explodes each batch and checks the target at
+        # stat_concurrency depth, handing the files that need transfer to a
+        # transfer queue drained by max_concurrent workers.
+        batch_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+        transfer_queue: asyncio.Queue = asyncio.Queue(maxsize=max_concurrent * 4)
+        stat_sem = asyncio.Semaphore(stat_concurrency)
 
         async def _producer() -> None:
-            for item in items:
-                if await loop.run_in_executor(None, _needs_transfer, item):
-                    await queue.put(item)
+            """List the source in batches and feed the batch queue."""
+            nonlocal total_size, total_items
+            try:
+                if direction == "up":
+                    batches = _iter_upload_batches(source, target)
                 else:
-                    _logger.debug("Skipping %s (size matches)", item[1])
-                    _advance(True, item[2], 1)
-            for _ in range(max_concurrent):
-                await queue.put(None)
+                    batches = _iter_download_batches(source, target)
+                async for batch in batches:
+                    for _, _, size in batch:
+                        total_items += 1
+                        total_size += size
+                    progress.update(walk_task_id, advance=len(batch))
+                    progress.update(
+                        copy_task_id,
+                        total=total_size if track_bytes else total_items,
+                    )
+                    await batch_queue.put(batch)
+            finally:
+                progress.remove_task(walk_task_id)
+                # Single sentinel for the single classifier; placed in the
+                # finally so the classifier always terminates, even if the
+                # listing raised (e.g. a missing source).
+                await batch_queue.put(None)
 
-        async def _worker() -> None:
+        async def _classify(item: _Item) -> None:
+            async with stat_sem:
+                needs = await loop.run_in_executor(None, _needs_transfer, item)
+            if needs:
+                await transfer_queue.put(item)
+            else:
+                _logger.debug("Skipping %s (size matches)", item[1])
+                _advance(True, item[2], 1)
+
+        async def _classifier() -> None:
+            """Check each listed file against the target, at stat depth."""
+            try:
+                while True:
+                    batch = await batch_queue.get()
+                    if batch is None:
+                        return
+                    await asyncio.gather(*[_classify(it) for it in batch])
+            finally:
+                # Stop the transfer workers once every batch is classified.
+                for _ in range(max_concurrent):
+                    await transfer_queue.put(None)
+
+        async def _transfer_worker() -> None:
             while True:
-                item = await queue.get()
+                item = await transfer_queue.get()
                 if item is None:
                     return
                 await loop.run_in_executor(None, _transfer, item)
@@ -373,10 +477,30 @@ async def _copy_s3(
 
         stop_event = asyncio.Event()
         ticker = asyncio.create_task(_ticker(stop_event))
+        # Immediate heartbeat entering the listing phase so the catalogue is
+        # refreshed before a (potentially long) listing, not only once the
+        # first 30s tick fires.
+        await _emit(
+            f"{name}: listing {label}",
+            status="progress",
+            progress=_payload()[1],
+        )
+        tasks = [
+            asyncio.create_task(_producer()),
+            asyncio.create_task(_classifier()),
+            *[asyncio.create_task(_transfer_worker())
+              for _ in range(max_concurrent)],
+        ]
         try:
-            await asyncio.gather(
-                _producer(), *[_worker() for _ in range(max_concurrent)],
-            )
+            await asyncio.gather(*tasks)
+        except BaseException:
+            # On any failure (e.g. a missing source surfaced by the producer)
+            # cancel the rest of the pipeline and let it settle before
+            # re-raising, so no task is left pending.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         finally:
             stop_event.set()
             await ticker
@@ -434,6 +558,7 @@ async def copy_to_s3(
     on_monitor: Callable | None = None,
     quiet: bool = False,
     steal: bool = False,
+    stat_concurrency: int = DEFAULT_STAT_CONCURRENCY,
 ) -> None:
     """Copy the local *source* file or directory to the S3 *target*.
 
@@ -462,11 +587,14 @@ async def copy_to_s3(
     steal : bool
         If True, kill any client already registered under ``name`` and take
         over the name before connecting (requires ``broker_url``).
+    stat_concurrency : int
+        Depth of the resume scan (concurrent destination ``HEAD`` checks).
     """
     await _copy_s3(
         "up", source, target, broker_url,
         name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}", site,
         max_concurrent, track_bytes, ssl_verify, on_monitor, quiet, steal,
+        stat_concurrency,
     )
 
 
@@ -483,6 +611,7 @@ async def copy_from_s3(
     on_monitor: Callable | None = None,
     quiet: bool = False,
     steal: bool = False,
+    stat_concurrency: int = DEFAULT_STAT_CONCURRENCY,
 ) -> None:
     """Copy the S3 *source* object or prefix to the local *target*.
 
@@ -511,11 +640,14 @@ async def copy_from_s3(
     steal : bool
         If True, kill any client already registered under ``name`` and take
         over the name before connecting (requires ``broker_url``).
+    stat_concurrency : int
+        Depth of the resume scan (concurrent local ``stat`` checks).
     """
     await _copy_s3(
         "down", source, target, broker_url,
         name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}", site,
         max_concurrent, track_bytes, ssl_verify, on_monitor, quiet, steal,
+        stat_concurrency,
     )
 
 
@@ -550,6 +682,17 @@ def _main(direction: str) -> None:
         "--max-concurrent", type=int,
         default=cli_default("max_concurrent", "copy_s3", default=8, type_fn=int),
         help="Number of parallel S3 transfers (default: 8)",
+    )
+    parser.add_argument(
+        "--stat-concurrency", type=int,
+        default=cli_default(
+            "stat_concurrency", "copy_s3",
+            default=DEFAULT_STAT_CONCURRENCY, type_fn=int,
+        ),
+        help=(
+            "Max concurrent target existence/size checks during the resume "
+            f"scan (default: {DEFAULT_STAT_CONCURRENCY})"
+        ),
     )
     parser.add_argument(
         "--size", action="store_true",
@@ -597,6 +740,7 @@ def _main(direction: str) -> None:
                 ssl_verify=not args.no_verify,
                 quiet=args.quiet,
                 steal=args.steal,
+                stat_concurrency=args.stat_concurrency,
             )
         )
     except (FileNotFoundError, ValueError) as exc:
