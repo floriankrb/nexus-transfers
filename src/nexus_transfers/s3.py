@@ -326,10 +326,11 @@ def download_file(
     s3_key
         Object key in the configured bucket.
     target_path
-        The temp file is created next to this path with a
-        ``.tmp.<random>`` suffix.  This ensures the rename to
-        ``target_path`` is always same-filesystem.  If None, the temp
-        file is created in the system temporary directory.
+        Required.  The temp file is created next to this path with a
+        ``.tmp.<random>`` suffix, ensuring the rename to ``target_path``
+        is always same-filesystem.  Must include a directory component;
+        ``ValueError`` is raised for ``None`` or a bare filename rather
+        than silently falling back to the system temp directory or cwd.
     bucket
         Bucket name (plain name or ``s3://bucket`` URI).
     expected_checksum
@@ -345,12 +346,19 @@ def download_file(
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             result = obs.get(store, s3_key)
-            if target_path is not None:
-                target_dir = os.path.dirname(target_path) or "."
-                prefix = os.path.basename(target_path) + ".tmp."
-            else:
-                target_dir = tempfile.gettempdir()
-                prefix = (s3_key.rsplit("/", 1)[-1] or "download") + ".tmp."
+            if target_path is None:
+                raise ValueError(
+                    "download_file requires an explicit target_path; refusing "
+                    "to fall back to a temporary directory."
+                )
+            target_dir = os.path.dirname(target_path)
+            if not target_dir:
+                raise ValueError(
+                    f"target_path {target_path!r} has no directory component; "
+                    "a dir-qualified (ideally absolute) path is required so the "
+                    "temp file lands next to its destination."
+                )
+            prefix = os.path.basename(target_path) + ".tmp."
             os.makedirs(target_dir, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=prefix)
             os.fchmod(fd, _FILE_MODE)

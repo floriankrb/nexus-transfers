@@ -18,6 +18,7 @@ An async WebSocket relay broker that routes binary-framed messages between named
 | `monitor.py` | CLI tool (`nexus-transfers monitor`) that registers as a monitoring service and prints broadcast events. |
 | `copy.py` | Recursive remote-to-local directory copy via relay/S3. |
 | `copy_ssh.py` | Local-to-remote SSH/SFTP directory copy. |
+| `kill.py` | CLI tool (`nexus-transfers kill`) — kill clients by name/wildcard or `--all`, soft (`-1`) / hard (`-9`). |
 | `dispatch.py` | Default dispatch table (`adder`, `echo`, `get_file`, `list_dir`). |
 
 ## Wire Protocol (v1)
@@ -56,6 +57,8 @@ The broker forwards frames with a non-empty target verbatim without decoding the
 | `chunk`            | client → client (relay)| Binary file chunk; R payload = `[2b hdr_len][json hdr][raw data]` |
 | `list_clients`     | client → broker        | Request connected client names                   |
 | `list_clients`     | broker → client        | Response; JSON payload has `clients` array       |
+| `kill`             | client → client (relay)| Ask the target to shut down. JSON payload has `msg_id`, `reason`, `from`, `signal` (`9` = hard `os._exit`, `1` = soft clean exit) |
+| `kill_ack`         | client → client (relay)| Acknowledgement sent back just before the target goes down |
 | `error`            | broker → client        | Error; JSON payload has `error` (and optionally `msg_id`) |
 
 ### Chunk payload format (encoding = R)
@@ -176,7 +179,32 @@ nexus-transfers copy --from <remote> <src> <local> [--chunk-size BYTES] [--max-c
 
 # Copy-ssh — local-to-remote SSH/SFTP copy (terminates)
 nexus-transfers copy-ssh --source /local/dir --target user@host:/remote/path
+
+# Kill — terminate connected clients by name or wildcard (terminates)
+nexus-transfers kill <name>        # exact name
+nexus-transfers kill 'copy-*'      # fnmatch wildcards (* and ?); quote to avoid shell glob
+nexus-transfers kill --all         # every client
+nexus-transfers kill -1 <name>     # soft only (clean exit 0)
+nexus-transfers kill -9 <name>     # hard only (immediate os._exit)
 ```
+
+### Killing clients
+
+`nexus-transfers kill` enumerates targets with `list_clients`, then sends a `kill`
+frame to each match concurrently. Self and `monitor-*` clients are skipped
+(`--include-monitors` to include the latter). Signals mirror `kill(1)`:
+
+- `-9` **hard**: target acks then `os._exit(1)` immediately, abandoning any in-flight transfer.
+- `-1` **soft**: target acks, emits a `warning` monitor event, closes its connection cleanly, and exits 0.
+- **default** (neither flag): send `-1`, wait `--grace` seconds (default 2.0), then `-9` any client still connected.
+
+Robustness: a single client process registers **one** name; its in-process
+concurrency (async tasks, `max_concurrent`) all dies with that process. For
+`copy-ssh --processes N`, each worker process becomes its own process-group
+leader (`os.setpgrp`) and registers its pgid on the coordinator's client via
+`Client.register_child_pgid`; the kill handler then `killpg`s each worker group
+(SIGKILL for hard, SIGTERM for soft) so workers and their `ssh` grandchildren
+are never orphaned.
 
 ### Interactive shell commands
 
@@ -195,6 +223,8 @@ nexus-transfers copy-ssh --source /local/dir --target user@host:/remote/path
 | `Client._emit_event(event)` | `client.py` | Send a structured monitoring event to the broker for broadcast |
 | `Client.monitor(message, ...)` | `client.py` | High-level event emitter (fire-and-forget) |
 | `Client.register_monitor(callback)` | `client.py` | Register as a monitoring service and set event callback |
+| `Client.kill(target, reason="", timeout=5.0, signal=9)` | `client.py` | Tell a peer to shut down (`signal=9` hard, `1` soft); awaits its `kill_ack` |
+| `Client.register_child_pgid(pgid)` / `unregister_child_pgid(pgid)` | `client.py` | Track child worker process groups to `killpg` when this client is killed |
 | `Client._dispatch_call(sender, msg_id, payload)` | `client.py` | Shared RPC dispatch used by both listener modes |
 | `Client._send_file_chunks(target, msg_id, ft)` | `client.py` | Send a `FileTransfer` as R-encoded chunk frames |
 | `Client._receive_chunk_payload(raw_payload)` | `client.py` | Buffer incoming chunk payloads; returns assembled bytes when complete |

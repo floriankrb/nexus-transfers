@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import ssl
 import traceback
 import uuid
@@ -133,6 +134,9 @@ class Client:
         self._early_frames: list[bytes] = []
         self._warned_plaintext_auth = False
         self._warned_no_tls_verify = False
+        # Process groups of child workers (e.g. copy-ssh shards) to take down
+        # when this client is killed, so a kill never orphans the workers.
+        self._child_pgids: set[int] = set()
 
     # ======================================================================
     # Connection lifecycle
@@ -440,12 +444,11 @@ class Client:
                              target, self.peer_delay, attempt)
                 await asyncio.sleep(self.peer_delay)
 
-    async def kill(self, target, reason="", timeout=5.0):
-        """Tell *target* to log and ``exit(1)``, waiting for its acknowledgement.
+    async def kill(self, target, reason="", timeout=5.0, signal=9):
+        """Tell *target* to shut down, waiting for its acknowledgement.
 
-        The target sends a ``kill_ack`` frame back before exiting, so a
-        returned result confirms the peer received the kill and is going
-        down. Cleanup on the target is **not** performed (hard ``os._exit``).
+        The target sends a ``kill_ack`` frame back before going down, so a
+        returned result confirms the peer received the kill.
 
         Parameters
         ----------
@@ -455,6 +458,11 @@ class Client:
             Free-form reason string, logged by the target.
         timeout:
             Seconds to wait for the acknowledgement before giving up.
+        signal:
+            ``9`` (default) for a hard kill — the target exits immediately
+            via ``os._exit`` with no cleanup.  ``1`` for a soft kill — the
+            target emits a disconnect event, closes its connection cleanly,
+            and exits with status 0.
 
         Raises
         ------
@@ -464,14 +472,43 @@ class Client:
         msg_id = str(uuid.uuid4())[:8]
         future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = future
-        body = {"msg_id": msg_id, "reason": reason, "from": self.name}
+        body = {"msg_id": msg_id, "reason": reason, "from": self.name,
+                "signal": signal}
         frame = encode_frame(self.name, "kill", target, "J", json.dumps(body).encode())
-        _logger.warning("[kill] %s -> %s: %s", self.name, target, reason)
+        _logger.warning("[kill -%d] %s -> %s: %s", signal, self.name, target, reason)
         await self._ws.send(frame)
         try:
             return await asyncio.wait_for(future, timeout)
         finally:
             self._pending.pop(msg_id, None)
+
+    def register_child_pgid(self, pgid: int) -> None:
+        """Register a child process group to terminate when this client is killed.
+
+        The child must be its own process-group leader (``os.setpgrp()``), so
+        *pgid* equals its PID.  Signalling the group reaps the worker and any
+        grandchildren it spawned (e.g. ``ssh`` processes).
+        """
+        self._child_pgids.add(pgid)
+
+    def unregister_child_pgid(self, pgid: int) -> None:
+        """Forget a child process group that has finished on its own."""
+        self._child_pgids.discard(pgid)
+
+    def _terminate_children(self, sig: int) -> None:
+        """Send *sig* to every registered child process group.
+
+        Best-effort: a group that has already exited (``ProcessLookupError``)
+        is ignored.
+        """
+        for pgid in list(self._child_pgids):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                _logger.debug("Failed to signal child group %d", pgid,
+                              exc_info=True)
 
     async def list_clients(self):
         """Return the list of currently connected client names."""
@@ -677,6 +714,15 @@ class Client:
         future = self._pending.pop(msg_id, None)
         if future and not future.done():
             future.set_result(data)
+        else:
+            # The future was already resolved or dropped (e.g. a reconnect
+            # cleared it while the download streamed in the background). No
+            # one will move the temp file into place, so delete it rather
+            # than leak a full-size orphan next to the destination.
+            try:
+                os.unlink(data)
+            except OSError:
+                pass
         asyncio.create_task(self._s3_cleanup_remote(source, s3_key))
 
     async def _s3_cleanup_remote(self, target: str, s3_key: str | None):
@@ -996,22 +1042,46 @@ class Client:
                 data = json.loads(payload)
                 msg_id = data.get("msg_id")
                 reason = data.get("reason", "")
+                # signal 9 = hard (immediate os._exit), 1 = soft (clean exit).
+                hard = data.get("signal", 9) != 1
                 _logger.critical(
-                    "Kill received from %s: %s — acknowledging and exiting",
-                    source, reason,
+                    "Kill (-%s) received from %s: %s — acknowledging and "
+                    "%s", 9 if hard else 1, source, reason,
+                    "exiting" if hard else "shutting down gracefully",
                 )
-                ack = {"msg_id": msg_id, "result": "killed", "from": self.name}
+                ack = {"msg_id": msg_id,
+                       "result": "killed" if hard else "terminating",
+                       "from": self.name}
                 try:
                     await self._ws.send(
                         encode_frame(self.name, "kill_ack", source, "J",
                                      json.dumps(ack).encode())
                     )
                     # Give the ack a moment to reach the wire before the
-                    # hard exit drops the connection.
+                    # connection drops.
                     await asyncio.sleep(0.1)
                 except Exception:
                     _logger.warning("Failed to send kill_ack", exc_info=True)
-                os._exit(1)
+                if hard:
+                    # SIGKILL the worker groups first so none are orphaned,
+                    # then drop dead ourselves.
+                    self._terminate_children(signal.SIGKILL)
+                    os._exit(1)
+                # Soft kill: ask the worker groups to terminate (SIGTERM lets
+                # them close SSH connections cleanly), emit a disconnect event,
+                # and close the socket before exiting with success.  Setting
+                # _closed first stops the listener from trying to reconnect.
+                self._closed = True
+                self._terminate_children(signal.SIGTERM)
+                try:
+                    await self.monitor(
+                        f"{self.name}: soft-killed ({reason}) — shutting down",
+                        status="warning",
+                    )
+                    await self._ws.close()
+                except Exception:
+                    _logger.debug("Soft-kill cleanup failed", exc_info=True)
+                os._exit(0)
 
             case "kill_ack":
                 data = json.loads(payload)

@@ -213,6 +213,14 @@ def _shard_main_sync(
     batched ``("delta", n_bytes, n_files, is_skip)`` tuples onto *progress_queue*
     and exactly one terminal ``("done",)`` or ``("error", repr)`` before exit.
     """
+    # Become a process-group leader so the coordinator can take this worker
+    # (and any ssh child it spawns) down as a group when killed, instead of
+    # orphaning it.  Harmless if the platform lacks setpgrp.
+    if hasattr(os, "setpgrp"):
+        try:
+            os.setpgrp()
+        except OSError:
+            pass
     rc = 0
     try:
         asyncio.run(
@@ -291,6 +299,8 @@ async def _run_multiprocess(
     max_concurrent: int,
     stat_concurrency: int,
     advance: Callable[[bool, int, int], None],
+    register: Callable[[int], None] | None = None,
+    unregister: Callable[[int], None] | None = None,
 ) -> None:
     """Shard *items* across *processes* worker processes and aggregate progress.
 
@@ -309,6 +319,11 @@ async def _run_multiprocess(
     advance : callable
         ``advance(is_skip, n_bytes, n_files)`` applied for each progress delta;
         must be thread-safe (it is called from a background drain thread).
+    register : callable, optional
+        ``register(pgid)`` called with each spawned worker's process-group id
+        so a kill of the coordinator can take the worker group down.
+    unregister : callable, optional
+        ``unregister(pgid)`` called once a worker has been reaped.
     """
     loop = asyncio.get_running_loop()
     ctx = mp.get_context("spawn")
@@ -327,6 +342,11 @@ async def _run_multiprocess(
         )
         p.start()
         procs.append(p)
+        # The worker makes itself a group leader (see _shard_main_sync), so
+        # its PID is also its process-group id; register it so a kill of the
+        # coordinator takes the whole worker group down.
+        if register is not None and p.pid is not None:
+            register(p.pid)
 
     n_procs = len(procs)
     errors: list[str] = []
@@ -359,6 +379,10 @@ async def _run_multiprocess(
         for p in procs:
             if p.is_alive():
                 await loop.run_in_executor(None, p.join)
+        if unregister is not None:
+            for p in procs:
+                if p.pid is not None:
+                    unregister(p.pid)
 
     if errors:
         raise RuntimeError(
@@ -593,6 +617,14 @@ async def _copy_to_ssh(
                 max_concurrent=max_concurrent,
                 stat_concurrency=stat_concurrency,
                 advance=_advance,
+                register=(
+                    monitor_client.register_child_pgid
+                    if monitor_client else None
+                ),
+                unregister=(
+                    monitor_client.unregister_child_pgid
+                    if monitor_client else None
+                ),
             )
     finally:
         stop_event.set()

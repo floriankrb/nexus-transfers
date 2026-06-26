@@ -591,7 +591,14 @@ class _DirectoryCheck:
 
     async def _download(self, remote_file, local_file):
         """Re-download one file from the reference (same path as nexus-copy)."""
-        os.makedirs(os.path.dirname(local_file) or ".", exist_ok=True)
+        local_dir = os.path.dirname(local_file)
+        if not local_dir:
+            raise ValueError(
+                f"local_file {local_file!r} has no directory component; a "
+                "dir-qualified (ideally absolute) path is required — refusing "
+                "to write to cwd."
+            )
+        os.makedirs(local_dir, exist_ok=True)
         while True:
             try:
                 if self._use_s3:

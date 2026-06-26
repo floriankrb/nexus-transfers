@@ -10,6 +10,15 @@ Usage::
 The pattern uses :mod:`fnmatch` semantics, so ``*`` matches any run of
 characters and ``?`` matches a single character.  Quote the pattern in the
 shell to stop it being expanded against local filenames.
+
+Signals mirror ``kill(1)``:
+
+* ``-9`` hard kill — the target exits immediately (``os._exit``), abandoning
+  any in-flight transfer.
+* ``-1`` soft kill — the target closes its connection cleanly and exits 0.
+
+With neither flag the default is graceful escalation: send ``-1``, wait
+``--grace`` seconds, then ``-9`` any client still connected.
 """
 
 import argparse
@@ -52,8 +61,31 @@ def _select_targets(clients, name, pattern, include_monitors):
     return targets
 
 
-async def _run(pattern, reason, include_monitors, dry_run):
-    """Connect, resolve targets, and kill them concurrently. Return exit code."""
+async def _send_kill(client, targets, reason, signal):
+    """Send a kill at *signal* to every target concurrently.
+
+    Returns the number of targets that did not acknowledge.
+    """
+    failures = 0
+
+    async def _one(t):
+        nonlocal failures
+        try:
+            res = await client.kill(t, reason=reason, timeout=5.0, signal=signal)
+            print(f"  ✓ {t}: {res}")
+        except asyncio.TimeoutError:
+            failures += 1
+            print(f"  ✗ {t}: no ack (timeout)")
+        except Exception as exc:
+            failures += 1
+            print(f"  ✗ {t}: {exc}")
+
+    await asyncio.gather(*(_one(t) for t in targets))
+    return failures
+
+
+async def _run(pattern, reason, include_monitors, dry_run, mode, grace):
+    """Connect, resolve targets, and kill them. Return the exit code."""
     name = f"killer-{uuid.uuid4().hex[:6]}"
     async with Client(name) as client:
         clients = await client.list_clients()
@@ -62,29 +94,34 @@ async def _run(pattern, reason, include_monitors, dry_run):
             print("No matching clients to kill.")
             return 0
 
-        print(f"Killing {len(targets)} client(s):")
+        verb = {"soft": "Soft-killing (-1)", "hard": "Hard-killing (-9)",
+                "default": "Killing"}[mode]
+        print(f"{verb} {len(targets)} client(s):")
         for t in targets:
             print(f"  {t}")
         if dry_run:
             print("(dry run — nothing sent)")
             return 0
 
-        failures = 0
+        if mode == "hard":
+            return 1 if await _send_kill(client, targets, reason, 9) else 0
+        if mode == "soft":
+            return 1 if await _send_kill(client, targets, reason, 1) else 0
 
-        async def _kill(t):
-            nonlocal failures
-            try:
-                res = await client.kill(t, reason=reason, timeout=5.0)
-                print(f"  ✓ {t}: {res}")
-            except asyncio.TimeoutError:
-                failures += 1
-                print(f"  ✗ {t}: no ack (timeout)")
-            except Exception as exc:
-                failures += 1
-                print(f"  ✗ {t}: {exc}")
-
-        await asyncio.gather(*(_kill(t) for t in targets))
-        return 1 if failures else 0
+        # Default: soft first, then hard on whoever is still connected.
+        await _send_kill(client, targets, reason, 1)
+        print(f"Waiting {grace:g}s for clients to shut down …")
+        await asyncio.sleep(grace)
+        still_here = _select_targets(
+            await client.list_clients(), name, pattern, include_monitors)
+        survivors = [t for t in targets if t in still_here]
+        if not survivors:
+            print("All targets shut down after soft kill.")
+            return 0
+        print(f"{len(survivors)} client(s) still alive — sending hard kill (-9):")
+        for t in survivors:
+            print(f"  {t}")
+        return 1 if await _send_kill(client, survivors, reason, 9) else 0
 
 
 def main() -> None:
@@ -102,6 +139,20 @@ def main() -> None:
     parser.add_argument(
         "--all", action="store_true",
         help="Kill every connected client (equivalent to the pattern '*').",
+    )
+    sig = parser.add_mutually_exclusive_group()
+    sig.add_argument(
+        "-1", "--soft", dest="soft", action="store_true",
+        help="Soft kill only: target closes cleanly and exits 0.",
+    )
+    sig.add_argument(
+        "-9", "--hard", dest="hard", action="store_true",
+        help="Hard kill only: target exits immediately, abandoning transfers.",
+    )
+    parser.add_argument(
+        "--grace", type=float, default=2.0, metavar="SECS",
+        help="Seconds to wait after the soft kill before escalating to a "
+             "hard kill (default: 2.0; only used when neither -1 nor -9 given).",
     )
     parser.add_argument(
         "--reason", default="killed via nexus-transfers kill",
@@ -131,10 +182,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    mode = "soft" if args.soft else "hard" if args.hard else "default"
     # --all matches everything; a pattern restricts the selection.
     pattern = None if args.all else args.pattern
     rc = asyncio.run(_run(
         pattern, args.reason, args.include_monitors, args.dry_run,
+        mode, args.grace,
     ))
     sys.exit(rc)
 

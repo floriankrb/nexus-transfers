@@ -28,7 +28,12 @@ async def test_s3_file_transfer(broker, tmp_path, shared_store):
         Client("sender", url=broker, allowed_paths=[str(tmp_path)]) as sender,
         Client("receiver", url=broker) as receiver,
     ):
-        result = await receiver.send("sender.get_file", str(src_file))
+        # The S3 download requires an explicit local target (it refuses to
+        # fall back to a temp dir); the temp file lands next to it.
+        result = await receiver.send(
+            "sender.get_file", str(src_file),
+            _local_target=str(tmp_path / "downloaded.bin"),
+        )
         # S3 path returns a temp file path; read and verify contents.
         assert isinstance(result, str)
         with open(result, "rb") as fh:

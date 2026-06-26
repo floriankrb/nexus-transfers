@@ -16,6 +16,11 @@ def _trunc(s, limit=200):
 def _write_file(path, data):
     """Write *data* to *path* atomically via a temp file + rename."""
     dirpath = os.path.dirname(path)
+    if not dirpath:
+        raise ValueError(
+            f"path {path!r} has no directory component; a dir-qualified "
+            "(ideally absolute) path is required — refusing to write to cwd."
+        )
     fd, tmp = tempfile.mkstemp(dir=dirpath)
     os.fchmod(fd, _FILE_MODE)
     try:
