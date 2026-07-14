@@ -104,3 +104,30 @@ class TestMakeListDir:
         list_dir = make_list_dir([str(tmp_path)])
         with pytest.raises(NotADirectoryError):
             list_dir(str(f))
+
+    def test_pages_come_from_one_snapshot(self, tmp_path):
+        for name in ("b", "c", "d", "e"):
+            (tmp_path / name).write_text("x")
+        list_dir = make_list_dir([str(tmp_path)])
+        page1 = list_dir(str(tmp_path), offset=0, limit=2)
+        # A file sorting first would shift every offset if pages rescanned.
+        (tmp_path / "a").write_text("x")
+        page2 = list_dir(str(tmp_path), offset=2, limit=2)
+        names = [e["name"] for e in page1 + page2]
+        assert names == ["b", "c", "d", "e"]
+        # A new walk (offset 0) takes a fresh snapshot and sees the new file.
+        assert [e["name"] for e in list_dir(str(tmp_path), offset=0, limit=2)] == ["a", "b"]
+
+    def test_vanished_entry_does_not_shorten_page(self, tmp_path):
+        for name in ("a", "b", "c", "d"):
+            (tmp_path / name).write_text("x")
+        list_dir = make_list_dir([str(tmp_path)])
+        list_dir(str(tmp_path), offset=0, limit=2)
+        (tmp_path / "c").unlink()
+        # A short page would end the caller's pagination loop early, so the
+        # vanished entry must still be reported (as a file, without size).
+        page = list_dir(str(tmp_path), offset=2, limit=2, include_size=True)
+        assert [e["name"] for e in page] == ["c", "d"]
+        vanished = page[0]
+        assert vanished["type"] == "file"
+        assert "size" not in vanished

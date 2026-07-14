@@ -5,8 +5,15 @@ import logging
 import math
 import os
 import stat as _stat
+import threading
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of directory snapshots kept by ``make_list_dir``'s
+# pagination cache (LRU). Each snapshot is a sorted list of entry names;
+# even a huge zarr chunk directory costs only tens of MB.
+_LIST_DIR_CACHE_SIZE = 16
 
 
 def adder(value):
@@ -194,11 +201,24 @@ def make_hash_file(allowed_paths):
 def make_list_dir(allowed_paths):
     """Create a ``list_dir`` function bound to allowed paths.
 
+    The sorted name listing is cached per directory so that paginating
+    through a huge directory does not rescan and re-sort all of it for
+    every page (quadratic in the directory size). Every walk starts at
+    ``offset == 0``, which always takes a fresh snapshot — so consecutive
+    walks see current data, while the pages of one walk come from a single
+    consistent snapshot (entries can no longer be skipped or duplicated
+    when the directory changes mid-walk).
+
     Parameters
     ----------
     allowed_paths
         List of allowed base directories.
     """
+    # resolved path -> sorted list of entry names, LRU-evicted. list_dir
+    # runs in executor threads, so guard the cache with a lock.
+    cache: OrderedDict = OrderedDict()
+    lock = threading.Lock()
+
     def list_dir(path=".", include_size=False, offset=0, limit=1000,
                  progress_callback=None):
         """List the contents of a directory with pagination.
@@ -210,7 +230,8 @@ def make_list_dir(allowed_paths):
         include_size
             Whether to include file sizes in the result.
         offset
-            Index of the first entry to return.
+            Index of the first entry to return. ``0`` takes a fresh
+            directory snapshot; later pages are served from the snapshot.
         limit
             Maximum number of entries to return.
         progress_callback
@@ -223,30 +244,56 @@ def make_list_dir(allowed_paths):
         if not os.path.isdir(resolved):
             raise NotADirectoryError(f"not a directory: {path}")
 
-        # Sort names first (cheap), then only build info dicts for the
-        # requested page and only stat() files when include_size is set.
-        with os.scandir(resolved) as it:
-            sorted_entries = sorted(it, key=lambda e: e.name)
-
-        end = offset + limit
-        page = []
-        for i, entry in enumerate(sorted_entries):
+        names = None
+        if offset > 0:
+            with lock:
+                names = cache.get(resolved)
+                if names is not None:
+                    cache.move_to_end(resolved)
+        if names is None:
+            # Names only: the scan stays a pure directory read (no per-entry
+            # stat), so snapshotting costs the same as one page did before.
+            names = []
+            with os.scandir(resolved) as it:
+                for entry in it:
+                    names.append(entry.name)
+                    # Throttled: a per-entry callback from this executor
+                    # thread would hammer the GIL and starve the event loop.
+                    if progress_callback is not None and len(names) % 1000 == 0:
+                        progress_callback(len(names))
+            names.sort()
             if progress_callback is not None:
-                progress_callback(i + 1)
-            if i < offset:
+                progress_callback(len(names))
+            with lock:
+                cache[resolved] = names
+                cache.move_to_end(resolved)
+                while len(cache) > _LIST_DIR_CACHE_SIZE:
+                    cache.popitem(last=False)
+
+        page = []
+        for name in names[offset:offset + limit]:
+            # One lstat per page entry replaces the DirEntry type/size
+            # lookups (a snapshot cannot keep DirEntry objects). Symlink
+            # semantics are unchanged: a symlink is always type "file".
+            try:
+                st = os.lstat(os.path.join(resolved, name))
+            except OSError:
+                # Vanished since the snapshot. Do not drop it: a short page
+                # would end the caller's pagination early. Report it as a
+                # file without size; downstream treats it like any missing
+                # or changed file.
+                page.append({"name": name, "type": "file"})
                 continue
-            if i >= end:
-                break
             info = {
-                "name": entry.name,
-                "type": "dir" if entry.is_dir(follow_symlinks=False) else "file",
+                "name": name,
+                "type": "dir" if _stat.S_ISDIR(st.st_mode) else "file",
             }
-            if include_size and entry.is_file(follow_symlinks=False):
-                info["size"] = entry.stat(follow_symlinks=False).st_size
+            if include_size and _stat.S_ISREG(st.st_mode):
+                info["size"] = st.st_size
             page.append(info)
 
         logger.debug("Returning %d/%d entries (offset=%d) in %s",
-                     len(page), len(sorted_entries), offset, resolved)
+                     len(page), len(names), offset, resolved)
         return page
 
     return list_dir
