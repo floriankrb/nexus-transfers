@@ -1,7 +1,7 @@
 """Atomic file I/O helpers."""
 
 import os
-import tempfile
+import uuid
 
 # Downloaded files always get 644, regardless of the process umask, so
 # transferred datasets end up world-readable on every site.
@@ -21,7 +21,11 @@ def _write_file(path, data):
             f"path {path!r} has no directory component; a dir-qualified "
             "(ideally absolute) path is required — refusing to write to cwd."
         )
-    fd, tmp = tempfile.mkstemp(dir=dirpath)
+    # "<name>.<8 hex>.tmp" matches check_files' leftover pattern (same
+    # naming as ssh.write_file), so debris from a crash between write and
+    # rename is deletable by --delete-extra.
+    tmp = os.path.join(dirpath, f"{os.path.basename(path)}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
     os.fchmod(fd, _FILE_MODE)
     try:
         with os.fdopen(fd, "wb") as fh:

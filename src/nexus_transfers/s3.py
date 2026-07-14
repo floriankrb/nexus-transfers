@@ -20,8 +20,8 @@ Configuration is read from the environment:
 import hashlib
 import logging
 import os
-import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -415,7 +415,7 @@ def download_file(
         Object key in the configured bucket.
     target_path
         Required.  The temp file is created next to this path with a
-        ``.tmp.<random>`` suffix, ensuring the rename to ``target_path``
+        ``.<hex>.tmp`` suffix, ensuring the rename to ``target_path``
         is always same-filesystem.  Must include a directory component;
         ``ValueError`` is raised for ``None`` or a bare filename rather
         than silently falling back to the system temp directory or cwd.
@@ -446,9 +446,16 @@ def download_file(
                     "a dir-qualified (ideally absolute) path is required so the "
                     "temp file lands next to its destination."
                 )
-            prefix = os.path.basename(target_path) + ".tmp."
             os.makedirs(target_dir, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=prefix)
+            # "<name>.<8 hex>.tmp" matches check_files' leftover pattern
+            # (same naming as ssh.write_file), so debris from a crashed
+            # download is deletable by --delete-extra; mkstemp's random
+            # suffix is not hex and would be kept forever.
+            tmp_path = os.path.join(
+                target_dir,
+                f"{os.path.basename(target_path)}.{uuid.uuid4().hex[:8]}.tmp",
+            )
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
             os.fchmod(fd, _FILE_MODE)
             try:
                 hasher = hashlib.sha256()

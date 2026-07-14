@@ -134,18 +134,21 @@ async def test_check_extra_files(broker, tmp_path):
 
 def test_is_failed_transfer_leftover():
     ref = {"a.txt", "sub/b.txt", "data/0.1.2"}
-    # write_file tmp name, with and without the .tmp suffix
+    # staging tmp name used by every transfer path: <base>.<8 hex>.tmp
     assert is_failed_transfer_leftover("a.txt.3fa9c2d1.tmp", ref)
-    assert is_failed_transfer_leftover("sub/b.txt.deadbe", ref)
-    assert is_failed_transfer_leftover("data/0.1.2.abc123", ref)
+    assert is_failed_transfer_leftover("sub/b.txt.deadbeef.tmp", ref)
+    assert is_failed_transfer_leftover("data/0.1.2.abc12345.tmp", ref)
     # base not on the reference
     assert not is_failed_transfer_leftover("stray.txt.3fa9c2d1.tmp", ref)
-    # no hex suffix
+    # no staging suffix
     assert not is_failed_transfer_leftover("stray.txt", ref)
     assert not is_failed_transfer_leftover("a.txt.backup", ref)
-    # hex too short / not hex
-    assert not is_failed_transfer_leftover("a.txt.3fa9", ref)
-    assert not is_failed_transfer_leftover("a.txt.zzzzzz", ref)
+    # missing .tmp: nothing stages without it — never delete
+    assert not is_failed_transfer_leftover("a.txt.3fa9c2d1", ref)
+    # hex part too short / too long / not hex
+    assert not is_failed_transfer_leftover("a.txt.3fa9.tmp", ref)
+    assert not is_failed_transfer_leftover("a.txt.3fa9c2d1ab.tmp", ref)
+    assert not is_failed_transfer_leftover("a.txt.zzzzzzzz.tmp", ref)
 
 
 def test_is_deletable_extra():

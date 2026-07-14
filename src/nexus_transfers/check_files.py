@@ -42,18 +42,20 @@ class CheckFailedError(Exception):
     """Raised when the check cannot run (e.g. an incompatible reference)."""
 
 
-# Leftover of an interrupted transfer: "<base>.<hex>" or "<base>.<hex>.tmp"
-# (ssh.write_file uploads to "<name>.<8 hex>.tmp" before its atomic rename).
-_LEFTOVER_RE = re.compile(r"^(?P<base>.+)\.[0-9a-f]{6,12}(\.tmp)?$")
+# Leftover of an interrupted transfer: "<base>.<8 hex>.tmp"
+# (ssh.write_file, s3.download_file and client._io._write_file all stage to
+# "<name>.<8 hex>.tmp" before their atomic rename).
+_LEFTOVER_RE = re.compile(r"^(?P<base>.+)\.[0-9a-f]{8}\.tmp$")
 
 
 def is_failed_transfer_leftover(rel: str, reference_files) -> bool:
     """True when *rel* looks like debris from an interrupted transfer.
 
     Deliberately strict — this is the only thing ``--delete-extra`` is
-    allowed to remove: the name must end in ``.<hex>`` (optionally
-    ``.tmp``) **and** the corresponding base file must exist on the
-    reference. Anything else is reported but never deleted.
+    allowed to remove: the name must end in ``.<8 hex>.tmp`` (the staging
+    suffix used by every transfer path) **and** the corresponding base
+    file must exist on the reference. Anything else is reported but never
+    deleted.
 
     Parameters
     ----------
@@ -680,7 +682,7 @@ async def check_files(name, broker_url, remote_client, source, target,
         If True, re-download corrupt or missing files.
     delete_extra:
         If True, delete extra local files that are failed-transfer
-        leftovers (``<base>.<hex>[.tmp]`` with ``<base>`` on the
+        leftovers (``<base>.<hex>.tmp`` with ``<base>`` on the
         reference); other extras are only reported, never deleted.
     fix_permissions:
         Explicit permission bits (e.g. ``0o600``) to enforce on every local
@@ -785,7 +787,7 @@ def main() -> None:
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files", default=False),
         help="Delete whitelisted extra local files: failed-transfer "
-             "leftovers (<base>.<hex>[.tmp] with <base> on the reference) "
+             "leftovers (<base>.<hex>.tmp with <base> on the reference) "
              "and files under _build/; other extras are only reported, "
              "never deleted",
     )

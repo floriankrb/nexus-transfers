@@ -423,7 +423,7 @@ def main() -> None:
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files_ssh", default=False),
         help="Delete whitelisted extra remote files: failed-transfer "
-             "leftovers (<base>.<hex>[.tmp] with <base> in the local "
+             "leftovers (<base>.<hex>.tmp with <base> in the local "
              "reference) and files under _build/; other extras are only "
              "reported, never deleted",
     )

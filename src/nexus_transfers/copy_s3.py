@@ -400,7 +400,7 @@ async def _copy_s3(
             """Move one file (runs in an executor thread).
 
             Uploads put the object straight at its final key (S3 ``PUT`` is
-            atomic). Downloads stream to a ``<name>.tmp.<random>`` file next to
+            atomic). Downloads stream to a ``<name>.<hex>.tmp`` file next to
             the destination and ``os.replace`` it into place, so a partial
             download never appears as a complete file.
             """

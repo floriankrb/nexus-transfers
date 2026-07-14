@@ -380,7 +380,7 @@ def main() -> None:
         "--delete-extra", action="store_true",
         default=cli_default("delete_extra", "check_files_s3", default=False),
         help="Delete whitelisted extra objects: failed-transfer leftovers "
-             "(<base>.<hex>[.tmp] with <base> in the local reference) and "
+             "(<base>.<hex>.tmp with <base> in the local reference) and "
              "objects under _build/; other extras are only reported, "
              "never deleted",
     )
