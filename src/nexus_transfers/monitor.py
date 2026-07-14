@@ -30,11 +30,24 @@ _TYPE_STYLES = {
 }
 
 
-def _format_progress(progress: dict | None) -> str:
+def _strip_source_prefix(text: str, source: str) -> str:
+    """Drop a leading ``"<source>: "`` from *text*.
+
+    Emitters conventionally prefix their own client name to messages and
+    progress labels; the monitor prints the event source in its own column,
+    so the prefix would appear twice on every line.
+    """
+    prefix = f"{source}: "
+    if source and text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+
+def _format_progress(progress: dict | None, source: str = "") -> str:
     """Format a progress dict into a compact string."""
     if not progress:
         return ""
-    label = progress.get("label", "")
+    label = _strip_source_prefix(progress.get("label", ""), source)
     value = progress.get("value")
     maximum = progress.get("maximum")
     unit = progress.get("unit", "")
@@ -51,9 +64,12 @@ def _format_progress(progress: dict | None) -> str:
             if unit:
                 parts.append(unit)
     elif value is not None:
-        parts.append(str(value))
-        if unit:
-            parts.append(unit)
+        if unit == "byte":
+            parts.append(_fmt_bytes(value))
+        else:
+            parts.append(str(value))
+            if unit:
+                parts.append(unit)
     if rate is not None:
         if unit == "byte":
             parts.append(f"@ {_fmt_bytes(rate)}/s")
@@ -168,7 +184,7 @@ async def _run_monitor(name, url, raw_json=False, source_filter=None,
         event_type = event.get("type", "info")
         date = event.get("date", "")
         source = event.get("source", "")
-        message = event.get("message", "")
+        message = _strip_source_prefix(event.get("message", ""), source)
         progress = event.get("progress")
         task = event.get("task")
 
@@ -191,7 +207,7 @@ async def _run_monitor(name, url, raw_json=False, source_filter=None,
         parts.append(message)
 
         if progress:
-            prog_str = _format_progress(progress)
+            prog_str = _format_progress(progress, source)
             if prog_str:
                 parts.append(f"[dim]({prog_str})[/dim]")
 
