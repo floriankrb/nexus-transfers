@@ -1012,6 +1012,19 @@ class Client:
                         if future and not future.done():
                             future.set_result(b"")
                 elif data.get("s3_transfer"):
+                    # Only act on replies to our own pending requests. An
+                    # unknown msg_id means the reply belongs to a previous
+                    # holder of our name (e.g. a worker we displaced with
+                    # --steal): downloading it would be wasted work, and the
+                    # cleanup at the end of _handle_s3_download would delete
+                    # a staged object that is not ours to consume.
+                    if msg_id not in self._pending:
+                        _logger.warning(
+                            "Ignoring S3 reply for unknown msg_id %r from %s "
+                            "(displaced predecessor's transfer?)",
+                            msg_id, source,
+                        )
+                        return
                     task = asyncio.create_task(
                         self._handle_s3_download(msg_id, source,
                                                  data.get("result", {}))
