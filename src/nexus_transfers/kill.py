@@ -19,6 +19,14 @@ Signals mirror ``kill(1)``:
 
 With neither flag the default is graceful escalation: send ``-1``, wait
 ``--grace`` seconds, then ``-9`` any client still connected.
+
+A one-shot kill only reaches clients registered on the broker at that
+instant: a worker that is mid-reconnect (e.g. a phantom from a dead SLURM
+job in its retry loop) is invisible and survives. ``--sweep SECS`` repeats
+the list-and-kill pass every ``--every`` seconds for the whole window, so
+such a worker is caught the moment it re-registers::
+
+    nexus-transfers kill '*-<task-id>' --sweep 30 --every 2
 """
 
 import argparse
@@ -84,44 +92,78 @@ async def _send_kill(client, targets, reason, signal):
     return failures
 
 
-async def _run(pattern, reason, include_monitors, dry_run, mode, grace):
-    """Connect, resolve targets, and kill them. Return the exit code."""
+async def _kill_pass(client, name, targets, reason, mode, grace,
+                     pattern, include_monitors):
+    """Kill *targets* according to *mode*; return the number of failures."""
+    if mode == "hard":
+        return await _send_kill(client, targets, reason, 9)
+    if mode == "soft":
+        return await _send_kill(client, targets, reason, 1)
+
+    # Default: soft first, then hard on whoever is still connected.
+    await _send_kill(client, targets, reason, 1)
+    print(f"Waiting {grace:g}s for clients to shut down …")
+    await asyncio.sleep(grace)
+    still_here = _select_targets(
+        await client.list_clients(), name, pattern, include_monitors)
+    survivors = [t for t in targets if t in still_here]
+    if not survivors:
+        print("All targets shut down after soft kill.")
+        return 0
+    print(f"{len(survivors)} client(s) still alive — sending hard kill (-9):")
+    for t in survivors:
+        print(f"  {t}")
+    return await _send_kill(client, survivors, reason, 9)
+
+
+async def _run(pattern, reason, include_monitors, dry_run, mode, grace,
+               sweep=0.0, every=2.0):
+    """Connect, resolve targets, and kill them. Return the exit code.
+
+    With ``sweep > 0`` the list-and-kill pass repeats every ``every`` seconds
+    until the window closes, catching workers that were disconnected (e.g.
+    mid-reconnect) during earlier passes. The exit code then reflects the
+    state at the end of the sweep: 0 when no matching client is left.
+    """
     name = f"killer-{uuid.uuid4().hex[:6]}"
     async with Client(name) as client:
-        clients = await client.list_clients()
-        targets = _select_targets(clients, name, pattern, include_monitors)
-        if not targets:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + sweep
+        matched_any = False
+        failures = 0
+        while True:
+            targets = _select_targets(
+                await client.list_clients(), name, pattern, include_monitors)
+            if targets:
+                matched_any = True
+                verb = {"soft": "Soft-killing (-1)", "hard": "Hard-killing (-9)",
+                        "default": "Killing"}[mode]
+                print(f"{verb} {len(targets)} client(s):")
+                for t in targets:
+                    print(f"  {t}")
+                if dry_run:
+                    print("(dry run — nothing sent)")
+                else:
+                    failures = await _kill_pass(
+                        client, name, targets, reason, mode, grace,
+                        pattern, include_monitors)
+            if dry_run or loop.time() >= deadline:
+                break
+            await asyncio.sleep(every)
+
+        if not matched_any:
             print("No matching clients to kill.")
             return 0
-
-        verb = {"soft": "Soft-killing (-1)", "hard": "Hard-killing (-9)",
-                "default": "Killing"}[mode]
-        print(f"{verb} {len(targets)} client(s):")
-        for t in targets:
-            print(f"  {t}")
-        if dry_run:
-            print("(dry run — nothing sent)")
+        if sweep > 0 and not dry_run:
+            leftovers = _select_targets(
+                await client.list_clients(), name, pattern, include_monitors)
+            if leftovers:
+                print(f"Sweep over — {len(leftovers)} matching client(s) "
+                      "still connected.")
+                return 1
+            print("Sweep over — no matching clients left.")
             return 0
-
-        if mode == "hard":
-            return 1 if await _send_kill(client, targets, reason, 9) else 0
-        if mode == "soft":
-            return 1 if await _send_kill(client, targets, reason, 1) else 0
-
-        # Default: soft first, then hard on whoever is still connected.
-        await _send_kill(client, targets, reason, 1)
-        print(f"Waiting {grace:g}s for clients to shut down …")
-        await asyncio.sleep(grace)
-        still_here = _select_targets(
-            await client.list_clients(), name, pattern, include_monitors)
-        survivors = [t for t in targets if t in still_here]
-        if not survivors:
-            print("All targets shut down after soft kill.")
-            return 0
-        print(f"{len(survivors)} client(s) still alive — sending hard kill (-9):")
-        for t in survivors:
-            print(f"  {t}")
-        return 1 if await _send_kill(client, survivors, reason, 9) else 0
+        return 1 if failures else 0
 
 
 def main() -> None:
@@ -153,6 +195,18 @@ def main() -> None:
         "--grace", type=float, default=2.0, metavar="SECS",
         help="Seconds to wait after the soft kill before escalating to a "
              "hard kill (default: 2.0; only used when neither -1 nor -9 given).",
+    )
+    parser.add_argument(
+        "--sweep", type=float, default=0.0, metavar="SECS",
+        help="Repeat the list-and-kill pass for this many seconds, so a "
+             "worker that was mid-reconnect (and therefore invisible) during "
+             "one pass is caught when it re-registers (default: 0 = single "
+             "pass).",
+    )
+    parser.add_argument(
+        "--every", type=float, default=2.0, metavar="SECS",
+        help="Seconds between sweep passes (default: 2.0; only used with "
+             "--sweep).",
     )
     parser.add_argument(
         "--reason", default="killed via nexus-transfers kill",
@@ -187,7 +241,7 @@ def main() -> None:
     pattern = None if args.all else args.pattern
     rc = asyncio.run(_run(
         pattern, args.reason, args.include_monitors, args.dry_run,
-        mode, args.grace,
+        mode, args.grace, sweep=args.sweep, every=args.every,
     ))
     sys.exit(rc)
 

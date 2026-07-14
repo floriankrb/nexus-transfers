@@ -102,6 +102,15 @@ class Client:
         self.ssl_verify = ssl_verify
         self.on_monitor_event = on_monitor_event
         self._s3_keys: set[str] = set()
+        # Bounds concurrently dispatched incoming calls (see _handle_frame).
+        # A site server fans in every worker (sites x transfers x their
+        # max_concurrent can exceed 2000 in-flight calls), so keep this well
+        # above that; it only backstops a runaway peer. The semaphore is
+        # acquired inside the spawned task, never by the listener, so even
+        # at the cap the socket keeps draining and pings are answered —
+        # excess calls just wait. Throughput is bounded by the executor,
+        # not by this number.
+        self._dispatch_sem = asyncio.Semaphore(4096)
         if self.allowed_paths:
             self.dispatch["get_file"] = make_get_file(self.allowed_paths)
             self.dispatch["list_dir"] = make_list_dir(self.allowed_paths)
@@ -862,6 +871,12 @@ class Client:
     # RPC dispatch and background listener
     # ======================================================================
 
+    async def _dispatch_call_bounded(self, sender: str, msg_id: str,
+                                     payload: bytes):
+        """Run _dispatch_call under the concurrent-dispatch semaphore."""
+        async with self._dispatch_sem:
+            await self._dispatch_call(sender, msg_id, payload)
+
     async def _dispatch_call(self, sender: str, msg_id: str, payload: bytes):
         """Dispatch an incoming RPC call and send the reply frame."""
         try:
@@ -993,7 +1008,17 @@ class Client:
         match msg_name:
             case "call":
                 data = json.loads(payload)
-                await self._dispatch_call(source, data.get("msg_id"), payload)
+                # Dispatch as a task: awaiting inline would stall the
+                # listener behind one slow call (its executor slot can sit
+                # behind multi-second uploads), the receive queue would
+                # fill, websockets would pause the transport, and the
+                # broker's unanswered keepalive pings would drop the
+                # connection (close 1011).
+                task = asyncio.create_task(
+                    self._dispatch_call_bounded(
+                        source, data.get("msg_id"), payload)
+                )
+                task.add_done_callback(self._log_task_exception)
 
             case "reply":
                 data = json.loads(payload)
