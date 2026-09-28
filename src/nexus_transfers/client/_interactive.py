@@ -2,11 +2,9 @@
 
 import asyncio
 import json
-import logging
 import uuid
 
 from nexus_transfers._progress import setup_cli_logging
-from nexus_transfers.config import cli_default
 from nexus_transfers.protocol import decode_frame, encode_frame
 
 from ._client import Client, _DEFAULT_URL
@@ -198,40 +196,22 @@ async def _interactive_listener(client, console):
 
 
 def main():
-    """CLI entry point for ``nexus-client``."""
-    import argparse
+    """CLI entry point for ``nexus-transfers server``."""
+    from nexus_transfers._cli import CommandParser
 
-    parser = argparse.ArgumentParser(description="Transfer RPC client")
+    parser = CommandParser("client", description="Transfer RPC client")
     parser.add_argument("--name", required=True, help="Unique client ID")
-    parser.add_argument("--broker-url",
-                        default=cli_default("broker_url", "client", default=None),
-                        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})")
     parser.add_argument("--allow-path", action="append", default=[],
                         help="Allowed directory for get_file/list_dir (repeatable)")
-    parser.add_argument("--interactive", action="store_true",
-                        default=cli_default("interactive", "client", default=False),
-                        help="Start an interactive prompt (default: headless RPC worker)")
-    parser.add_argument("--reconnect-retries", type=int,
-                        default=cli_default("reconnect_retries", "client", default=-1, type_fn=int),
-                        help="Reconnection attempts on disconnect (-1 = infinite, default: -1)")
-    parser.add_argument("--reconnect-delay", type=float,
-                        default=cli_default("reconnect_delay", "client", default=2.0, type_fn=float),
-                        help="Seconds between reconnection attempts (default: 2.0)")
-    parser.add_argument("--peer-retries", type=int,
-                        default=cli_default("peer_retries", "client", default=-1, type_fn=int),
-                        help="Retries when target peer is not found (-1 = infinite, default: -1)")
-    parser.add_argument("--peer-delay", type=float,
-                        default=cli_default("peer_delay", "client", default=2.0, type_fn=float),
-                        help="Seconds between peer-not-found retries (default: 2.0)")
-    parser.add_argument("--call-timeout", type=float,
-                        default=cli_default("call_timeout", "client", default=None, type_fn=float),
-                        help="Timeout in seconds for RPC calls (default: no timeout)")
-    parser.add_argument("--no-verify", action="store_true",
-                        default=cli_default("no_verify", "client", default=False),
-                        help="Skip TLS certificate verification for wss:// connections")
-    parser.add_argument("--debug", action="store_true",
-                        default=cli_default("debug", "client", default=False),
-                        help="Enable debug logging")
+    parser.option("--interactive", action="store_true",
+                  help="Start an interactive prompt (default: headless RPC worker)")
+    parser.reconnect_options()
+    parser.peer_options()
+    parser.broker_options(
+        f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+        no_verify_help="Skip TLS certificate verification for wss:// connections",
+    )
+    parser.debug_option()
     args = parser.parse_args()
     setup_cli_logging(debug=args.debug)
     client_kwargs = dict(

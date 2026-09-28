@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented — atomic `<name>.<8hex>.tmp` + rename, resume, reconnect/peer retries, `--call-timeout`. Reference: [docs/BACKENDS.md](../BACKENDS.md), [README](../../README.md). `nexus-copy` is historical (`nexus-transfers copy`).
+
 
 
 when you download a file to disk, make sure it is downloaded in a temp file, not directly in the final filename, then rename atomically to the final file. we don't want truncated files.

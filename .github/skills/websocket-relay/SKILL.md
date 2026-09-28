@@ -188,6 +188,13 @@ nexus-transfers kill -1 <name>     # soft only (clean exit 0)
 nexus-transfers kill -9 <name>     # hard only (immediate os._exit)
 ```
 
+**Names are locks.** The broker keeps names unique, so a client name keyed on
+a unit of work is a distributed mutex; `--steal` (and `nexus_transfers.api`'s
+`lock=`) displaces a stale holder first. The Nexus client's lock is
+`nexus-location-<location_uuid>` (one per Nexus location row), so
+`kill 'nexus-location-*'` / `monitor --filter 'nexus-location-<uuid>'` target
+those transfers.
+
 ### Killing clients
 
 `nexus-transfers kill` enumerates targets with `list_clients`, then sends a `kill`

@@ -7,9 +7,10 @@ lets a starting worker *take over* a name that a previous (possibly stuck)
 worker still holds, by killing the incumbent and waiting for it to drop before
 the caller registers.
 
-The helper is deliberately unaware of any "task" concept: it operates purely on
-a client *name*.  Callers that key names on a task id (e.g.
-``"<site>-transfer-<task-id>"``) get a per-task interlock for free.
+The helper is deliberately unaware of what a name stands for: it operates
+purely on a client *name*.  Callers that key names on a unit of work (the
+Nexus client uses ``"nexus-location-<location_uuid>"``) get a per-transfer
+interlock for free.
 
 No broker change is involved — the kill travels over the existing broker relay
 and the name is freed atomically when the incumbent disconnects.  The caller
@@ -73,7 +74,7 @@ async def claim_name(
     *,
     ssl_verify=True,
     kill_existing=False,
-    reason="displaced by a newer worker for the same task",
+    reason="displaced by a newer worker for the same transfer",
     soft_grace=5.0,
     wait_timeout=30.0,
     poll_interval=0.5,
@@ -98,7 +99,7 @@ async def claim_name(
     Parameters
     ----------
     name
-        Client name to claim (e.g. ``"atos-transfer-<task-id>"``).
+        Client name to claim (e.g. ``"nexus-location-<location_uuid>"``).
     broker_url
         Broker WebSocket URL.  If ``None``, claiming is skipped (there is no
         broker to hold the lock) and the function returns immediately.
@@ -184,3 +185,37 @@ async def claim_name(
         _logger.info("Incumbent %r gone after hard kill", name)
     finally:
         await client.close()
+
+
+async def connect_locked(name: str, broker_url: str | None, *,
+                         ssl_verify: bool = True, steal: bool = False):
+    """Register *name* on the broker for monitoring, optionally as a lock.
+
+    With *steal*, a holder of *name* is displaced first (:func:`claim_name`)
+    and losing the race for the name afterwards raises
+    :class:`~nexus_transfers.client.NameTakenError` — continuing unlocked
+    would let two runs of the same transfer overlap.  Without *steal* a
+    taken name, or an unreachable broker, only disables monitoring.
+
+    Returns the connected :class:`~nexus_transfers.client.Client`, or
+    ``None`` (no broker, or monitoring disabled).  The caller closes it.
+    """
+    if not broker_url:
+        return None
+    if steal:
+        await claim_name(name, broker_url, ssl_verify=ssl_verify, kill_existing=True)
+    try:
+        # Monitoring is best-effort: keep retrying forever so a dropped relay
+        # connection (e.g. a keepalive timeout) silently reconnects instead of
+        # permanently losing live progress for the rest of the run.
+        client = Client(name, broker_url, dispatch={},
+                        ssl_verify=ssl_verify, reconnect_retries=-1)
+        await client.connect()
+        return client
+    except NameTakenError:
+        if steal:
+            raise
+        _logger.warning("Relay name %r already taken, continuing without monitor", name)
+    except Exception as exc:
+        _logger.warning("Relay unavailable (%s), continuing without monitor", exc)
+    return None

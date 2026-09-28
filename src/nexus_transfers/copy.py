@@ -2,20 +2,19 @@
 
 Usage::
 
-    nexus-copy --from a /remote/dir /local/dir
-    nexus-copy --from a src ./mirror --broker-url wss://example.com/transfers
+    nexus-transfers copy --from a /remote/dir /local/dir
+    nexus-transfers copy --from a src ./mirror --broker-url wss://example.com/transfers
 """
 
-import argparse
 import asyncio
 import datetime
 import os
 import uuid
 
 
+from nexus_transfers._cli import CommandParser
 from nexus_transfers._progress import make_console, setup_cli_logging
 from nexus_transfers.client import _DEFAULT_URL, Client
-from nexus_transfers.config import cli_default
 
 
 async def list_dir(name, broker_url, remote_client, path, **client_kwargs):
@@ -59,8 +58,9 @@ async def list_dir(name, broker_url, remote_client, path, **client_kwargs):
 
 
 def main():
-    """CLI entry point for ``nexus-copy``."""
-    parser = argparse.ArgumentParser(
+    """CLI entry point for ``nexus-transfers copy``."""
+    parser = CommandParser(
+        "copy",
         description="Recursively copy a directory from a remote nexus client",
     )
     parser.add_argument(
@@ -71,96 +71,35 @@ def main():
     )
     parser.add_argument("source", help="Remote directory path")
     parser.add_argument("target", help="Local destination directory")
-    parser.add_argument(
-        "--broker-url",
-        default=cli_default("broker_url", "copy", default=None),
-        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+    parser.broker_options(
+        f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+        name_help="Client name (default: auto-generated)",
+        site_help="Site label used in the auto-generated client name instead "
+                  "of 'copy'",
+        no_verify_help="Skip TLS certificate verification for wss:// "
+                       "connections",
     )
-    parser.add_argument(
-        "--name",
-        default=cli_default("name", "copy", default=None),
-        help="Client name (default: auto-generated)",
-    )
-    parser.add_argument(
-        "--max-concurrent",
-        type=int,
-        default=cli_default("max_concurrent", "copy", default=4, type_fn=int),
-        help="Maximum parallel file transfers (default: 4)",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=cli_default("chunk_size", "copy", default=65536, type_fn=int),
-        help="Binary chunk size in bytes for file transfers (default: 65536)",
-    )
-    parser.add_argument(
-        "--use-broker",
-        action="store_true",
-        default=cli_default("use_broker", "copy", default=False),
-        help="Transfer via the WebSocket relay instead of S3 staging",
-    )
-    parser.add_argument(
-        "--reconnect-retries",
-        type=int,
-        default=cli_default("reconnect_retries", "copy", default=-1, type_fn=int),
-        help="Reconnection attempts on disconnect (-1 = infinite, default: -1)",
-    )
-    parser.add_argument(
-        "--reconnect-delay",
-        type=float,
-        default=cli_default("reconnect_delay", "copy", default=2.0, type_fn=float),
-        help="Seconds between reconnection attempts (default: 2.0)",
-    )
-    parser.add_argument(
-        "--peer-retries",
-        type=int,
-        default=cli_default("peer_retries", "copy", default=-1, type_fn=int),
-        help="Retries when target peer is not found (-1 = infinite, default: -1)",
-    )
-    parser.add_argument(
-        "--peer-delay",
-        type=float,
-        default=cli_default("peer_delay", "copy", default=2.0, type_fn=float),
-        help="Seconds between peer-not-found retries (default: 2.0)",
-    )
-    parser.add_argument(
-        "--call-timeout",
-        type=float,
-        default=cli_default("call_timeout", "copy", default=None, type_fn=float),
-        help="Timeout in seconds for RPC calls (default: no timeout)",
-    )
-    parser.add_argument(
-        "--no-verify",
-        action="store_true",
-        default=cli_default("no_verify", "copy", default=False),
-        help="Skip TLS certificate verification for wss:// connections",
-    )
-    parser.add_argument(
-        "--site",
-        default=cli_default("site", "copy", default=None),
-        help="Site label used in the auto-generated client name instead of 'copy'",
-    )
-    parser.add_argument(
-        "--size",
-        action="store_true",
-        default=cli_default("size", "copy", default=False),
-        help="Show transfer progress in bytes and use size to verify resume skips",
-    )
-    parser.add_argument(
-        "--steal",
-        action="store_true",
-        default=cli_default("steal", "copy", default=False),
+    parser.option("--max-concurrent", type=int, default=4,
+                  help="Maximum parallel file transfers (default: 4)")
+    parser.option("--chunk-size", type=int, default=65536,
+                  help="Binary chunk size in bytes for file transfers "
+                       "(default: 65536)")
+    parser.option("--use-broker", action="store_true",
+                  help="Transfer via the WebSocket relay instead of S3 staging")
+    parser.reconnect_options()
+    parser.peer_options()
+    parser.option("--size", action="store_true",
+                  help="Show transfer progress in bytes and use size to "
+                       "verify resume skips")
+    parser.option(
+        "--steal", action="store_true",
         help="If a client is already registered under --name, kill it (soft "
              "kill first, then hard kill if it does not exit) and take over "
-             "the name. With a task-keyed name this guarantees only one copy "
-             "for the same task runs at a time.",
+             "the name. With a name keyed on the transfer (e.g. "
+             "nexus-location-<location_uuid>) this guarantees only one copy "
+             "of it runs at a time.",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        default=cli_default("debug", "copy", default=False),
-        help="Enable debug logging",
-    )
+    parser.debug_option()
     args = parser.parse_args()
 
     setup_cli_logging(debug=args.debug)
@@ -229,7 +168,8 @@ async def copy(name, broker_url, remote_client, source, target, site=None,
     steal:
         If True, displace any peer already registered under ``name`` before
         connecting (soft kill, then hard kill).  Use a name keyed on the unit
-        of work (e.g. the task id) so this acts as a per-task interlock that
+        of work (e.g. ``nexus-location-<location_uuid>``) so this acts as a
+        per-transfer interlock that
         guarantees only one copy runs at a time.
     **client_kwargs:
         Forwarded to :class:`~nexus_transfers.client.Client`.

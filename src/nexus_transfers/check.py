@@ -5,7 +5,8 @@ Two independent sub-checks:
 * ``--s3``        Round-trip a small object through the configured S3
                   bucket (put → get → delete).
 * ``--site NAME`` Resolve the site config from the anemoi registry
-                  (catalogue) and connect/register against its broker.
+                  (``anemoi.registry.Site``) and connect/register against
+                  its broker.
 
 Both flags may be combined; at least one is required.
 """
@@ -139,13 +140,13 @@ def _try_delete(store, key: str) -> None:
 
 
 def _load_site(name: str) -> dict[str, Any]:
-    """Resolve a site name to its catalogue config via ``anemoi.registry``."""
+    """Resolve a site name to its registry config via ``anemoi.registry``."""
     try:
         from anemoi.registry import Site
     except ImportError as exc:
         raise RuntimeError(
             "anemoi-registry is not installed in this environment "
-            "— cannot resolve site config from the catalogue"
+            "— cannot resolve site config from the registry"
         ) from exc
     return Site(name).data
 
@@ -161,22 +162,22 @@ async def _broker_round_trip(name: str, broker_url: str, ssl_verify: bool) -> No
 
 def check_site(site_name: str, verbose: bool = False,
                ssl_verify: bool = True) -> int:
-    """Resolve a site via the catalogue then dial its broker. Return 0 on success."""
+    """Resolve a site via the registry then dial its broker. Return 0 on success."""
     print(f"== Site check ({site_name}) ==", flush=True)
 
     try:
         data = _load_site(site_name)
     except Exception as exc:
-        print(f"\nFAIL: cannot resolve site {site_name!r} from catalogue: "
+        print(f"\nFAIL: cannot resolve site {site_name!r} from registry: "
               f"{exc}", file=sys.stderr)
         if verbose:
             raise
         return 1
-    print("  catalogue OK")
+    print("  registry OK")
 
     broker_url = data.get("broker_url")
     if not broker_url:
-        print(f"\nFAIL: site {site_name!r} has no 'broker_url' in its catalogue "
+        print(f"\nFAIL: site {site_name!r} has no 'broker_url' in its registry "
               "config", file=sys.stderr)
         return 1
     print(f"  broker_url  = {broker_url}")
@@ -214,12 +215,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--site", metavar="NAME", default=None,
-        help="Site name to resolve via the anemoi catalogue, then connect "
+        help="Site name to resolve via the anemoi registry, then connect "
              "to its broker.",
     )
     parser.add_argument(
-        "--no-ssl-verify", action="store_true",
-        help="Skip TLS certificate verification when dialling the broker.",
+        "--no-verify", "--no-ssl-verify", dest="no_verify", action="store_true",
+        help="Skip TLS certificate verification when dialling the broker "
+             "(--no-ssl-verify is a deprecated alias).",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -243,7 +245,7 @@ def main() -> None:
             print()
         rc = max(rc, check_site(
             args.site, verbose=args.verbose,
-            ssl_verify=not args.no_ssl_verify,
+            ssl_verify=not args.no_verify,
         ))
     sys.exit(rc)
 

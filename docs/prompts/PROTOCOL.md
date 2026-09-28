@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented — frame layout, `match` dispatch, configurable chunk size, 1–255 name-length validation in `encode_frame` / `decode_frame`. Reference: [docs/PROTOCOL.md](../PROTOCOL.md). `nexus-copy` is historical (`nexus-transfers copy`).
+
 I want the server to be less involved in the protocol, and only decode json wehen needed.
 So, the messages on the web sockect will be as follows:
 

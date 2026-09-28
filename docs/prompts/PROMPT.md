@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented — the original build log of the package (renamed `transfer` → `nexus_transfers`; the standalone `nexus-copy` / `--server-url` names are historical, now `nexus-transfers copy` / `--broker-url`). Reference: [README](../../README.md), [docs/PROTOCOL.md](../PROTOCOL.md).
+
 i want a server to relay messages between two clients, everything in python
 use websockets.
 the server need to be multithreaded, and both client connections will have access to the same memory

@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented — single `nexus-transfers <command>` script; the legacy standalone commands are gone. Reference: [README § CLI reference](../../README.md#cli-reference).
+
 Refactor the nexus CLIs into a single one called "nexus-transfers" followed by a single word and then arguments
 
 - broker (run the broker, runs forever)

@@ -2,10 +2,9 @@
 
 Usage::
 
-    nexus-copy-to-ssh --source /data/dataset.zarr --target user@host:/remote/path
+    nexus-transfers copy-ssh --source /data/dataset.zarr --target user@host:/remote/path
 """
 
-import argparse
 import asyncio
 import logging
 import multiprocessing as mp
@@ -17,57 +16,31 @@ import uuid
 from pathlib import PurePosixPath
 from typing import Callable
 
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
-
 from nexus_transfers._progress import (
-    _BinarySpeedColumn,
-    _CountOrBytesColumn,
-    _fmt_binary,
+    CopyStats,
     make_console,
+    make_progress,
+    run_abortable,
     setup_cli_logging,
 )
-from nexus_transfers.client import Client, NameTakenError
-from nexus_transfers.config import cli_default
-from nexus_transfers.ssh import SSHPool, stat_remote, write_file
+from nexus_transfers._run import Monitor, run_workers, ticking
+from nexus_transfers._cli import CommandParser
+from nexus_transfers.ssh import (
+    SSHConfig,
+    SSHPool,
+    parse_ssh_target,
+    stat_remote,
+    write_file,
+)
 
 _logger = logging.getLogger(__name__)
-
-
-def _parse_target(target: str) -> tuple[str | None, str, str]:
-    """Parse ``[user@]host:/path`` into ``(user, host, remote_path)``.
-
-    Parameters
-    ----------
-    target : str
-        Target specification in the form ``[user@]host:/path``.
-
-    Raises
-    ------
-    ValueError
-        If *target* does not contain a colon separator.
-    """
-    if ":" not in target:
-        raise ValueError(
-            f"Invalid target {target!r}: expected [user@]host:/path"
-        )
-    host_part, remote_path = target.split(":", 1)
-    if "@" in host_part:
-        user, host = host_part.split("@", 1)
-    else:
-        user, host = None, host_part
-    return user, host, remote_path
 
 
 async def _list_local(source_path: str) -> tuple[list[tuple[str, str, int]], int, int]:
     """Walk *source_path* and return ``(items, total_count, total_size)``.
 
-    Each item is a ``(local_path, relative_path, size)`` tuple. Runs
+    Each item is a ``(local_path, relative_path, size)`` tuple; a single-file
+    *source_path* yields one item whose relative path is ``""``. Runs
     ``os.scandir`` in a thread-pool executor so NFS stat calls do not block the
     event loop.
 
@@ -77,6 +50,12 @@ async def _list_local(source_path: str) -> tuple[list[tuple[str, str, int]], int
         Root directory to walk.
     """
     loop = asyncio.get_running_loop()
+
+    if os.path.isfile(source_path):
+        # A single file: one item with an empty relative path (the target is
+        # the file itself, not a directory to put it in).
+        size = os.path.getsize(source_path)
+        return [(source_path, "", size)], 1, size
 
     def _scan(dirpath: str, prefix: str) -> list[tuple[str, str, int]]:
         entries = []
@@ -154,13 +133,13 @@ async def _run_shard(
     stat_concurrency : int
         Maximum number of concurrent remote ``stat`` calls.
     """
-    upload_queue: asyncio.Queue = asyncio.Queue()
     sem = asyncio.Semaphore(stat_concurrency)
 
-    async def _classify(item: tuple[str, str, int]) -> None:
+    async def _classify(item: tuple[str, str, int], put) -> None:
         local_file, rel_path, size = item
-        rel_posix = PurePosixPath(rel_path).as_posix()
-        remote_path = f"{remote_base}/{rel_posix}"
+        rel_posix = PurePosixPath(rel_path).as_posix() if rel_path else ""
+        # An empty relative path is a single-file source: the target *is* the file.
+        remote_path = f"{remote_base}/{rel_posix}" if rel_posix else remote_base
         async with sem:
             remote_size = await stat_remote(pool.get_sftp(), remote_path)
         if remote_size is not None and remote_size == size:
@@ -171,38 +150,23 @@ async def _run_shard(
                 _logger.debug("Uploading %s (not found on remote)", rel_posix)
             else:
                 _logger.debug("Re-uploading %s (remote=%d != local=%d)", rel_posix, remote_size, size)
-            await upload_queue.put((local_file, remote_path, size))
+            await put((local_file, remote_path, size))
 
-    async def _classify_all() -> None:
-        await asyncio.gather(*[_classify(it) for it in items])
-        for _ in range(max_concurrent):
-            await upload_queue.put(None)
+    async def _classify_all(put) -> None:
+        await asyncio.gather(*[_classify(it, put) for it in items])
 
-    async def _upload_worker() -> None:
-        sftp = pool.get_sftp()
-        while True:
-            entry = await upload_queue.get()
-            if entry is None:
-                return
-            local_file, remote_path, size = entry
-            await write_file(sftp, local_file, remote_path)
-            report("uploaded", size, 1)
+    async def _upload(entry: tuple[str, str, int]) -> None:
+        local_file, remote_path, size = entry
+        await write_file(pool.get_sftp(), local_file, remote_path)
+        report("uploaded", size, 1)
 
-    await asyncio.gather(
-        _classify_all(),
-        *[_upload_worker() for _ in range(max_concurrent)],
-    )
+    await run_workers(_classify_all, _upload, max_concurrent)
 
 
 def _shard_main_sync(
     shard: list[tuple[str, str, int]],
-    host: str,
-    port: int,
-    user: str | None,
-    key_path: str | None,
-    ssh_connections: int,
+    ssh: SSHConfig,
     remote_base: str,
-    encryption_algs: list[str] | None,
     max_concurrent: int,
     stat_concurrency: int,
     progress_queue,
@@ -225,8 +189,7 @@ def _shard_main_sync(
     try:
         asyncio.run(
             _shard_worker(
-                shard, host, port, user, key_path, ssh_connections,
-                remote_base, encryption_algs, max_concurrent, stat_concurrency,
+                shard, ssh, remote_base, max_concurrent, stat_concurrency,
                 progress_queue,
             )
         )
@@ -242,13 +205,8 @@ def _shard_main_sync(
 
 async def _shard_worker(
     shard: list[tuple[str, str, int]],
-    host: str,
-    port: int,
-    user: str | None,
-    key_path: str | None,
-    ssh_connections: int,
+    ssh: SSHConfig,
     remote_base: str,
-    encryption_algs: list[str] | None,
     max_concurrent: int,
     stat_concurrency: int,
     progress_queue,
@@ -278,9 +236,7 @@ async def _shard_worker(
             _flush()
             last_flush = loop.time()
 
-    async with SSHPool(
-        host, port, user, key_path, ssh_connections, encryption_algs,
-    ) as pool:
+    async with ssh.pool() as pool:
         await _run_shard(pool, shard, remote_base, _report, max_concurrent, stat_concurrency)
     _flush()
 
@@ -289,13 +245,8 @@ async def _run_multiprocess(
     *,
     items: list[tuple[str, str, int]],
     processes: int,
-    host: str,
-    ssh_port: int,
-    user: str | None,
-    ssh_key: str | None,
-    ssh_connections: int,
+    ssh: SSHConfig,
     remote_base: str,
-    encryption_algs: list[str] | None,
     max_concurrent: int,
     stat_concurrency: int,
     advance: Callable[[bool, int, int], None],
@@ -316,6 +267,8 @@ async def _run_multiprocess(
         ``(local_path, relative_path, size)`` tuples to distribute.
     processes : int
         Number of worker processes to spawn.
+    ssh : SSHConfig
+        Connection settings; each worker opens its own pool.
     advance : callable
         ``advance(is_skip, n_bytes, n_files)`` applied for each progress delta;
         must be thread-safe (it is called from a background drain thread).
@@ -335,8 +288,7 @@ async def _run_multiprocess(
         p = ctx.Process(
             target=_shard_main_sync,
             args=(
-                shard, host, ssh_port, user, ssh_key, ssh_connections,
-                remote_base, encryption_algs, max_concurrent, stat_concurrency,
+                shard, ssh, remote_base, max_concurrent, stat_concurrency,
                 progress_queue,
             ),
         )
@@ -350,10 +302,11 @@ async def _run_multiprocess(
 
     n_procs = len(procs)
     errors: list[str] = []
+    stop_drain = threading.Event()
 
     def _drain() -> None:
         finished = 0
-        while finished < n_procs:
+        while finished < n_procs and not stop_drain.is_set():
             try:
                 msg = progress_queue.get(timeout=1.0)
             except _queue.Empty:
@@ -373,6 +326,10 @@ async def _run_multiprocess(
         for p in procs:
             await loop.run_in_executor(None, p.join)
     finally:
+        # Unblock the drain thread when we leave early (cancelled, e.g. by a
+        # progress callback that aborted the copy): the children it waits on
+        # are about to be terminated and will never report "done".
+        stop_drain.set()
         for p in procs:
             if p.is_alive():
                 p.terminate()
@@ -411,7 +368,9 @@ async def _copy_to_ssh(
     stat_concurrency: int = 64,
     encryption_algs: list[str] | None = None,
     steal: bool = False,
-) -> None:
+    progress_callback: Callable[[int, int, int], None] | None = None,
+    progress_interval: float = 5.0,
+) -> dict:
     """Copy the local *source* directory to the SSH *target*.
 
     Parameters
@@ -458,257 +417,99 @@ async def _copy_to_ssh(
     steal : bool
         If True (and ``broker_url`` is set), displace any peer already
         registered under ``name`` before connecting (soft then hard kill), and
-        abort if the name cannot be claimed.  With a task-keyed name this acts
-        as a per-task interlock so only one push for the same task runs at a
-        time.  Requires ``broker_url`` — the relay name is the lock.
+        abort if the name cannot be claimed.  With a name keyed on the
+        transfer (``nexus-location-<location_uuid>``) this acts as a
+        per-transfer interlock so only one push of it runs at a time.  Requires ``broker_url`` — the relay name is the lock.
+    progress_callback : callable, optional
+        ``progress_callback(bytes_done, bytes_total, files_done)`` called
+        every ``progress_interval`` seconds and once at the end, from the
+        event-loop thread.  ``bytes_done`` / ``files_done`` include the files
+        skipped because they were already at the target.  If it raises, the
+        copy is aborted (the workers are stopped) and the exception
+        propagates to the caller — this is how a caller stops a transfer it
+        no longer owns.
+    progress_interval : float
+        Seconds between ``progress_callback`` calls.
+
+    Returns
+    -------
+    dict
+        ``{"bytes", "files", "transferred_bytes", "transferred_files",
+        "skipped_bytes", "skipped_files"}`` — ``bytes`` / ``files`` are the
+        totals of the source (what the target now holds).
     """
-    user, host, remote_base = _parse_target(target)
+    user, host, remote_base = parse_ssh_target(target)
+    ssh = SSHConfig(host, user, ssh_port, ssh_key, ssh_connections,
+                    encryption_algs)
     source = os.path.expanduser(source)
     console = make_console(quiet=quiet)
 
     label = os.path.basename(source.rstrip("/")) or source
     dest_label = f"{site}:{remote_base}" if site else f"{host}:{remote_base}"
-    if not quiet:
-        console.print(
-            f"Copying [yellow]{source}[/yellow] -> [yellow]{dest_label}[/yellow]"
-        )
+    console.print(
+        f"Copying [yellow]{source}[/yellow] -> [yellow]{dest_label}[/yellow]"
+    )
 
-    # When stealing, the relay name is the per-task lock: displace any
+    # When stealing, the relay name is the per-transfer lock: displace any
     # incumbent worker before we register, and treat a lost name race as fatal
-    # (continuing unlocked would allow two pushes for the same task to run).
-    if steal and broker_url:
-        from nexus_transfers.claim import claim_name
-
-        await claim_name(
-            name, broker_url, ssl_verify=ssl_verify, kill_existing=True,
+    # (continuing unlocked would allow two pushes of the same transfer to run).
+    async with await Monitor.connect(
+        name, broker_url, ssl_verify=ssl_verify, steal=steal,
+        on_monitor=on_monitor,
+    ) as monitor:
+        await monitor.emit(
+            f"{name}: starting copy {source} -> {dest_label}",
+            status="progress",
         )
 
-    monitor_client: Client | None = None
-    if broker_url:
+        progress = make_progress(quiet)
+        stats = CopyStats(name, label, progress, track_bytes=track_bytes)
+        progress.start()
         try:
-            # Monitoring is best-effort: keep retrying forever so a dropped
-            # relay connection (e.g. a keepalive timeout) silently reconnects
-            # instead of permanently losing live progress for the rest of the
-            # copy.
-            monitor_client = Client(
-                name, broker_url, dispatch={},
-                ssl_verify=ssl_verify, reconnect_retries=-1,
-            )
-            await monitor_client.connect()
-        except NameTakenError:
-            # The name is held. Under --steal this means we lost a race to
-            # another worker that grabbed it after our claim — abort rather
-            # than run a second concurrent push. Without --steal, fall back to
-            # monitor-less operation as before.
-            if steal:
-                raise
-            _logger.warning(
-                "Relay name %r already taken, continuing without monitor", name,
-            )
-            monitor_client = None
-        except Exception as exc:
-            _logger.warning(
-                "Relay unavailable (%s), continuing without monitor", exc,
-            )
-            monitor_client = None
+            items, total_count, total_size = await _list_local(source)
+            stats.add_total(total_count, total_size)
+            stats.listed()
 
-    async def _emit(message, status=None, **kw):
-        if monitor_client is not None:
-            try:
-                await monitor_client.monitor(message, status=status, **kw)
-            except Exception as exc:
-                _logger.warning("Failed to send monitor event: %s", exc)
-        if on_monitor is not None:
-            try:
-                await on_monitor(message, status=status, **kw)
-            except Exception as exc:
-                _logger.warning("on_monitor callback failed: %s", exc)
+            async def _copy_body() -> None:
+                if processes <= 1:
+                    async with ssh.pool() as pool:
+                        await _run_shard(
+                            pool, items, remote_base,
+                            lambda kind, nb, nf: stats.advance(
+                                kind == "skipped", nb, nf),
+                            max_concurrent, stat_concurrency,
+                        )
+                else:
+                    client = monitor.client
+                    await _run_multiprocess(
+                        items=items,
+                        processes=processes,
+                        ssh=ssh,
+                        remote_base=remote_base,
+                        max_concurrent=max_concurrent,
+                        stat_concurrency=stat_concurrency,
+                        advance=stats.advance,
+                        register=client.register_child_pgid if client else None,
+                        unregister=(
+                            client.unregister_child_pgid if client else None
+                        ),
+                    )
 
-    await _emit(
-        f"{name}: starting copy {source} -> {dest_label}",
-        status="progress",
-    )
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        _CountOrBytesColumn(),
-        _BinarySpeedColumn(),
-        TimeRemainingColumn(),
-        transient=True,
-    )
-
-    loop = asyncio.get_running_loop()
-    start = loop.time()
-    total_bytes = 0
-    done_count = 0
-    skipped = 0
-    skipped_bytes = 0
-    lock = threading.Lock()
-
-    unit = "bytes" if track_bytes else "files"
-    walk_task_id = progress.add_task(
-        f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
-    )
-    copy_task_id = progress.add_task(
-        f"[cyan]Copying {label}[/cyan]", total=None, unit=unit,
-    )
-    progress.start()
-
-    items, total_count, total_size = await _list_local(source)
-    progress.update(copy_task_id, total=total_size if track_bytes else total_count)
-    progress.remove_task(walk_task_id)
-
-    def _advance(is_skip: bool, n_bytes: int, n_files: int) -> None:
-        """Update shared counters and the rich bar (thread-safe)."""
-        nonlocal total_bytes, done_count, skipped, skipped_bytes
-        with lock:
-            if is_skip:
-                skipped += n_files
-                skipped_bytes += n_bytes
-            else:
-                total_bytes += n_bytes
-                done_count += n_files
-            if track_bytes:
-                progress.advance(copy_task_id, n_bytes)
-            else:
-                progress.update(copy_task_id, completed=done_count + skipped)
-            if skipped:
-                progress.update(
-                    copy_task_id,
-                    description=(
-                        f"[cyan]Copying {label}[/cyan] "
-                        f"[dim]({skipped} skipped)[/dim]"
-                    ),
+            async with ticking(30, lambda: stats.heartbeat(monitor)):
+                await run_abortable(
+                    _copy_body(), stats, progress_callback, progress_interval,
                 )
+        finally:
+            progress.stop()
 
-    def _payload() -> tuple[float, dict]:
-        with lock:
-            elapsed = loop.time() - start
-            rate = total_bytes / elapsed if elapsed > 0 else 0
-            return rate, {
-                "label": f"{name}: {done_count} files",
-                "value": total_bytes + skipped_bytes,
-                "maximum": total_size or None,
-                "unit": "byte",
-                "total_transferred": total_bytes + skipped_bytes,
-                "files_done": done_count,
-                "files_skipped": skipped,
-                "rate": rate,
-            }
-
-    async def _ticker(stop_event: asyncio.Event) -> None:
-        """Emit aggregated progress every 30s until *stop_event* is set."""
-        while True:
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=30)
-                return
-            except asyncio.TimeoutError:
-                pass
-            rate, payload = _payload()
-            skip_suffix = (
-                f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
-                if skipped else ""
-            )
-            await _emit(
-                f"{name}: {done_count} files "
-                f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)" + skip_suffix,
-                status="progress",
-                progress=payload,
-            )
-
-    stop_event = asyncio.Event()
-    ticker = asyncio.create_task(_ticker(stop_event))
-
-    try:
-        if processes <= 1:
-            async with SSHPool(
-                host, ssh_port, user, ssh_key, ssh_connections, encryption_algs,
-            ) as pool:
-                await _run_shard(
-                    pool, items, remote_base,
-                    lambda kind, nb, nf: _advance(kind == "skipped", nb, nf),
-                    max_concurrent, stat_concurrency,
-                )
-        else:
-            await _run_multiprocess(
-                items=items,
-                processes=processes,
-                host=host,
-                ssh_port=ssh_port,
-                user=user,
-                ssh_key=ssh_key,
-                ssh_connections=ssh_connections,
-                remote_base=remote_base,
-                encryption_algs=encryption_algs,
-                max_concurrent=max_concurrent,
-                stat_concurrency=stat_concurrency,
-                advance=_advance,
-                register=(
-                    monitor_client.register_child_pgid
-                    if monitor_client else None
-                ),
-                unregister=(
-                    monitor_client.unregister_child_pgid
-                    if monitor_client else None
-                ),
-            )
-    finally:
-        stop_event.set()
-        await ticker
-        progress.stop()
-
-    if skipped:
-        _logger.info(
-            "Skipped %d already-complete file(s) (%s)",
-            skipped, _fmt_binary(skipped_bytes),
-        )
-        if not quiet:
-            console.print(
-                f"Skipped [bold]{skipped}[/bold] already-complete file(s) "
-                f"([bold]{_fmt_binary(skipped_bytes)}[/bold])"
-            )
-
-    elapsed = loop.time() - start
-    rate = total_bytes / elapsed if elapsed > 0 else 0
-    skip_suffix = (
-        f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
-        if skipped else ""
-    )
-    summary = (
-        f"Transferred {_fmt_binary(total_bytes)} "
-        f"in {elapsed:.1f}s ({_fmt_binary(rate)}/s)" + skip_suffix
-    )
-    if not quiet:
-        console.print(
-            f"Transferred [bold]{_fmt_binary(total_bytes)}[/bold] "
-            f"in [bold]{elapsed:.1f}s[/bold] "
-            f"([bold]{_fmt_binary(rate)}/s[/bold])"
-        )
-
-    await _emit(
-        f"{name}: {summary}",
-        status="ok",
-        progress={
-            "label": f"{name}: {done_count} files",
-            "value": total_bytes + skipped_bytes,
-            "maximum": total_size or None,
-            "unit": "byte",
-            "total_transferred": total_bytes + skipped_bytes,
-            "files_done": done_count,
-            "files_skipped": skipped,
-            "rate": rate,
-        },
-    )
-
-    if monitor_client:
-        await monitor_client.close()
+        await stats.finish(monitor, console)
+    return stats.result()
 
 
 def main() -> None:
-    """CLI entry point for ``nexus-copy-to-ssh``."""
-    parser = argparse.ArgumentParser(
+    """CLI entry point for ``nexus-transfers copy-ssh``."""
+    parser = CommandParser(
+        "copy_ssh",
         description="Copy a local directory to a remote SSH/SFTP target",
     )
     parser.add_argument("--source", required=True, help="Local directory to copy")
@@ -716,77 +517,29 @@ def main() -> None:
         "--target", required=True,
         help="Remote target: [user@]host:/remote/path",
     )
-    parser.add_argument(
-        "--broker-url",
-        default=cli_default("broker_url", "copy_ssh", default=None),
-        help="Relay WebSocket URL for monitoring (default: none — monitoring disabled)",
-    )
-    parser.add_argument(
-        "--name", default=cli_default("name", "copy_ssh", default=None),
-        help="Client name on the relay (default: auto-generated)",
-    )
-    parser.add_argument(
-        "--site",
-        default=cli_default("site", "copy_ssh", default=None),
-        help="Site label for monitor messages",
-    )
-    parser.add_argument(
-        "--max-concurrent", type=int,
-        default=cli_default("max_concurrent", "copy_ssh", default=4, type_fn=int),
-        help="Number of parallel SFTP uploads (default: 4)",
-    )
-    parser.add_argument(
-        "--ssh-port", type=int,
-        default=cli_default("ssh_port", "copy_ssh", default=22, type_fn=int),
-        help="SSH port (default: 22)",
-    )
-    parser.add_argument(
-        "--ssh-key",
-        default=cli_default("ssh_key", "copy_ssh", default=None),
-        help="Path to SSH private key",
-    )
-    parser.add_argument(
-        "--ssh-connections", type=int,
-        default=cli_default("ssh_connections", "copy_ssh", default=2, type_fn=int),
-        help="Number of SSH connections to open per process (default: 2)",
-    )
-    parser.add_argument(
-        "--processes", type=int,
-        default=cli_default("processes", "copy_ssh", default=1, type_fn=int),
-        help="Number of worker processes to shard files across; >1 spreads SSH "
-             "encryption over cores (default: 1)",
-    )
-    parser.add_argument(
-        "--stat-concurrency", type=int,
-        default=cli_default("stat_concurrency", "copy_ssh", default=64, type_fn=int),
-        help="Max concurrent remote stat calls during the resume scan (default: 64)",
-    )
-    parser.add_argument(
-        "--cipher", nargs="+", default=None, metavar="ALG",
-        help="SSH cipher preference list (default: aes128-gcm@openssh.com first)",
-    )
-    parser.add_argument(
-        "--size", action="store_true",
-        default=cli_default("size", "copy_ssh", default=False),
-        help="Show byte-based progress instead of file count",
-    )
-    parser.add_argument(
-        "--no-verify", action="store_true",
-        default=cli_default("no_verify", "copy_ssh", default=False),
-        help="Skip TLS verification for the relay connection",
-    )
-    parser.add_argument(
+    parser.monitor_options()
+    parser.option("--max-concurrent", type=int, default=4,
+                  help="Number of parallel SFTP uploads (default: 4)")
+    parser.ssh_options("Number of SSH connections to open per process "
+                       "(default: 2)")
+    parser.option("--processes", type=int, default=1,
+                  help="Number of worker processes to shard files across; >1 "
+                       "spreads SSH encryption over cores (default: 1)")
+    parser.option("--stat-concurrency", type=int, default=64,
+                  help="Max concurrent remote stat calls during the resume "
+                       "scan (default: 64)")
+    parser.option("--size", action="store_true",
+                  help="Show byte-based progress instead of file count")
+    parser.option(
         "--steal", action="store_true",
-        default=cli_default("steal", "copy_ssh", default=False),
         help="If a client is already registered under --name, kill it (soft "
              "kill first, then hard kill if it does not exit) and take over "
-             "the name, aborting if the name cannot be claimed. With a "
-             "task-keyed name this guarantees only one push for the same task "
-             "runs at a time. Requires --broker-url.",
+             "the name, aborting if the name cannot be claimed. With a name "
+             "keyed on the transfer (e.g. nexus-location-<location_uuid>) this "
+             "guarantees only one push of it runs at a time. Requires "
+             "--broker-url.",
     )
-    parser.add_argument("--debug", action="store_true",
-                        default=cli_default("debug", "copy_ssh", default=False),
-                        help="Enable debug logging")
+    parser.debug_option()
     args = parser.parse_args()
 
     setup_cli_logging(debug=args.debug)

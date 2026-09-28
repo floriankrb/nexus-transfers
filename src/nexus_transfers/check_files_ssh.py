@@ -2,7 +2,7 @@
 
 The local directory is the reference. Local files are walked and hashed,
 the remote hash is computed over SSH (``md5sum`` by default, same asyncssh
-pool as ``nexus-copy-ssh``), and the two are compared.
+pool as ``nexus-transfers copy-ssh``), and the two are compared.
 
 Usage::
 
@@ -10,44 +10,28 @@ Usage::
     nexus-transfers check-files-ssh --source ... --target ... --fix --delete-extra
 """
 
-import argparse
 import asyncio
 import logging
 import os
 import stat as _stat
-import sys
 import time
 import uuid
 from typing import Callable
 
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
-
-from nexus_transfers._progress import (
-    _BinarySpeedColumn,
-    _CountOrBytesColumn,
-    make_console,
-    setup_cli_logging,
-)
+from nexus_transfers._progress import setup_cli_logging
 from nexus_transfers.check_files import (
-    CheckFailedError,
     CheckReport,
     _parse_age,
     _parse_mode,
-    is_deletable_extra,
+    check_copy,
     scan_local_files,
 )
-from nexus_transfers.client import Client
-from nexus_transfers.config import cli_default
-from nexus_transfers.copy_ssh import _parse_target
+from nexus_transfers._cli import CommandParser, run_check
 from nexus_transfers.dispatch import compute_file_hash
 from nexus_transfers.ssh import (
+    SSHConfig,
     SSHPool,
+    parse_ssh_target,
     remote_hash,
     walk_remote,
     write_file,
@@ -56,107 +40,111 @@ from nexus_transfers.ssh import (
 _logger = logging.getLogger(__name__)
 
 
-async def _check_one_ssh(pool, local_root, remote_base, rel, report, *,
-                         algo, fix, fix_permissions, max_age, loop):
-    """Compare one local reference file against its remote counterpart.
+class _SSHCopy:
+    """A remote copy ``[user@]host:/path`` of the local reference
+    *local_root* (a :class:`~nexus_transfers.check_files.CopyTarget`).
 
-    Returns True when the file was checked, False when it was skipped
-    because the remote copy is older than *max_age*.
-
-    Parameters
-    ----------
-    pool : SSHPool
-        Connection pool to draw SSH/SFTP clients from.
-    local_root : str
-        Local reference root directory.
-    remote_base : str
-        Remote root directory (POSIX).
-    rel : str
-        File path relative to both roots (POSIX).
-    report : CheckReport
-        Aggregator for discrepancies.
-    algo : str
-        Hash algorithm (must have a ``<algo>sum`` binary on the remote).
-    fix : bool
-        Re-upload corrupt or missing remote files.
-    fix_permissions : int or None
-        Explicit permission bits (e.g. ``0o600``) to enforce on every remote
-        file. ``None`` only reports drift against the local reference.
-    max_age : float or None
-        Only check remote files modified within the last ``max_age``
-        seconds; older files are skipped. Missing remote files are never
-        skipped — they have no mtime and must be reported.
-    loop :
-        Running event loop (for executor calls).
+    Compares *algo* hashes (the remote host needs ``<algo>sum``) and
+    permission bits.  With *fix*, missing or corrupt files are uploaded
+    again with the reference's mode; *fix_permissions* (e.g. ``0o600``)
+    is enforced on every file, else mode drift is only reported.  With
+    *max_age* (seconds), remote files modified longer ago are skipped.
     """
-    local_file = os.path.join(local_root, rel)
-    remote_file = f"{remote_base}/{rel}"
-    sftp = pool.get_sftp()
-    local_mode = _stat.S_IMODE(os.stat(local_file).st_mode)
 
-    if max_age is not None:
+    def __init__(self, target: str, local_root: str, *, algo: str = "md5",
+                 fix: bool = False, fix_permissions: int | None = None,
+                 max_age: float | None = None, ssh_port: int = 22,
+                 ssh_key: str | None = None, ssh_connections: int = 2,
+                 encryption_algs: list[str] | None = None) -> None:
+        user, self.host, remote_base = parse_ssh_target(target)
+        self.remote_base = remote_base.rstrip("/")
+        self.local_root = os.path.expanduser(local_root)
+        self.algo = algo
+        self.fix = fix
+        self.fix_permissions = fix_permissions
+        self.max_age = max_age
+        self._pool = SSHConfig(self.host, user, ssh_port, ssh_key,
+                               ssh_connections, encryption_algs).pool()
+
+    async def __aenter__(self) -> "_SSHCopy":
+        await self._pool.connect()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self._pool.close()
+
+    async def list_files(self) -> set[str]:
+        return {rel for rel, _ in
+                await walk_remote(self._pool.get_sftp(), self.remote_base)}
+
+    async def delete(self, rel: str) -> None:
+        await self._pool.get_sftp().remove(f"{self.remote_base}/{rel}")
+
+    async def check_one(self, rel: str, local_size: int,
+                        report: CheckReport) -> bool:
+        local_file = os.path.join(self.local_root, rel)
+        remote_file = f"{self.remote_base}/{rel}"
+        sftp = self._pool.get_sftp()
+        local_mode = _stat.S_IMODE(os.stat(local_file).st_mode)
+
+        if self.max_age is not None:
+            try:
+                attrs = await sftp.stat(remote_file)
+            except Exception:
+                attrs = None  # missing remote file: never skip, check it
+            if (attrs is not None and attrs.mtime is not None
+                    and time.time() - attrs.mtime > self.max_age):
+                report.skipped += 1
+                return False
+
+        remote_digest, local_digest = await asyncio.gather(
+            remote_hash(self._pool.get_conn(), remote_file, algo=self.algo),
+            asyncio.get_running_loop().run_in_executor(
+                None, compute_file_hash, local_file, self.algo),
+        )
+
+        if remote_digest is None:
+            problem = ("missing", "not found on remote", "uploaded")
+        elif remote_digest != local_digest:
+            problem = ("corrupt",
+                       f"{self.algo} remote {remote_digest} != local {local_digest}",
+                       "re-uploaded")
+        else:
+            problem = None
+        if problem is not None:
+            kind, detail, fixed = problem
+            fix_label = None
+            if self.fix:
+                await write_file(sftp, local_file, remote_file)
+                # A repaired file must fully match the reference, mode
+                # included (a fresh upload gets server-default bits).
+                await sftp.chmod(remote_file, local_mode)
+                fix_label = fixed
+            report.add(kind, rel, detail, fix=fix_label)
+            if remote_digest is None and not self.fix:
+                return True  # nothing on the remote to compare modes against
+
         try:
             attrs = await sftp.stat(remote_file)
         except Exception:
-            attrs = None  # missing remote file: never skip, check it
-        if (attrs is not None and attrs.mtime is not None
-                and time.time() - attrs.mtime > max_age):
-            report.skipped += 1
-            return False
-
-    remote_digest, local_digest = await asyncio.gather(
-        remote_hash(pool.get_conn(), remote_file, algo=algo),
-        loop.run_in_executor(None, compute_file_hash, local_file, algo),
-    )
-
-    content_fixed = False
-    if remote_digest is None:
-        fix_label = None
-        if fix:
-            await write_file(sftp, local_file, remote_file)
-            # A repaired file must fully match the reference, mode
-            # included (a fresh upload gets server-default bits).
-            await sftp.chmod(remote_file, local_mode)
-            fix_label = "uploaded"
-            content_fixed = True
-        report.add("missing", rel, "not found on remote", fix=fix_label)
-    elif remote_digest != local_digest:
-        fix_label = None
-        if fix:
-            await write_file(sftp, local_file, remote_file)
-            await sftp.chmod(remote_file, local_mode)
-            fix_label = "re-uploaded"
-            content_fixed = True
-        report.add(
-            "corrupt", rel,
-            f"{algo} remote {remote_digest} != local {local_digest}",
-            fix=fix_label,
-        )
-
-    if remote_digest is None and not content_fixed:
-        return True  # nothing on the remote to compare permissions against
-
-    try:
-        attrs = await sftp.stat(remote_file)
-    except Exception:
-        return True
-    remote_mode = _stat.S_IMODE(attrs.permissions)
-    if fix_permissions is not None:
-        # Explicit target mode: enforce it on the remote copy.
-        if remote_mode != fix_permissions:
-            await sftp.chmod(remote_file, fix_permissions)
+            return True
+        remote_mode = _stat.S_IMODE(attrs.permissions)
+        if self.fix_permissions is not None:
+            # Explicit target mode: enforce it on the remote copy.
+            if remote_mode != self.fix_permissions:
+                await sftp.chmod(remote_file, self.fix_permissions)
+                report.add(
+                    "mode", rel,
+                    f"remote {remote_mode:o} != required {self.fix_permissions:o}",
+                    fix=f"chmod {self.fix_permissions:o}",
+                )
+        elif remote_mode != local_mode:
+            # Detection only: report drift against the local reference.
             report.add(
                 "mode", rel,
-                f"remote {remote_mode:o} != required {fix_permissions:o}",
-                fix=f"chmod {fix_permissions:o}",
+                f"remote {remote_mode:o} != local {local_mode:o}",
             )
-    elif remote_mode != local_mode:
-        # Detection only: report drift against the local reference.
-        report.add(
-            "mode", rel,
-            f"remote {remote_mode:o} != local {local_mode:o}",
-        )
-    return True
+        return True
 
 
 async def _check_ssh(
@@ -232,162 +220,141 @@ async def _check_ssh(
         The filled-in report; ``report.ok`` is False when unfixed
         discrepancies remain.
     """
-    user, host, remote_base = _parse_target(target)
-    source = os.path.expanduser(source)
-    remote_base = remote_base.rstrip("/")
-    # The local tree is the reference here: a missing or empty source is
-    # far more likely a typo or filesystem problem than a real dataset,
-    # and with --delete-extra it would classify the entire remote tree as
-    # extra. Refuse before touching anything.
-    if not os.path.isdir(source):
-        raise CheckFailedError(
-            f"reference {source} is not a directory — refusing to check"
-        )
-    console = make_console(quiet=quiet)
-    loop = asyncio.get_running_loop()
+    copy = _SSHCopy(
+        target, source, algo=algo, fix=fix, fix_permissions=fix_permissions,
+        max_age=max_age, ssh_port=ssh_port, ssh_key=ssh_key,
+        ssh_connections=ssh_connections, encryption_algs=encryption_algs,
+    )
+    return await check_copy(
+        source, copy,
+        f"{site or copy.host}:{copy.remote_base}",
+        broker_url=broker_url, name=name, delete_extra=delete_extra,
+        max_concurrent=max_concurrent, ssl_verify=ssl_verify,
+        on_monitor=on_monitor, quiet=quiet,
+    )
 
-    label = os.path.basename(source.rstrip("/")) or source
-    dest_label = f"{site}:{remote_base}" if site else f"{host}:{remote_base}"
-    if not quiet:
-        console.print(
-            f"Checking [yellow]{dest_label}[/yellow] against "
-            f"[yellow]{source}[/yellow]"
-        )
 
-    monitor_client: Client | None = None
-    if broker_url:
+async def _verify_ssh(
+    target: str,
+    expected,
+    *,
+    checksum: bool = False,
+    algo: str = "md5",
+    tally=None,
+    ssh_port: int = 22,
+    ssh_key: str | None = None,
+    ssh_connections: int = 2,
+    max_concurrent: int = 4,
+    encryption_algs: list[str] | None = None,
+) -> dict:
+    """Compare the SSH *target* against what is *expected* — read-only.
+
+    The comparison of ``check-files-ssh`` as a result instead of a report:
+    nothing is fixed or deleted, and nothing at *target* is not an error
+    (everything is then missing).
+
+    Parameters
+    ----------
+    target : str
+        ``[user@]host:/path`` — a directory or a single file.
+    expected : str, os.PathLike or Mapping[str, int]
+        A local reference (directory or single file), or a manifest
+        ``{relative_posix_path: size}``.  A single-file reference is the
+        one-entry manifest ``{basename: size}``; a single-file *target* is
+        compared as the manifest's only file.
+    checksum : bool
+        Also compare ``algo`` hashes of same-size files (needs a local
+        reference; ignored for a manifest).
+    tally : nexus_transfers._progress.Tally, optional
+        Advanced by the expected size of each file compared.
+
+    Returns
+    -------
+    dict
+        ``{"bytes", "files", "missing", "mismatched", "extra"}``: the totals
+        of what is at *target*, and sorted lists of relative paths.
+    """
+    from collections.abc import Mapping
+
+    user, host, remote_base = parse_ssh_target(target)
+    remote_base = remote_base.rstrip("/") or "/"
+    local_root: str | None = None
+    local_file: str | None = None
+    if isinstance(expected, Mapping):
+        manifest = {str(k): int(v) for k, v in expected.items()}
+    else:
+        ref = os.path.expanduser(os.fspath(expected))
+        if os.path.isdir(ref):
+            local_root = ref
+            manifest = await asyncio.get_running_loop().run_in_executor(
+                None, scan_local_files, ref)
+        elif os.path.isfile(ref):
+            local_file = ref
+            manifest = {os.path.basename(ref): os.path.getsize(ref)}
+        else:
+            raise FileNotFoundError(f"reference {ref} does not exist")
+    if tally is not None:
+        tally.bytes_total = sum(manifest.values())
+
+    async with SSHPool(host, ssh_port, user, ssh_key, ssh_connections,
+                       encryption_algs) as pool:
+        sftp = pool.get_sftp()
         try:
-            monitor_client = Client(
-                name, broker_url, dispatch={},
-                ssl_verify=ssl_verify, reconnect_retries=-1,
-            )
-            await monitor_client.connect()
-        except Exception as exc:
-            _logger.warning(
-                "Relay unavailable (%s), continuing without monitor", exc,
-            )
-            monitor_client = None
+            attrs = await sftp.stat(remote_base)
+        except Exception:                 # asyncssh.SFTPError: nothing there
+            attrs = None
+        single = attrs is not None and not _stat.S_ISDIR(attrs.permissions or 0)
+        if attrs is None:
+            remote: dict[str, int] = {}
+        elif single:
+            key = (next(iter(manifest)) if len(manifest) == 1
+                   else remote_base.rsplit("/", 1)[-1])
+            remote = {key: int(attrs.size or 0)}
+        else:
+            remote = dict(await walk_remote(sftp, remote_base))
 
-    async def _emit(message, status=None, **kw):
-        if monitor_client is not None:
-            try:
-                await monitor_client.monitor(message, status=status, **kw)
-            except Exception as exc:
-                _logger.warning("Failed to send monitor event: %s", exc)
-        if on_monitor is not None:
-            try:
-                await on_monitor(message, status=status, **kw)
-            except Exception as exc:
-                _logger.warning("on_monitor callback failed: %s", exc)
+        missing = sorted(set(manifest) - set(remote))
+        extra = sorted(set(remote) - set(manifest))
+        mismatched: list[str] = []
+        common = sorted(set(manifest) & set(remote))
+        for rel in missing:
+            if tally is not None:
+                tally.add(manifest[rel])
+        hash_it = checksum and (local_root is not None or local_file is not None)
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(max_concurrent)
 
-    await _emit(
-        f"{name}: starting check {dest_label} against {source}",
-        status="progress",
-    )
-
-    report = CheckReport(_emit, name, label)
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        _CountOrBytesColumn(),
-        _BinarySpeedColumn(),
-        TimeRemainingColumn(),
-        transient=True,
-        disable=quiet,
-    )
-    progress.start()
-    walk_task_id = progress.add_task(
-        f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
-    )
-    local_files = await loop.run_in_executor(None, scan_local_files, source)
-    if not local_files:
-        progress.stop()
-        raise CheckFailedError(
-            f"reference {source} contains no files — refusing to check "
-            "(wrong path or filesystem issue?)"
-        )
-    report.total = len(local_files)
-    progress.remove_task(walk_task_id)
-    check_task_id = progress.add_task(
-        f"[cyan]Checking {label}[/cyan]", total=len(local_files), unit="files",
-    )
-
-    try:
-        async with SSHPool(
-            host, ssh_port, user, ssh_key, ssh_connections, encryption_algs,
-        ) as pool:
-
-            # Bounded queue + workers rather than one task per file: zarr
-            # trees can hold 100k+ chunk files.
-            queue: asyncio.Queue = asyncio.Queue(maxsize=max_concurrent * 4)
-
-            async def _producer() -> None:
-                for rel in sorted(local_files):
-                    await queue.put(rel)
-                for _ in range(max_concurrent):
-                    await queue.put(None)
-
-            async def _worker() -> None:
-                while True:
-                    rel = await queue.get()
-                    if rel is None:
-                        return
-                    checked = await _check_one_ssh(
-                        pool, source, remote_base, rel, report,
-                        algo=algo, fix=fix, fix_permissions=fix_permissions,
-                        max_age=max_age, loop=loop,
+        async def _compare(rel: str) -> None:
+            if remote[rel] != manifest[rel]:
+                mismatched.append(rel)
+            elif hash_it:
+                local = local_file or os.path.join(local_root, rel)
+                remote_file = remote_base if single else f"{remote_base}/{rel}"
+                async with sem:
+                    remote_digest, local_digest = await asyncio.gather(
+                        remote_hash(pool.get_conn(), remote_file, algo=algo),
+                        loop.run_in_executor(None, compute_file_hash, local, algo),
                     )
-                    if checked:
-                        report.checked += 1
-                    progress.update(
-                        check_task_id,
-                        completed=report.checked + report.skipped,
-                    )
-                    await report.maybe_report()
+                if remote_digest != local_digest:
+                    mismatched.append(rel)
+            if tally is not None:
+                tally.add(manifest[rel])
 
-            await asyncio.gather(
-                _producer(), *[_worker() for _ in range(max_concurrent)],
-            )
+        await asyncio.gather(*[_compare(rel) for rel in common])
 
-            # Extra remote files (the local copy is the reference).
-            remote_files = await walk_remote(pool.get_sftp(), remote_base)
-            for rel, _size in sorted(remote_files):
-                if rel in local_files:
-                    continue
-                fix_label = None
-                detail = "not in the local reference"
-                if delete_extra:
-                    # Only ever delete whitelisted extras (failed-transfer
-                    # debris, _build/*); anything else is kept and reported.
-                    if is_deletable_extra(rel, local_files):
-                        try:
-                            await pool.get_sftp().remove(f"{remote_base}/{rel}")
-                            fix_label = "deleted"
-                        except Exception as exc:
-                            _logger.warning(
-                                "Could not delete extra remote file %s: %s",
-                                rel, exc,
-                            )
-                    else:
-                        detail += " (kept: not a deletable extra)"
-                report.add("extra", rel, detail, fix=fix_label)
-                await report.maybe_report()
-    finally:
-        progress.stop()
-
-    await report.final_report()
-    report.print_summary(console)
-
-    if monitor_client:
-        await monitor_client.close()
-    return report
+    return {
+        "bytes": sum(remote.values()),
+        "files": len(remote),
+        "missing": missing,
+        "mismatched": sorted(mismatched),
+        "extra": extra,
+    }
 
 
 def main() -> None:
     """CLI entry point for ``nexus-transfers check-files-ssh``."""
-    parser = argparse.ArgumentParser(
+    parser = CommandParser(
+        "check_files_ssh",
         description="Verify a remote SSH copy against the local reference "
                     "(hashes and permissions), optionally fixing it",
     )
@@ -397,87 +364,31 @@ def main() -> None:
         "--target", required=True,
         help="Remote copy to verify: [user@]host:/remote/path",
     )
-    parser.add_argument(
-        "--broker-url",
-        default=cli_default("broker_url", "check_files_ssh", default=None),
-        help="Relay WebSocket URL for monitoring (default: none — monitoring disabled)",
-    )
-    parser.add_argument(
-        "--name", default=cli_default("name", "check_files_ssh", default=None),
-        help="Client name on the relay (default: auto-generated)",
-    )
-    parser.add_argument(
-        "--site", default=cli_default("site", "check_files_ssh", default=None),
-        help="Site label for monitor messages",
-    )
-    parser.add_argument(
-        "--algo", default=cli_default("algo", "check_files_ssh", default="md5"),
-        help="Hash algorithm; the remote host needs <algo>sum (default: md5)",
-    )
-    parser.add_argument(
-        "--fix", action="store_true",
-        default=cli_default("fix", "check_files_ssh", default=False),
-        help="Re-upload corrupt or missing remote files instead of failing",
-    )
-    parser.add_argument(
+    parser.monitor_options()
+    parser.option("--algo", default="md5",
+                  help="Hash algorithm; the remote host needs <algo>sum "
+                       "(default: md5)")
+    parser.option("--fix", action="store_true",
+                  help="Re-upload corrupt or missing remote files instead of "
+                       "failing")
+    parser.option(
         "--delete-extra", action="store_true",
-        default=cli_default("delete_extra", "check_files_ssh", default=False),
         help="Delete whitelisted extra remote files: failed-transfer "
              "leftovers (<base>.<hex>.tmp with <base> in the local "
              "reference) and files under _build/; other extras are only "
              "reported, never deleted",
     )
-    parser.add_argument(
-        "--fix-permissions", metavar="MODE", type=_parse_mode,
-        default=cli_default("fix_permissions", "check_files_ssh", default=None,
-                            type_fn=_parse_mode),
-        help="Octal permission bits to enforce on every remote file "
-             "(e.g. 600); without this option drift is only reported",
-    )
-    parser.add_argument(
-        "--max-concurrent", type=int,
-        default=cli_default("max_concurrent", "check_files_ssh", default=4,
-                            type_fn=int),
-        help="Maximum parallel file checks (default: 4)",
-    )
-    parser.add_argument(
-        "--ssh-port", type=int,
-        default=cli_default("ssh_port", "check_files_ssh", default=22,
-                            type_fn=int),
-        help="SSH port (default: 22)",
-    )
-    parser.add_argument(
-        "--ssh-key",
-        default=cli_default("ssh_key", "check_files_ssh", default=None),
-        help="Path to SSH private key",
-    )
-    parser.add_argument(
-        "--ssh-connections", type=int,
-        default=cli_default("ssh_connections", "check_files_ssh", default=2,
-                            type_fn=int),
-        help="Number of SSH connections to open (default: 2)",
-    )
-    parser.add_argument(
-        "--max-age", metavar="AGE", type=_parse_age,
-        default=cli_default("max_age", "check_files_ssh", default=None,
-                            type_fn=_parse_age),
-        help="Only check remote files modified within AGE — e.g. 30d, 1h, "
-             "45m, 4 (seconds); older files are skipped (default: check all)",
-    )
-    parser.add_argument(
-        "--cipher", nargs="+", default=None, metavar="ALG",
-        help="SSH cipher preference list (default: aes128-gcm@openssh.com first)",
-    )
-    parser.add_argument(
-        "--no-verify", action="store_true",
-        default=cli_default("no_verify", "check_files_ssh", default=False),
-        help="Skip TLS verification for the relay connection",
-    )
-    parser.add_argument(
-        "--debug", action="store_true",
-        default=cli_default("debug", "check_files_ssh", default=False),
-        help="Enable debug logging",
-    )
+    parser.option("--fix-permissions", metavar="MODE", type=_parse_mode,
+                  help="Octal permission bits to enforce on every remote file "
+                       "(e.g. 600); without this option drift is only reported")
+    parser.option("--max-concurrent", type=int, default=4,
+                  help="Maximum parallel file checks (default: 4)")
+    parser.ssh_options()
+    parser.option("--max-age", metavar="AGE", type=_parse_age,
+                  help="Only check remote files modified within AGE — e.g. "
+                       "30d, 1h, 45m, 4 (seconds); older files are skipped "
+                       "(default: check all)")
+    parser.debug_option()
     args = parser.parse_args()
 
     setup_cli_logging(debug=args.debug)
@@ -487,32 +398,26 @@ def main() -> None:
     prefix = f"{args.site}-" if args.site else ""
     name = args.name or f"{prefix}{uuid.uuid4().hex[:8]}-check-ssh"
 
-    try:
-        report = asyncio.run(
-            _check_ssh(
-                source=args.source,
-                target=args.target,
-                broker_url=args.broker_url,
-                name=name,
-                site=args.site,
-                algo=args.algo,
-                fix=args.fix,
-                delete_extra=args.delete_extra,
-                fix_permissions=args.fix_permissions,
-                max_concurrent=args.max_concurrent,
-                ssh_port=args.ssh_port,
-                ssh_key=args.ssh_key,
-                ssh_connections=args.ssh_connections,
-                ssl_verify=not args.no_verify,
-                encryption_algs=args.cipher,
-                max_age=args.max_age,
-            )
+    run_check(
+        _check_ssh(
+            source=args.source,
+            target=args.target,
+            broker_url=args.broker_url,
+            name=name,
+            site=args.site,
+            algo=args.algo,
+            fix=args.fix,
+            delete_extra=args.delete_extra,
+            fix_permissions=args.fix_permissions,
+            max_concurrent=args.max_concurrent,
+            ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key,
+            ssh_connections=args.ssh_connections,
+            ssl_verify=not args.no_verify,
+            encryption_algs=args.cipher,
+            max_age=args.max_age,
         )
-    except CheckFailedError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(2)
-    if not report.ok:
-        sys.exit(1)
+    )
 
 
 if __name__ == "__main__":

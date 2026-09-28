@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nexus_transfers.copy_ssh import _list_local, _parse_target
-from nexus_transfers.ssh import SSHPool, stat_remote, write_file
+from nexus_transfers.copy_ssh import _list_local
+from nexus_transfers.ssh import SSHPool, parse_ssh_target, stat_remote, write_file
 
 
 # ---------------------------------------------------------------------------
@@ -20,16 +20,16 @@ from nexus_transfers.ssh import SSHPool, stat_remote, write_file
     ("user@host:/deep/nested/dir", ("user", "host", "/deep/nested/dir")),
 ])
 def test_parse_target_valid(target, expected):
-    assert _parse_target(target) == expected
+    assert parse_ssh_target(target) == expected
 
 
 def test_parse_target_no_colon():
     with pytest.raises(ValueError, match="Invalid target"):
-        _parse_target("host/path/no-colon")
+        parse_ssh_target("host/path/no-colon")
 
 
 def test_parse_target_no_user():
-    user, host, path = _parse_target("myhost:/data")
+    user, host, path = parse_ssh_target("myhost:/data")
     assert user is None
     assert host == "myhost"
     assert path == "/data"

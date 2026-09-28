@@ -1,25 +1,11 @@
-"""Unit tests for _DirectoryTransfer's remote walk (mocked client, no broker)."""
+"""Unit tests for the paged remote walk (mocked client, no broker)."""
 
-import asyncio
-
-from nexus_transfers.client._transfer import _DirectoryTransfer
-
-
-class _FakeProgress:
-    def add_task(self, *args, **kwargs):
-        return 1
-
-    def update(self, *args, **kwargs):
-        pass
-
-    def remove_task(self, *args, **kwargs):
-        pass
+from nexus_transfers.client._transfer import walk_peer_dir
 
 
 class _FakeClient:
     """Serves paginated list_dir results from an in-memory tree."""
 
-    _progress = _FakeProgress()
     peer_delay = 0.0
     name = "fake"
 
@@ -35,16 +21,13 @@ class _FakeClient:
 
 
 async def _walk(tree, root, tmp_path):
-    xfer = _DirectoryTransfer(
-        client=_FakeClient(tree), target="t", remote_path=root,
-        local_path=str(tmp_path / "out"), max_concurrent=4,
-        chunk_size=65536, use_s3=False, s3_prefix=None, track_bytes=False,
-    )
-    queue: asyncio.Queue = asyncio.Queue()
-    await xfer._walk_remote(root, str(tmp_path / "out"), queue)
     files = []
-    while not queue.empty():
-        files.append(queue.get_nowait()[0])
+    async for remote_file, local_file, rel, _ in walk_peer_dir(
+        _FakeClient(tree), "t", root, str(tmp_path / "out"), make_dirs=True,
+    ):
+        assert remote_file == f"{root}/{rel}"
+        assert local_file == str(tmp_path / "out" / rel)
+        files.append(remote_file)
     return files
 
 

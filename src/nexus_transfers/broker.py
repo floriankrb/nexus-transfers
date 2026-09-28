@@ -260,21 +260,13 @@ async def run_broker(host="localhost", port=8766):
 
 
 def main():
-    """CLI entry point for ``nexus-broker``."""
-    import argparse
+    """CLI entry point for ``nexus-transfers broker``."""
+    from nexus_transfers._cli import CommandParser
 
-    from nexus_transfers.config import cli_default
-
-    parser = argparse.ArgumentParser(description="Transfer relay broker")
-    parser.add_argument("--host",
-                        default=cli_default("host", "broker", default="localhost"),
-                        help="Bind address")
-    parser.add_argument("--port", type=int,
-                        default=cli_default("port", "broker", default=8766, type_fn=int),
-                        help="Bind port")
-    parser.add_argument("--debug", action="store_true",
-                        default=cli_default("debug", "broker", default=False),
-                        help="Enable debug logging")
+    parser = CommandParser("broker", description="Transfer relay broker")
+    parser.option("--host", default="localhost", help="Bind address")
+    parser.option("--port", type=int, default=8766, help="Bind port")
+    parser.debug_option()
     args = parser.parse_args()
     setup_cli_logging(debug=args.debug)
     asyncio.run(run_broker(args.host, args.port))

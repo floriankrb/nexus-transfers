@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** partly adopted — `server` → `broker` done (`nexus-transfers broker`, `--broker-url`); the peer-running subcommand is still called `server`; rename tracked in [../ROADMAP.md](../ROADMAP.md).
+
 # Naming Analysis
 
 The current architecture has:

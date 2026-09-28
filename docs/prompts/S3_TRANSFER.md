@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented — S3 staging is now the **default** (`--use-broker` opts out); the prefix is `<UTC ts>-<remote>-<local name>-<uuid4>`, not `<source>-<target>`. Reference: [docs/BACKENDS.md](../BACKENDS.md). `nexus-copy` / `nexus-client` are historical.
+
 
 we want to, optionally, use s3 as a staging space, so when copying a file, the initiater will call get_file with option use_s3 (add this option to the nexus-copy cli).
 

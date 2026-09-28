@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** partly implemented — monitor registration, broadcast, `connected`/`disconnected` events, `nexus-transfers monitor`, `on_monitor`. The full event schema (`task`, progress `uuid`/`start`/`update`/`minimum`) is not emitted; see [../ROADMAP.md](../ROADMAP.md). Reference: [docs/PROTOCOL.md](../PROTOCOL.md#monitor-events). `nexus-monitor` is historical.
+
 One or more client will be able to register as monitoring service.
 Each monitor messages (called events) will be broadcast to all monitoring services.
 No replies will be given to the monitoring messages.

@@ -1,10 +1,11 @@
 [Unit]
-Description=Nexus Transfers WebSocket Relay Server
+Description=Nexus Transfers WebSocket Broker
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=nexus-transfer broker --host 127.0.0.1 --port 8766
+# Absolute path: systemd does not search PATH for a bare command name.
+ExecStart=/home/cloud-user/nexus-transfers/.venv/bin/nexus-transfers broker --host 127.0.0.1 --port 8766
 Environment=PYTHON_GIL=0
 Restart=on-failure
 RestartSec=5

@@ -5,10 +5,77 @@ import logging
 import os
 
 from nexus_transfers._progress import _fmt_binary
+from nexus_transfers._run import run_workers
 from ._errors import PeerNotFoundError
 from ._io import _write_file
 
 _logger = logging.getLogger(__name__)
+
+
+_PAGE_SIZE = 1000
+
+
+async def walk_peer_dir(client, target, remote_path, local_path, *,
+                        include_size=False, make_dirs=False):
+    """Walk the directory *remote_path* of the peer *target* with paged
+    ``list_dir`` calls, yielding ``(remote_file, local_file, rel, size)``
+    for every file: *local_file* mirrors it under *local_path*, *rel* is its
+    POSIX path relative to *remote_path*, *size* is None unless
+    *include_size*.
+
+    Listing retries forever on :class:`PeerNotFoundError`,
+    :class:`ConnectionError` and :class:`asyncio.TimeoutError`, sleeping
+    ``client.peer_delay`` and emitting a ``warning`` monitor event.  With
+    *make_dirs*, the local directories are created along the way.
+    """
+
+    async def _page(path, offset):
+        while True:
+            try:
+                return await client.send(
+                    f"{target}.list_dir", path, include_size=include_size,
+                    offset=offset, limit=_PAGE_SIZE,
+                )
+            except (PeerNotFoundError, ConnectionError,
+                    asyncio.TimeoutError) as exc:
+                _logger.warning(
+                    "Listing %s failed (%s), retrying in %.1fs …",
+                    path, exc, client.peer_delay,
+                )
+                await client.monitor(
+                    f"{client.name}: listing {path} failed "
+                    f"({type(exc).__name__}), retrying …",
+                    status="warning",
+                )
+                await asyncio.sleep(client.peer_delay)
+
+    async def _walk(path, local, rel_prefix):
+        if make_dirs:
+            os.makedirs(local, exist_ok=True)
+        # Recurse only once the whole directory is paged in: a subdirectory
+        # can appear in any page, including a non-final one.
+        dirs = []
+        offset = 0
+        while True:
+            page = await _page(path, offset)
+            for entry in page:
+                name = entry["name"]
+                child = f"{path}/{name}" if path != "." else name
+                local_child = os.path.join(local, name)
+                rel = f"{rel_prefix}/{name}" if rel_prefix else name
+                if entry["type"] == "dir":
+                    dirs.append((child, local_child, rel))
+                else:
+                    yield child, local_child, rel, entry.get("size")
+            if len(page) < _PAGE_SIZE:
+                break
+            offset += len(page)
+        for child, local_child, rel in dirs:
+            async for item in _walk(child, local_child, rel):
+                yield item
+
+    async for item in _walk(remote_path, local_path, ""):
+        yield item
 
 
 class _DirectoryTransfer:
@@ -80,123 +147,52 @@ class _DirectoryTransfer:
             f"[cyan]Copying {self._label}[/cyan]",
             total=None, unit="files",
         )
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def _walk_and_enqueue():
+        async def _walk(put):
             nonlocal walk_task
-            await self._walk_remote(
-                self._remote_path, self._local_path, queue,
-                walk_task=walk_task,
-            )
-            for _ in range(self._max_concurrent):
-                await queue.put(None)
+            n = 0
+            async for remote_file, local_file, _, size in walk_peer_dir(
+                self._client, self._target, self._remote_path,
+                self._local_path, include_size=self._track_bytes,
+                make_dirs=True,
+            ):
+                n += 1
+                progress.update(walk_task, completed=n)
+                await put((remote_file, local_file, size))
             progress.remove_task(walk_task)
             walk_task = None
 
-        sem = asyncio.Semaphore(self._max_concurrent)
+        async def _copy(item):
+            remote_file, local_file, remote_size = item
 
-        async def _worker():
-            while True:
-                item = await queue.get()
-                if item is None:
-                    return
-                remote_file, local_file, remote_size = item
+            if self._should_skip(local_file, remote_size):
+                self._add_skip(local_file)
+                progress.update(
+                    copy_task,
+                    completed=self._done_count + self._skipped,
+                    description=(
+                        f"[cyan]Copying {self._label}[/cyan] "
+                        f"[dim]({self._skipped} skipped)[/dim]"
+                    ),
+                )
+                return
 
-                if self._should_skip(local_file, remote_size):
-                    self._add_skip(local_file)
-                    progress.update(
-                        copy_task,
-                        completed=self._done_count + self._skipped,
-                        description=(
-                            f"[cyan]Copying {self._label}[/cyan] "
-                            f"[dim]({self._skipped} skipped)[/dim]"
-                        ),
-                    )
-                    continue
-
-                async with sem:
-                    data = await self._transfer_file(remote_file, local_file)
-                    file_size = await self._save_file(data, local_file)
-                    self._total_bytes += file_size
-                    self._done_count += 1
-                    progress.update(
-                        copy_task,
-                        completed=self._done_count + self._skipped,
-                    )
-                    await self._maybe_report_progress()
+            data = await self._transfer_file(remote_file, local_file)
+            file_size = await self._save_file(data, local_file)
+            self._total_bytes += file_size
+            self._done_count += 1
+            progress.update(
+                copy_task,
+                completed=self._done_count + self._skipped,
+            )
+            await self._maybe_report_progress()
 
         try:
-            await asyncio.gather(
-                _walk_and_enqueue(),
-                *[_worker() for _ in range(self._max_concurrent)],
-            )
+            await run_workers(_walk, _copy, self._max_concurrent)
         finally:
             if walk_task is not None:
                 progress.remove_task(walk_task)
             progress.remove_task(copy_task)
         await self._print_summary()
-
-    # -- remote walk -------------------------------------------------------
-
-    async def _walk_remote(self, remote_path, local_path, queue,
-                           walk_task=None, _counter=None):
-        """Recursively walk and enqueue files as they are discovered."""
-        if _counter is None:
-            _counter = [0]
-        os.makedirs(local_path, exist_ok=True)
-        offset = 0
-        limit = 1000
-        dirs = []
-        while True:
-            page = await self._list_dir_with_retry(remote_path, offset=offset)
-            for entry in page:
-                name = entry["name"]
-                remote_child = (
-                    f"{remote_path}/{name}" if remote_path != "." else name
-                )
-                local_child = os.path.join(local_path, name)
-                if entry["type"] == "dir":
-                    dirs.append((remote_child, local_child))
-                else:
-                    _counter[0] += 1
-                    if walk_task is not None:
-                        self._client._progress.update(
-                            walk_task, completed=_counter[0],
-                        )
-                    await queue.put(
-                        (remote_child, local_child, entry.get("size"))
-                    )
-            if len(page) < limit:
-                break
-            offset += len(page)
-
-        for remote_child, local_child in dirs:
-            await self._walk_remote(
-                remote_child, local_child, queue,
-                walk_task=walk_task, _counter=_counter,
-            )
-
-    async def _list_dir_with_retry(self, remote_path, offset=0, limit=1000):
-        """Fetch a page of directory entries, retrying on transient errors."""
-        while True:
-            try:
-                return await self._client.send(
-                    f"{self._target}.list_dir", remote_path,
-                    include_size=self._track_bytes,
-                    offset=offset, limit=limit,
-                )
-            except (PeerNotFoundError, ConnectionError,
-                    asyncio.TimeoutError) as exc:
-                _logger.warning(
-                    "Listing %s failed (%s), retrying in %.1fs …",
-                    remote_path, exc, self._client.peer_delay,
-                )
-                await self._client.monitor(
-                    f"{self._client.name}: listing {remote_path} failed "
-                    f"({type(exc).__name__}), retrying …",
-                    status="warning",
-                )
-                await asyncio.sleep(self._client.peer_delay)
 
     # -- skip detection ----------------------------------------------------
 

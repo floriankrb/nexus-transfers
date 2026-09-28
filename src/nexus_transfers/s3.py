@@ -8,13 +8,13 @@ source and asks the source to delete the staged object.
 
 Configuration is read from the environment:
 
-* ``NEXUS_TRANSFER_S3_BUCKET`` – bucket name (**required on the sending
+* ``NEXUS_TRANSFERS_S3_BUCKET`` – bucket name (**required on the sending
   side**; the receiving side learns the bucket from the sender's reply).
-* ``NEXUS_TRANSFER_S3_ENDPOINT_URL`` – endpoint URL (optional, for non-AWS
+* ``NEXUS_TRANSFERS_S3_ENDPOINT_URL`` – endpoint URL (optional, for non-AWS
   S3-compatible services).
-* ``NEXUS_TRANSFER_S3_ACCESS_KEY_ID`` – access key (optional, falls back to
+* ``NEXUS_TRANSFERS_S3_ACCESS_KEY_ID`` – access key (optional, falls back to
   the standard AWS credential chain otherwise).
-* ``NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY`` – secret key (optional, ditto).
+* ``NEXUS_TRANSFERS_S3_SECRET_ACCESS_KEY`` – secret key (optional, ditto).
 """
 
 import hashlib
@@ -34,11 +34,11 @@ load_dotenv(Path.home() / ".env")
 
 logger = logging.getLogger(__name__)
 
-S3_BUCKET_ENV = "NEXUS_TRANSFER_S3_BUCKET"
-S3_ENDPOINT_ENV = "NEXUS_TRANSFER_S3_ENDPOINT_URL"
-S3_ACCESS_KEY_ENV = "NEXUS_TRANSFER_S3_ACCESS_KEY_ID"
-S3_SECRET_KEY_ENV = "NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY"
-S3_VHOST_ENV = "NEXUS_TRANSFER_S3_VIRTUAL_HOSTED_STYLE"
+S3_BUCKET_ENV = "NEXUS_TRANSFERS_S3_BUCKET"
+S3_ENDPOINT_ENV = "NEXUS_TRANSFERS_S3_ENDPOINT_URL"
+S3_ACCESS_KEY_ENV = "NEXUS_TRANSFERS_S3_ACCESS_KEY_ID"
+S3_SECRET_KEY_ENV = "NEXUS_TRANSFERS_S3_SECRET_ACCESS_KEY"
+S3_VHOST_ENV = "NEXUS_TRANSFERS_S3_VIRTUAL_HOSTED_STYLE"
 
 _STREAM_CHUNK = 1024 * 1024
 _MAX_RETRIES = 3
@@ -126,7 +126,7 @@ def _build_store_from_env(bucket_override: str | None = None):
     Parameters
     ----------
     bucket_override
-        If supplied, used as the bucket name and ``NEXUS_TRANSFER_S3_BUCKET``
+        If supplied, used as the bucket name and ``NEXUS_TRANSFERS_S3_BUCKET``
         is not consulted.  Used by the receiving side, which learns the
         bucket from the sender's reply rather than from its own environment.
     """
@@ -177,7 +177,7 @@ def get_store(bucket: str | None = None):
 
 
 def _env_prefix() -> str | None:
-    """Extract the prefix portion of ``NEXUS_TRANSFER_S3_BUCKET`` if any."""
+    """Extract the prefix portion of ``NEXUS_TRANSFERS_S3_BUCKET`` if any."""
     raw = resolve(S3_BUCKET_ENV, default=None)
     if not raw:
         return None
@@ -185,7 +185,7 @@ def _env_prefix() -> str | None:
 
 
 def _env_bucket() -> str:
-    """Return the bucket portion of ``NEXUS_TRANSFER_S3_BUCKET`` (or ``?``)."""
+    """Return the bucket portion of ``NEXUS_TRANSFERS_S3_BUCKET`` (or ``?``)."""
     raw = resolve(S3_BUCKET_ENV, default=None)
     if not raw:
         return "?"
@@ -340,7 +340,7 @@ def upload_file(
     Streams the file in chunks while updating the SHA-256 hash so the
     file is read from disk only once.  The bucket name is included in the
     return value so the receiving client can reach the object without
-    needing its own ``NEXUS_TRANSFER_S3_BUCKET``.
+    needing its own ``NEXUS_TRANSFERS_S3_BUCKET``.
 
     Parameters
     ----------
@@ -355,7 +355,7 @@ def upload_file(
         not used.
     bucket
         Bucket name (plain name or ``s3://bucket`` URI); when given it
-        overrides ``NEXUS_TRANSFER_S3_BUCKET``.
+        overrides ``NEXUS_TRANSFERS_S3_BUCKET``.
     """
     store = get_store(bucket=bucket)
     bucket = _normalise_bucket(bucket) if bucket else _env_bucket()
@@ -530,7 +530,7 @@ def delete(s3_key: str, *, bucket: str | None = None) -> None:
     s3_key
         Object key to delete.
     bucket
-        Bucket name override; None uses ``NEXUS_TRANSFER_S3_BUCKET``.
+        Bucket name override; None uses ``NEXUS_TRANSFERS_S3_BUCKET``.
     """
     store = get_store(bucket=bucket)
     try:

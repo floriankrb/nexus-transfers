@@ -40,14 +40,14 @@ def _idle_incumbent(name, url):
 
 async def test_claim_free_name_is_noop(broker):
     """Claiming a name nobody holds returns without killing anything."""
-    await claim_name("atos-transfer-T1", broker, kill_existing=True)
-    assert "atos-transfer-T1" not in await _names(broker)
+    await claim_name("nexus-location-T1", broker, kill_existing=True)
+    assert "nexus-location-T1" not in await _names(broker)
 
 async def test_claim_refuses_when_held_and_not_stealing(broker):
     """Without kill_existing, an incumbent makes the claim raise."""
-    async with Client("atos-transfer-T2", broker):
+    async with Client("nexus-location-T2", broker):
         with pytest.raises(NameTakenError):
-            await claim_name("atos-transfer-T2", broker, kill_existing=False)
+            await claim_name("nexus-location-T2", broker, kill_existing=False)
 
 async def test_no_broker_url_is_noop(broker):
     """A missing broker URL skips claiming (nothing to lock against)."""
@@ -55,7 +55,7 @@ async def test_no_broker_url_is_noop(broker):
 
 async def test_steal_displaces_incumbent(broker):
     """kill_existing soft-kills the holder, waits for it to drop, frees the name."""
-    name = "atos-transfer-T3"
+    name = "nexus-location-T3"
     proc = mp.get_context("fork").Process(
         target=_idle_incumbent, args=(name, broker), daemon=True,
     )
@@ -123,6 +123,6 @@ async def test_monitor_filter_matches_source():
     """The monitor --filter glob is plain fnmatch on the event source."""
     import fnmatch
 
-    assert fnmatch.fnmatch("atos-transfer-T9", "*-T9")
-    assert not fnmatch.fnmatch("atos-transfer-T8", "*-T9")
+    assert fnmatch.fnmatch("nexus-location-T9", "*-T9")
+    assert not fnmatch.fnmatch("nexus-location-T8", "*-T9")
     assert fnmatch.fnmatch("ewc-to-lumi-T9", "*-T9")

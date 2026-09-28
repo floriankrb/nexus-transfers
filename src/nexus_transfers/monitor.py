@@ -2,22 +2,20 @@
 
 Usage::
 
-    nexus-monitor --broker-url wss://example.com/transfers
-    nexus-monitor --filter '*-<task-id>'   # only events from matching clients
+    nexus-transfers monitor --broker-url wss://example.com/transfers
+    nexus-transfers monitor --filter 'nexus-location-<location_uuid>'   # only events from matching clients
 """
 
-import argparse
 import asyncio
 import fnmatch
-import logging
 import uuid
 from datetime import datetime
 
 from rich.console import Console
 
+from nexus_transfers._cli import CommandParser
 from nexus_transfers._progress import setup_cli_logging
 from nexus_transfers.client import _DEFAULT_URL, Client
-from nexus_transfers.config import cli_default
 
 _TYPE_STYLES = {
     "ok": "bold green",
@@ -89,58 +87,27 @@ def _fmt_bytes(n) -> str:
 
 
 def main():
-    """CLI entry point for ``nexus-monitor``."""
-    parser = argparse.ArgumentParser(
+    """CLI entry point for ``nexus-transfers monitor``."""
+    parser = CommandParser(
+        "monitor",
         description="Monitor service – prints broadcast monitoring events from all clients",
     )
-    parser.add_argument(
-        "--name",
-        default=cli_default("name", "monitor", default=f"monitor-{uuid.uuid4().hex[:6]}"),
-        help="Client name to register with (default: monitor-<random>)",
+    parser.option("--name", default=f"monitor-{uuid.uuid4().hex[:6]}",
+                  help="Client name to register with (default: monitor-<random>)")
+    parser.broker_options(
+        f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+        no_verify_help="Skip TLS certificate verification for wss:// connections",
     )
-    parser.add_argument(
-        "--broker-url",
-        default=cli_default("broker_url", "monitor", default=None),
-        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})",
-    )
-    parser.add_argument(
-        "--reconnect-retries",
-        type=int,
-        default=cli_default("reconnect_retries", "monitor", default=-1, type_fn=int),
-        help="Reconnection attempts on disconnect (-1 = infinite, default: -1)",
-    )
-    parser.add_argument(
-        "--reconnect-delay",
-        type=float,
-        default=cli_default("reconnect_delay", "monitor", default=2.0, type_fn=float),
-        help="Seconds between reconnection attempts (default: 2.0)",
-    )
-    parser.add_argument(
-        "--no-verify",
-        action="store_true",
-        default=cli_default("no_verify", "monitor", default=False),
-        help="Skip TLS certificate verification for wss:// connections",
-    )
-    parser.add_argument(
-        "--filter",
-        dest="source_filter",
-        default=cli_default("filter", "monitor", default=None),
-        metavar="PATTERN",
+    parser.reconnect_options()
+    parser.option(
+        "--filter", dest="source_filter", key="filter", metavar="PATTERN",
         help="Only show events whose source client name matches this "
-             "shell-style wildcard (fnmatch, e.g. '*-<task-id>'). The "
+             "shell-style wildcard (fnmatch, e.g. 'nexus-location-*'). The "
              "connected-client listing is filtered the same way.",
     )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output raw JSON events instead of formatted text",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        default=cli_default("debug", "monitor", default=False),
-        help="Enable debug logging",
-    )
+    parser.add_argument("--json", action="store_true",
+                        help="Output raw JSON events instead of formatted text")
+    parser.debug_option()
     args = parser.parse_args()
 
     setup_cli_logging(debug=args.debug)
@@ -164,9 +131,10 @@ async def _run_monitor(name, url, raw_json=False, source_filter=None,
 
     When ``source_filter`` is given, only events whose ``source`` (the client
     name that emitted them) matches the shell-style wildcard are shown. The
-    broker stays unaware of any "task" concept — keying client names on a task
-    id (e.g. ``"<site>-transfer-<task-id>"``) lets ``--filter '*-<task-id>'``
-    follow a single task.
+    broker stays unaware of what a name stands for — keying client names on
+    the unit of work (the Nexus client's ``"nexus-location-<location_uuid>"``)
+    lets ``--filter 'nexus-location-<location_uuid>'`` follow a single
+    transfer.
     """
 
     console = Console()

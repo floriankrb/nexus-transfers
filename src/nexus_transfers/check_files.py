@@ -1,7 +1,7 @@
 """CLI tool: verify a local copy against a remote nexus reference.
 
 The remote nexus client is the reference. The tree is walked exactly like
-``nexus-copy`` (paged ``list_dir``), but instead of downloading file content
+``nexus-transfers copy`` (paged ``list_dir``), but instead of downloading file content
 the remote computes a hash (``hash_file``) which is compared against a
 locally computed one.
 
@@ -18,13 +18,15 @@ import logging
 import os
 import re
 import stat as _stat
-import sys
 import time
 import uuid
+from typing import Protocol
 
 from rich.console import Console
 
-from nexus_transfers._progress import make_console, setup_cli_logging
+from nexus_transfers._cli import CommandParser, run_check
+from nexus_transfers._progress import make_console, make_progress, setup_cli_logging
+from nexus_transfers._run import Monitor, run_workers
 from nexus_transfers.client import (
     _DEFAULT_URL,
     Client,
@@ -32,7 +34,7 @@ from nexus_transfers.client import (
     RemoteError,
 )
 from nexus_transfers.client._io import _write_file
-from nexus_transfers.config import cli_default
+from nexus_transfers.client._transfer import walk_peer_dir
 from nexus_transfers.dispatch import compute_file_hash
 
 _logger = logging.getLogger(__name__)
@@ -282,6 +284,149 @@ class CheckReport:
             )
 
 
+async def report_extras(report, extras, reference_files, delete=None, *,
+                        detail: str = "not in the local reference") -> None:
+    """Report each of *extras*: relative paths absent from *reference_files*.
+
+    With *delete* (an async ``delete(rel)``), whitelisted extras
+    (:func:`is_deletable_extra`) are deleted; anything else is kept and
+    reported.  A failed deletion leaves the extra unfixed.
+    """
+    for rel in extras:
+        fix = None
+        why = detail
+        if delete is not None:
+            if is_deletable_extra(rel, reference_files):
+                try:
+                    await delete(rel)
+                    fix = "deleted"
+                except Exception as exc:
+                    _logger.warning("Could not delete extra file %s: %s",
+                                    rel, exc)
+            else:
+                why += " (kept: not a deletable extra)"
+        report.add("extra", rel, why, fix=fix)
+        await report.maybe_report()
+
+
+class CopyTarget(Protocol):
+    """The copy that :func:`check_copy` verifies against a local reference.
+
+    An async context manager (open connections on enter); relative paths are
+    POSIX paths under the copy's root.
+    """
+
+    async def list_files(self) -> set[str]:
+        """Relative paths of every file in the copy."""
+
+    async def check_one(self, rel: str, local_size: int,
+                        report: "CheckReport") -> bool:
+        """Compare one reference file with its copy, adding discrepancies
+        (and fixes) to *report*.  False when skipped (the target counts it
+        in ``report.skipped``)."""
+
+    async def delete(self, rel: str) -> None:
+        """Delete an extra file of the copy."""
+
+
+async def check_copy(
+    source: str,
+    target: CopyTarget,
+    dest_label: str,
+    *,
+    broker_url: str | None,
+    name: str,
+    delete_extra: bool = False,
+    max_concurrent: int = 4,
+    ssl_verify: bool = True,
+    on_monitor=None,
+    quiet: bool = False,
+) -> "CheckReport":
+    """Verify the copy *target* against the local reference *source*.
+
+    The body of ``check-files-ssh`` / ``check-files-s3``: every reference
+    file is compared (``target.check_one``), then the extras of the copy
+    are reported — and, with *delete_extra*, the whitelisted ones deleted
+    (:func:`report_extras`).  *dest_label* names the copy in messages.
+
+    Raises :class:`CheckFailedError` before touching anything when *source*
+    is not a directory or holds no files.
+
+    Returns the filled-in :class:`CheckReport`; ``report.ok`` is False when
+    unfixed discrepancies remain.
+    """
+    source = os.path.expanduser(source)
+    # The local tree is the reference here: a missing or empty source is
+    # far more likely a typo or filesystem problem than a real dataset,
+    # and with --delete-extra it would classify the entire copy as extra.
+    # Refuse before touching anything.
+    if not os.path.isdir(source):
+        raise CheckFailedError(
+            f"reference {source} is not a directory — refusing to check"
+        )
+    console = make_console(quiet=quiet)
+    loop = asyncio.get_running_loop()
+    label = os.path.basename(source.rstrip("/")) or source
+    console.print(
+        f"Checking [yellow]{dest_label}[/yellow] against "
+        f"[yellow]{source}[/yellow]"
+    )
+
+    async with await Monitor.connect(
+        name, broker_url, ssl_verify=ssl_verify, on_monitor=on_monitor,
+    ) as monitor:
+        await monitor.emit(
+            f"{name}: starting check {dest_label} against {source}",
+            status="progress",
+        )
+        report = CheckReport(monitor.emit, name, label)
+        progress = make_progress(quiet)
+        progress.start()
+        try:
+            walk_task = progress.add_task(
+                f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
+            )
+            local_files = await loop.run_in_executor(
+                None, scan_local_files, source,
+            )
+            if not local_files:
+                raise CheckFailedError(
+                    f"reference {source} contains no files — refusing to "
+                    "check (wrong path or filesystem issue?)"
+                )
+            async with target:
+                remote_files = await target.list_files()
+                report.total = len(local_files)
+                progress.remove_task(walk_task)
+                check_task = progress.add_task(
+                    f"[cyan]Checking {label}[/cyan]", total=len(local_files),
+                    unit="files",
+                )
+
+                async def _check(rel: str) -> None:
+                    if await target.check_one(rel, local_files[rel], report):
+                        report.checked += 1
+                    progress.update(
+                        check_task,
+                        completed=report.checked + report.skipped,
+                    )
+                    await report.maybe_report()
+
+                # Bounded queue: zarr trees can hold 100k+ chunk files.
+                await run_workers(sorted(local_files), _check, max_concurrent,
+                                  maxsize=max_concurrent * 4)
+                await report_extras(
+                    report, sorted(remote_files - set(local_files)),
+                    local_files, target.delete if delete_extra else None,
+                )
+        finally:
+            progress.stop()
+
+        await report.final_report()
+        report.print_summary(console)
+    return report
+
+
 def scan_local_files(root: str) -> dict[str, int]:
     """Walk *root* and return ``{relative_posix_path: size}`` for all files.
 
@@ -342,7 +487,7 @@ class _DirectoryCheck:
         Explicit permission bits (e.g. ``0o600``) to enforce on every local
         file. ``None`` (default) only reports drift against the reference.
     use_s3 : bool
-        Stage fix downloads through S3 (mirrors ``nexus-copy``).
+        Stage fix downloads through S3 (mirrors ``nexus-transfers copy``).
     s3_prefix : str or None
         S3 key prefix for fix downloads.
     chunk_size : int
@@ -387,42 +532,36 @@ class _DirectoryCheck:
         check_task = progress.add_task(
             f"[cyan]Checking {self._label}[/cyan]", total=None, unit="files",
         )
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def _walk_and_enqueue():
+        async def _walk(put):
             nonlocal walk_task
-            await self._walk_remote(
-                self._remote_path, self._local_path, "", queue, walk_task,
-            )
+            async for remote_file, local_file, rel, _ in walk_peer_dir(
+                self._client, self._target, self._remote_path,
+                self._local_path,
+            ):
+                self._walked += 1
+                self._remote_rel.add(rel)
+                progress.update(walk_task, completed=self._walked)
+                await put((remote_file, local_file, rel))
             self._report.total = self._walked
             progress.update(check_task, total=self._walked)
-            for _ in range(self._max_concurrent):
-                await queue.put(None)
             progress.remove_task(walk_task)
             walk_task = None
 
-        async def _worker():
-            while True:
-                item = await queue.get()
-                if item is None:
-                    return
-                remote_file, local_file, rel = item
-                if self._too_old(local_file):
-                    self._report.skipped += 1
-                else:
-                    await self._check_one(remote_file, local_file, rel)
-                    self._report.checked += 1
-                progress.update(
-                    check_task,
-                    completed=self._report.checked + self._report.skipped,
-                )
-                await self._report.maybe_report()
+        async def _check(item):
+            remote_file, local_file, rel = item
+            if self._too_old(local_file):
+                self._report.skipped += 1
+            else:
+                await self._check_one(remote_file, local_file, rel)
+                self._report.checked += 1
+            progress.update(
+                check_task,
+                completed=self._report.checked + self._report.skipped,
+            )
+            await self._report.maybe_report()
 
         try:
-            await asyncio.gather(
-                _walk_and_enqueue(),
-                *[_worker() for _ in range(self._max_concurrent)],
-            )
+            await run_workers(_walk, _check, self._max_concurrent)
         finally:
             if walk_task is not None:
                 progress.remove_task(walk_task)
@@ -440,57 +579,6 @@ class _DirectoryCheck:
 
         await self._scan_extras()
         await self._report.final_report()
-
-    # -- remote walk ---------------------------------------------------------
-
-    async def _walk_remote(self, remote_path, local_path, rel_prefix, queue,
-                           walk_task):
-        """Recursively walk the reference tree with paged ``list_dir`` calls."""
-        offset = 0
-        limit = 1000
-        dirs = []
-        while True:
-            page = await self._list_dir_with_retry(remote_path, offset=offset,
-                                                   limit=limit)
-            for entry in page:
-                name = entry["name"]
-                remote_child = (
-                    f"{remote_path}/{name}" if remote_path != "." else name
-                )
-                local_child = os.path.join(local_path, name)
-                rel = f"{rel_prefix}/{name}" if rel_prefix else name
-                if entry["type"] == "dir":
-                    dirs.append((remote_child, local_child, rel))
-                else:
-                    self._walked += 1
-                    self._remote_rel.add(rel)
-                    self._client._progress.update(
-                        walk_task, completed=self._walked,
-                    )
-                    await queue.put((remote_child, local_child, rel))
-            if len(page) < limit:
-                break
-            offset += len(page)
-
-        for remote_child, local_child, rel in dirs:
-            await self._walk_remote(remote_child, local_child, rel, queue,
-                                    walk_task)
-
-    async def _list_dir_with_retry(self, remote_path, offset=0, limit=1000):
-        """Fetch a page of directory entries, retrying on transient errors."""
-        while True:
-            try:
-                return await self._client.send(
-                    f"{self._target}.list_dir", remote_path,
-                    offset=offset, limit=limit,
-                )
-            except (PeerNotFoundError, ConnectionError,
-                    asyncio.TimeoutError) as exc:
-                _logger.warning(
-                    "Listing %s failed (%s), retrying in %.1fs …",
-                    remote_path, exc, self._client.peer_delay,
-                )
-                await asyncio.sleep(self._client.peer_delay)
 
     # -- per-file check ------------------------------------------------------
 
@@ -592,7 +680,7 @@ class _DirectoryCheck:
     # -- fixes ---------------------------------------------------------------
 
     async def _download(self, remote_file, local_file):
-        """Re-download one file from the reference (same path as nexus-copy)."""
+        """Re-download one file from the reference (same path as `nexus-transfers copy`)."""
         local_dir = os.path.dirname(local_file)
         if not local_dir:
             raise ValueError(
@@ -634,23 +722,14 @@ class _DirectoryCheck:
         local_files = await self._loop.run_in_executor(
             None, scan_local_files, self._local_path,
         )
-        for rel in sorted(set(local_files) - self._remote_rel):
-            fix = None
-            detail = "not on the reference"
-            if self._delete_extra:
-                # Only ever delete whitelisted extras (failed-transfer
-                # debris, _build/*); anything else is kept and reported.
-                if is_deletable_extra(rel, self._remote_rel):
-                    try:
-                        os.remove(os.path.join(self._local_path, rel))
-                        fix = "deleted"
-                    except OSError as exc:
-                        _logger.warning("Could not delete extra file %s: %s",
-                                        rel, exc)
-                else:
-                    detail += " (kept: not a deletable extra)"
-            self._report.add("extra", rel, detail, fix=fix)
-            await self._report.maybe_report()
+        async def _delete(rel):
+            os.remove(os.path.join(self._local_path, rel))
+
+        await report_extras(
+            self._report, sorted(set(local_files) - self._remote_rel),
+            self._remote_rel, _delete if self._delete_extra else None,
+            detail="not on the reference",
+        )
 
 
 async def check_files(name, broker_url, remote_client, source, target,
@@ -712,11 +791,7 @@ async def check_files(name, broker_url, remote_client, source, target,
     console = make_console(quiet=quiet)
     async with Client(name, broker_url, **client_kwargs) as client:
 
-        async def _emit(message, status=None, **kw):
-            await client.monitor(message, status=status, **kw)
-            if on_monitor is not None:
-                await on_monitor(message, status=status, **kw)
-
+        _emit = Monitor(client, on_monitor).emit
         dest_label = f"{site}:{target}" if site else target
         if not quiet:
             console.print(
@@ -751,7 +826,8 @@ async def check_files(name, broker_url, remote_client, source, target,
 
 def main() -> None:
     """CLI entry point for ``nexus-transfers check-files``."""
-    parser = argparse.ArgumentParser(
+    parser = CommandParser(
+        "check_files",
         description="Verify a local copy against a remote nexus reference "
                     "(hashes and permissions), optionally fixing it",
     )
@@ -761,95 +837,40 @@ def main() -> None:
     )
     parser.add_argument("source", help="Remote reference directory path")
     parser.add_argument("target", help="Local directory to verify")
-    parser.add_argument(
-        "--broker-url",
-        default=cli_default("broker_url", "check_files", default=None),
-        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+    parser.broker_options(
+        f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+        name_help="Client name (default: auto-generated)",
+        site_help="Site label used in the auto-generated client name",
+        no_verify_help="Skip TLS certificate verification for wss:// "
+                       "connections",
     )
-    parser.add_argument(
-        "--name", default=cli_default("name", "check_files", default=None),
-        help="Client name (default: auto-generated)",
-    )
-    parser.add_argument(
-        "--site", default=cli_default("site", "check_files", default=None),
-        help="Site label used in the auto-generated client name",
-    )
-    parser.add_argument(
-        "--algo", default=cli_default("algo", "check_files", default="md5"),
-        help="Hash algorithm (default: md5)",
-    )
-    parser.add_argument(
-        "--fix", action="store_true",
-        default=cli_default("fix", "check_files", default=False),
-        help="Re-download corrupt or missing files instead of failing",
-    )
-    parser.add_argument(
+    parser.option("--algo", default="md5", help="Hash algorithm (default: md5)")
+    parser.option("--fix", action="store_true",
+                  help="Re-download corrupt or missing files instead of failing")
+    parser.option(
         "--delete-extra", action="store_true",
-        default=cli_default("delete_extra", "check_files", default=False),
         help="Delete whitelisted extra local files: failed-transfer "
              "leftovers (<base>.<hex>.tmp with <base> on the reference) "
              "and files under _build/; other extras are only reported, "
              "never deleted",
     )
-    parser.add_argument(
-        "--fix-permissions", metavar="MODE", type=_parse_mode,
-        default=cli_default("fix_permissions", "check_files", default=None,
-                            type_fn=_parse_mode),
-        help="Octal permission bits to enforce on every local file "
-             "(e.g. 600); without this option drift is only reported",
-    )
-    parser.add_argument(
-        "--max-concurrent", type=int,
-        default=cli_default("max_concurrent", "check_files", default=4,
-                            type_fn=int),
-        help="Maximum parallel file checks (default: 4)",
-    )
-    parser.add_argument(
-        "--max-age", metavar="AGE", type=_parse_age,
-        default=cli_default("max_age", "check_files", default=None,
-                            type_fn=_parse_age),
-        help="Only check local files modified within AGE — e.g. 30d, 1h, "
-             "45m, 4 (seconds); older files are skipped (default: check all)",
-    )
-    parser.add_argument(
-        "--use-broker", action="store_true",
-        default=cli_default("use_broker", "check_files", default=False),
-        help="Fix downloads via the WebSocket relay instead of S3 staging",
-    )
-    parser.add_argument(
-        "--chunk-size", type=int,
-        default=cli_default("chunk_size", "check_files", default=65536,
-                            type_fn=int),
-        help="Binary chunk size for fix downloads via the relay (default: 65536)",
-    )
-    parser.add_argument(
-        "--peer-retries", type=int,
-        default=cli_default("peer_retries", "check_files", default=-1,
-                            type_fn=int),
-        help="Retries when target peer is not found (-1 = infinite, default: -1)",
-    )
-    parser.add_argument(
-        "--peer-delay", type=float,
-        default=cli_default("peer_delay", "check_files", default=2.0,
-                            type_fn=float),
-        help="Seconds between peer-not-found retries (default: 2.0)",
-    )
-    parser.add_argument(
-        "--call-timeout", type=float,
-        default=cli_default("call_timeout", "check_files", default=None,
-                            type_fn=float),
-        help="Timeout in seconds for RPC calls (default: no timeout)",
-    )
-    parser.add_argument(
-        "--no-verify", action="store_true",
-        default=cli_default("no_verify", "check_files", default=False),
-        help="Skip TLS certificate verification for wss:// connections",
-    )
-    parser.add_argument(
-        "--debug", action="store_true",
-        default=cli_default("debug", "check_files", default=False),
-        help="Enable debug logging",
-    )
+    parser.option("--fix-permissions", metavar="MODE", type=_parse_mode,
+                  help="Octal permission bits to enforce on every local file "
+                       "(e.g. 600); without this option drift is only reported")
+    parser.option("--max-concurrent", type=int, default=4,
+                  help="Maximum parallel file checks (default: 4)")
+    parser.option("--max-age", metavar="AGE", type=_parse_age,
+                  help="Only check local files modified within AGE — e.g. "
+                       "30d, 1h, 45m, 4 (seconds); older files are skipped "
+                       "(default: check all)")
+    parser.option("--use-broker", action="store_true",
+                  help="Fix downloads via the WebSocket relay instead of S3 "
+                       "staging")
+    parser.option("--chunk-size", type=int, default=65536,
+                  help="Binary chunk size for fix downloads via the relay "
+                       "(default: 65536)")
+    parser.peer_options()
+    parser.debug_option()
     args = parser.parse_args()
 
     setup_cli_logging(debug=args.debug)
@@ -859,35 +880,29 @@ def main() -> None:
     prefix = f"{args.site}-" if args.site else ""
     name = args.name or f"{prefix}{uuid.uuid4().hex[:8]}-check"
 
-    try:
-        report = asyncio.run(
-            check_files(
-                name=name,
-                broker_url=args.broker_url,
-                remote_client=args.remote_client,
-                source=args.source,
-                target=args.target,
-                site=args.site,
-                max_concurrent=args.max_concurrent,
-                algo=args.algo,
-                fix=args.fix,
-                delete_extra=args.delete_extra,
-                fix_permissions=args.fix_permissions,
-                use_s3=not args.use_broker,
-                chunk_size=args.chunk_size,
-                max_age=args.max_age,
-                reconnect_retries=-1,
-                peer_retries=args.peer_retries,
-                peer_delay=args.peer_delay,
-                call_timeout=args.call_timeout,
-                ssl_verify=not args.no_verify,
-            )
+    run_check(
+        check_files(
+            name=name,
+            broker_url=args.broker_url,
+            remote_client=args.remote_client,
+            source=args.source,
+            target=args.target,
+            site=args.site,
+            max_concurrent=args.max_concurrent,
+            algo=args.algo,
+            fix=args.fix,
+            delete_extra=args.delete_extra,
+            fix_permissions=args.fix_permissions,
+            use_s3=not args.use_broker,
+            chunk_size=args.chunk_size,
+            max_age=args.max_age,
+            reconnect_retries=-1,
+            peer_retries=args.peer_retries,
+            peer_delay=args.peer_delay,
+            call_timeout=args.call_timeout,
+            ssl_verify=not args.no_verify,
         )
-    except CheckFailedError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(2)
-    if not report.ok:
-        sys.exit(1)
+    )
 
 
 if __name__ == "__main__":

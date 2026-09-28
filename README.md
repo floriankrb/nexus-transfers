@@ -2,6 +2,25 @@
 
 WebSocket relay broker with named RPC routing, binary file transfer, and recursive directory sync.
 
+A single script, `nexus-transfers <command>`. The broker routes frames
+between named peers; peers expose RPCs (`list_dir`, `get_file`,
+`hash_file`, …) and move bytes over the relay, through S3 staging, or
+directly over SSH / S3.
+
+Further reading:
+
+| Doc | Content |
+|-----|---------|
+| [docs/USAGE.md](docs/USAGE.md) | Guide: SSH and S3 copy, S3 staging, integrity checks, locks, kill, monitoring |
+| [docs/CLI.md](docs/CLI.md) | Every command and flag |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Precedence, environment variables, `[nexus]` settings tables, broker URL resolution |
+| [docs/PYTHON_API.md](docs/PYTHON_API.md) | `Client`, the transfer API (`nexus_transfers.api`), progress callbacks |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Frame layout, messages, pending calls, name locks, RPCs, checksums, monitor events |
+| [docs/BACKENDS.md](docs/BACKENDS.md) | Relay, S3 staging, SSH push, direct S3: data paths, resume, atomic writes |
+| [docs/CHECK_FILES.md](docs/CHECK_FILES.md) | `check-files`, `check-files-ssh`, `check-files-s3` |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Open items |
+| [docs/prompts/](docs/prompts/README.md) | The design prompts (history) |
+
 ## Installation
 
 Requires Python ≥ 3.12.
@@ -24,7 +43,7 @@ nexus-transfers broker --port 8766
 nexus-transfers server --name a --broker-url ws://localhost:8766 --allow-path /path/to/share
 ```
 
-`--allow-path` can be repeated to expose multiple directories for `get_file` and `list_dir` operations. Without it, only built-in RPC functions (`adder`, `echo`) are available.
+`--allow-path` can be repeated to expose multiple directories for `get_file`, `list_dir` and `hash_file` operations. Without it, only built-in RPC functions (`adder`, `echo`) are available.
 
 ### 3. Call remote functions
 
@@ -45,175 +64,35 @@ clients
 quit
 ```
 
-## Python API
-
-```python
-import asyncio
-from nexus_transfers import Client
-
-async def main():
-    async with Client("my-client", url="ws://localhost:8766") as client:
-        # List connected clients
-        clients = await client.list_clients()
-
-        # Call a function on client "a"
-        result = await client.send("a.adder", 42)
-
-        # List a remote directory
-        entries = await client.send("a.list_dir", ".")
-
-        # Transfer a single file over the relay (returns bytes).
-        # Without use_s3=False the transfer is staged through S3, which
-        # requires NEXUS_TRANSFER_S3_BUCKET to be set on the remote side.
-        data = await client.send("a.get_file", "data.bin", use_s3=False)
-
-        # Recursively copy a remote directory (resumes interrupted
-        # transfers).  Staged through S3 by default; pass use_s3=False to
-        # send the data over the relay instead.
-        await client.get_directory("a", "src", "./local-copy")
-
-asyncio.run(main())
-```
-
-### Serving files
-
-Pass `allowed_paths` to expose directories for `get_file` and `list_dir`:
-
-```python
-async with Client("worker", allowed_paths=["/data", "/models"]) as client:
-    await asyncio.Future()  # keep running
-```
-
-### Calling `copy` and `copy-ssh` from Python
-
-Both CLI commands have importable async counterparts:
-
-```python
-from nexus_transfers.copy import copy
-from nexus_transfers.copy_ssh import _copy_to_ssh
-
-# Equivalent to: nexus-transfers copy --from a /remote/src ./local-copy
-asyncio.run(copy(
-    name="my-copy",
-    broker_url="ws://localhost:8766",
-    remote_client="a",
-    source="/remote/src",
-    target="./local-copy",
-    max_concurrent=4,
-    use_s3=True,
-    track_bytes=False,
-))
-
-# Equivalent to: nexus-transfers copy-ssh --source /data --target user@host:/remote
-asyncio.run(_copy_to_ssh(
-    source="/data",
-    target="user@host:/remote",
-    broker_url="ws://localhost:8766",  # None to skip monitoring
-    name="my-ssh-copy",
-    site=None,
-    max_concurrent=4,
-    ssh_port=22,
-    ssh_key=None,
-    ssh_connections=2,
-    track_bytes=False,
-    ssl_verify=True,
-))
-```
-
-### Progress callbacks
-
-The relay broadcasts a progress event roughly every 30 seconds during a copy.
-Register a monitoring client with `on_monitor_event` to receive these events:
-
-```python
-def on_progress(event: dict) -> None:
-    # event keys: type, message, source, date
-    # type is "progress", "ok", "error", or "info"
-    print(event["source"], event["message"])
-
-async with Client("monitor", url="ws://localhost:8766",
-                  on_monitor_event=on_progress) as monitor:
-    await monitor.register_monitor()
-    await asyncio.Future()  # keep receiving events
-```
-
-You can also set the handler after construction:
-
-```python
-client.on_monitor_event = my_callback
-```
-
-Or pass it to `register_monitor`:
-
-```python
-await client.register_monitor(callback=my_callback)
-```
-
-## Direct SSH copy (no relay required)
-
-`nexus-transfers copy-ssh` copies a local directory straight to a remote host over
-SFTP.  No `nexus-transfers server` on the remote side, no S3, no relay for data — the
-relay is used only to send progress messages to a monitor peer.
-
-```
-Local filesystem ──► nexus-transfers copy-ssh ──► SFTP ──► SSH target
-                                   │
-                                   └──► relay ──► monitor (progress only)
-```
+### 4. Copy and watch
 
 ```bash
-nexus-transfers copy-ssh \
-    --source /data/dataset.zarr \
-    --target user@host:/remote/path \
-    --broker-url wss://relay.example.com \
-    --max-concurrent 8 \
-    --ssh-connections 2
+nexus-transfers monitor --broker-url ws://localhost:8766          # terminal 1
+nexus-transfers copy --from a /path/to/share/dir ./local-copy --use-broker
 ```
 
-Interrupted transfers resume automatically: a file is skipped when its remote
-size already matches the local size.
+## Commands
 
-## Direct S3 copy (no relay required)
+| Command | Runs | Purpose |
+|---------|------|---------|
+| `broker` | forever | WebSocket relay broker |
+| `monitor` | forever | Register as monitor, print broadcast events |
+| `server` | forever | Run a peer serving RPCs (headless, or `--interactive`) |
+| `copy` | once | Copy a remote peer's directory to local (S3 staging, or relay with `--use-broker`) |
+| `copy-ssh` | once | Push a local file/directory to `[user@]host:/path` over SFTP |
+| `copy-to-s3` | once | Local file/directory → `s3://bucket[/prefix]` |
+| `copy-from-s3` | once | `s3://bucket/key-or-prefix` → local |
+| `check` | once | Diagnose configuration: S3 credentials round-trip (`--s3`), site broker (`--site`) |
+| `check-files` | once | Verify a local copy against a remote peer's reference |
+| `check-files-ssh` | once | Verify a remote SSH copy against the local reference |
+| `check-files-s3` | once | Verify an S3 copy against the local reference |
+| `kill` | once | Kill connected clients by name / wildcard, or `--all` |
 
-`nexus-transfers copy-to-s3` and `nexus-transfers copy-from-s3` copy a local
-file or directory straight to/from an S3 bucket using the
-`NEXUS_TRANSFER_S3_*` credentials (the `s3://bucket/...` argument overrides
-only the bucket name). No peer or relay is involved in the data path — as
-with `copy-ssh`, the relay is used only for optional progress monitoring.
-
-```bash
-nexus-transfers copy-to-s3 \
-    --source /data/dataset.zarr \
-    --target s3://my-bucket/datasets/dataset.zarr
-
-nexus-transfers copy-from-s3 \
-    --source s3://my-bucket/datasets/dataset.zarr \
-    --target /data/dataset.zarr
-```
-
-Interrupted transfers resume automatically (files whose size already matches
-are skipped). Empty directories are not represented on S3, so they are not
-recreated on download.
-
-## Integrity check
-
-`nexus-transfers check-files` verifies a local copy against a remote nexus
-reference (hashes are computed on each side; no file content is transferred),
-and `nexus-transfers check-files-ssh` verifies a remote SSH copy against the
-local reference. Both detect corruption, missing files, extra files and
-permission drift, exit non-zero on unfixed discrepancies, and can repair with
-`--fix`, `--delete-extra` and `--fix-permissions MODE` (explicit octal mode,
-e.g. `600`). See [CHECK_FILES.md](CHECK_FILES.md).
-
-`nexus-transfers check-files-s3` verifies an S3 copy against the local
-reference: sizes are compared by default (one bucket listing, no data
-transfer); `--hash md5` streams every object back and compares digests.
-
-```bash
-nexus-transfers check-files --from a /remote/path ./local-path --fix
-nexus-transfers check-files-ssh --source /data --target user@host:/remote --fix
-nexus-transfers check-files-s3 --source /data --target s3://bucket/prefix --fix
-```
+`nexus-transfers <command> --help` lists every flag; the full reference is
+[docs/CLI.md](docs/CLI.md), worked examples are in
+[docs/USAGE.md](docs/USAGE.md), settings in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) and the Python API in
+[docs/PYTHON_API.md](docs/PYTHON_API.md).
 
 ## Features
 
@@ -222,124 +101,26 @@ nexus-transfers check-files-s3 --source /data --target s3://bucket/prefix --fix
 - **Binary file transfer** — files are sent as raw binary WebSocket frames (no base64), chunked with rich progress bars
 - **S3 staging (default)** — transfers are staged through an S3-compatible bucket; pass `use_s3=False` (or `--use-broker` to `nexus-transfers copy`) to send the data over the WebSocket relay instead
 - **SHA-256 checksums** — computed incrementally during transfer and verified on completion
-- **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers by comparing file sizes
+- **Recursive directory sync** — `get_directory` walks the remote tree and downloads files in parallel (configurable concurrency), resuming interrupted transfers
+- **Atomic writes** — every download / upload goes to `<name>.<8hex>.tmp` and is renamed into place
 - **Direct SSH copy** — `nexus-transfers copy-ssh` uploads a local directory via SFTP without any relay involvement in the data path
 - **Direct S3 copy** — `nexus-transfers copy-to-s3` / `copy-from-s3` move a local file or directory to/from an S3 bucket without any peer or relay
-- **Path security** — `get_file` and `list_dir` validate paths against an allow-list using `realpath`; `..` traversal is rejected
+- **Integrity check** — `check-files*` compare hashes / sizes against a reference and repair
+- **Dead-peer detection** — the broker errors pending calls when the callee disconnects
+- **Name locks** — unique names double as a distributed mutex (`--steal`, `api.push_ssh(lock=…)`)
+- **Path security** — `get_file`, `list_dir` and `hash_file` validate paths against an allow-list using `realpath`; `..` traversal is rejected
 - **Client discovery** — `list_clients` (or `clients` in the interactive prompt) returns all connected client names
 
-## S3 staging
+## Deployment
 
-S3 staging is the **default** transfer mode. Configure on the providing
-client (the receiving side learns the bucket name from the provider's
-reply):
+`etc/nexus-transfers.service` is a sample systemd user unit for the broker.
+Copy it to `~/.config/systemd/user/` and point `ExecStart` at your own
+checkout — systemd does not search `PATH`, so the venv's absolute path is
+required:
 
-```bash
-export NEXUS_TRANSFER_S3_BUCKET=my-bucket
-export NEXUS_TRANSFER_S3_ENDPOINT_URL=https://s3.example.com   # optional
-export NEXUS_TRANSFER_S3_ACCESS_KEY_ID=...                     # optional
-export NEXUS_TRANSFER_S3_SECRET_ACCESS_KEY=...                 # optional
+```ini
+ExecStart=/path/to/nexus-transfers/.venv/bin/nexus-transfers broker --host 127.0.0.1 --port 8766
 ```
 
-Then:
-
-```bash
-nexus-transfers copy --from a /remote/path ./local-path
-```
-
-To bypass S3 and send the data over the WebSocket relay instead:
-
-```bash
-nexus-transfers copy --from a /remote/path ./local-path --use-broker
-```
-
-Flow: provider uploads → returns key/size/sha256 → initiator downloads
-from S3 → initiator tells provider to delete the staged object. The file
-on the provider's disk is untouched.
-
-## CLI reference
-
-### `nexus-transfers broker`
-
-| Flag     | Default     | Description   |
-|----------|-------------|---------------|
-| `--host` | `localhost` | Bind address  |
-| `--port` | `8766`      | Bind port     |
-
-### `nexus-transfers server`
-
-| Flag            | Default                  | Description                                      |
-|-----------------|--------------------------|--------------------------------------------------|
-| `--name`        | (required)               | Unique client ID                                 |
-| `--broker-url`  | `ws://localhost:8766`    | Broker WebSocket URL                             |
-| `--allow-path`  | (none)                   | Directory to expose for file operations (repeatable) |
-| `--interactive` | off                      | Start an interactive prompt instead of a headless worker |
-
-### `nexus-transfers copy`
-
-| Flag               | Default               | Description                                            |
-|--------------------|-----------------------|--------------------------------------------------------|
-| `--from`           | (required)            | Name of the remote client                              |
-| `source target`    | (required)            | Remote source dir, local target dir                    |
-| `--broker-url`     | `ws://localhost:8766` | Broker WebSocket URL                                   |
-| `--max-concurrent` | `4`                   | Maximum parallel file transfers                        |
-| `--chunk-size`     | `65536`               | Binary chunk size (only used with `--use-broker`)      |
-| `--use-broker`     | off                   | Send data over the relay instead of S3 staging (S3 is the default and needs `NEXUS_TRANSFER_S3_*`) |
-
-### `nexus-transfers copy-ssh`
-
-| Flag               | Default                | Description                                         |
-|--------------------|------------------------|-----------------------------------------------------|
-| `--source`         | (required)             | Local directory to copy                             |
-| `--target`         | (required)             | `[user@]host:/remote/path`                          |
-| `--broker-url`     | (none — monitoring disabled) | Relay URL for monitoring only (optional)      |
-| `--name`           | auto-generated         | Client name on the relay                            |
-| `--site`           | (none)                 | Site label for monitor messages                     |
-| `--max-concurrent` | `4`                    | Number of parallel SFTP uploads                     |
-| `--ssh-port`       | `22`                   | SSH port on the target host                         |
-| `--ssh-key`        | SSH agent / default    | Path to private key file                            |
-| `--ssh-connections`| `2`                    | Number of SSH connections to open (see note below)  |
-| `--size`           | off                    | Show byte-based progress instead of file count      |
-| `--no-verify`      | off                    | Skip TLS verification for the relay connection      |
-| `--debug`          | off                    | Enable debug logging                                |
-
-**`--ssh-connections` vs `--max-concurrent`**: `--ssh-connections` controls how
-many TCP connections are opened to the SSH server.  Each connection carries one
-SFTP session, and the `--max-concurrent` upload workers are distributed across
-those sessions in round-robin order.  Opening more than one connection lets
-multiple SFTP sessions run in parallel, which can saturate bandwidth that a
-single SSH connection cannot fully use (SSH multiplexes all channels over one
-TCP stream, so a single connection is limited by its flow-control window).  Two
-connections is a reasonable default; raise it if the link is fast and latency is
-high.
-
-### `nexus-transfers copy-to-s3` / `copy-from-s3`
-
-| Flag               | Default                | Description                                         |
-|--------------------|------------------------|-----------------------------------------------------|
-| `--source`         | (required)             | Local path (`copy-to-s3`) or `s3://bucket/key-or-prefix` (`copy-from-s3`) |
-| `--target`         | (required)             | `s3://bucket[/prefix]` (`copy-to-s3`) or local path (`copy-from-s3`) |
-| `--broker-url`     | (none — monitoring disabled) | Relay URL for monitoring only (optional)      |
-| `--name`           | auto-generated         | Client name on the relay                            |
-| `--site`           | (none)                 | Site label for monitor messages                     |
-| `--max-concurrent` | `8`                    | Number of parallel S3 transfers                     |
-| `--size`           | off                    | Show byte-based progress instead of file count      |
-| `--quiet`          | off                    | Suppress console output                             |
-| `--no-verify`      | off                    | Skip TLS verification for the relay connection      |
-| `--debug`          | off                    | Enable debug logging                                |
-
-### `nexus-transfers check-files-s3`
-
-| Flag               | Default                | Description                                         |
-|--------------------|------------------------|-----------------------------------------------------|
-| `--source`         | (required)             | Local reference directory                           |
-| `--target`         | (required)             | S3 copy to verify: `s3://bucket[/prefix]`           |
-| `--hash`           | (none — sizes only)    | Hash algorithm (e.g. `md5`); re-downloads every byte |
-| `--fix`            | off                    | Re-upload corrupt or missing objects                |
-| `--delete-extra`   | off                    | Delete objects not in the local reference           |
-| `--max-concurrent` | `8`                    | Maximum parallel file checks                        |
-| `--broker-url`     | (none — monitoring disabled) | Relay URL for monitoring only (optional)      |
-| `--name`           | auto-generated         | Client name on the relay                            |
-| `--site`           | (none)                 | Site label for monitor messages                     |
-| `--no-verify`      | off                    | Skip TLS verification for the relay connection      |
-| `--debug`          | off                    | Enable debug logging                                |
+Put a TLS-terminating proxy in front and give clients a `wss://` URL when
+using Basic Auth.

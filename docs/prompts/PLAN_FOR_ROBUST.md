@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** partly implemented — temp names are now predictable (`<name>.<8hex>.tmp`, removable by `check-files --delete-extra`); executor timeouts, peer back-off and startup orphan cleanup remain, tracked in [../ROADMAP.md](../ROADMAP.md). `client.py` is now the `client/` package.
+
 # Robustness Plan — Remaining Items
 
 ---

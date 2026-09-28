@@ -17,7 +17,7 @@ Prerequisites
 
 The directory copy at the end uses ``use_s3=False`` so no S3 bucket is
 needed; drop that argument to stage the transfer through S3 (requires
-``NEXUS_TRANSFER_S3_BUCKET`` on client "a").
+``NEXUS_TRANSFERS_S3_BUCKET`` on client "a").
 """
 
 import asyncio

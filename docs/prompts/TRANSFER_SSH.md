@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented as `nexus-transfers copy-ssh` (plus `--processes`, `--stat-concurrency`, `--cipher`, `--steal`, atomic temp-file uploads). Reference: [README](../../README.md), [docs/BACKENDS.md](../BACKENDS.md). Names in this prompt (`nexus-copy-to-ssh`, `--server-url`, `nexus-client`) are historical.
+
 # nexus-copy-to-ssh
 
 Direct local-to-SSH file transfer with relay-based monitoring.

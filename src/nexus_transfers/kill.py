@@ -26,7 +26,7 @@ job in its retry loop) is invisible and survives. ``--sweep SECS`` repeats
 the list-and-kill pass every ``--every`` seconds for the whole window, so
 such a worker is caught the moment it re-registers::
 
-    nexus-transfers kill '*-<task-id>' --sweep 30 --every 2
+    nexus-transfers kill 'nexus-location-*' --sweep 30 --every 2
 """
 
 import argparse
@@ -36,7 +36,8 @@ import logging
 import sys
 import uuid
 
-from nexus_transfers.client import Client
+from nexus_transfers.client import _DEFAULT_URL, Client
+from nexus_transfers.config import broker_url_default
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ async def _kill_pass(client, name, targets, reason, mode, grace,
 
 
 async def _run(pattern, reason, include_monitors, dry_run, mode, grace,
-               sweep=0.0, every=2.0):
+               sweep=0.0, every=2.0, broker_url=None, ssl_verify=True):
     """Connect, resolve targets, and kill them. Return the exit code.
 
     With ``sweep > 0`` the list-and-kill pass repeats every ``every`` seconds
@@ -126,7 +127,7 @@ async def _run(pattern, reason, include_monitors, dry_run, mode, grace,
     state at the end of the sweep: 0 when no matching client is left.
     """
     name = f"killer-{uuid.uuid4().hex[:6]}"
-    async with Client(name) as client:
+    async with Client(name, broker_url, ssl_verify=ssl_verify) as client:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + sweep
         matched_any = False
@@ -209,6 +210,15 @@ def main() -> None:
              "--sweep).",
     )
     parser.add_argument(
+        "--broker-url",
+        default=broker_url_default("kill"),
+        help=f"Broker WebSocket URL (default: {_DEFAULT_URL})",
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip TLS certificate verification when dialling the broker.",
+    )
+    parser.add_argument(
         "--reason", default="killed via nexus-transfers kill",
         help="Reason string logged by the target before it exits.",
     )
@@ -242,6 +252,7 @@ def main() -> None:
     rc = asyncio.run(_run(
         pattern, args.reason, args.include_monitors, args.dry_run,
         mode, args.grace, sweep=args.sweep, every=args.every,
+        broker_url=args.broker_url, ssl_verify=not args.no_verify,
     ))
     sys.exit(rc)
 

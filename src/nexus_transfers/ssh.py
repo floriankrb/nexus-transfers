@@ -6,6 +6,7 @@ import os
 import shlex
 import stat
 import uuid
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 import asyncssh
@@ -48,6 +49,49 @@ def _ssh_config_files(path: str = "~/.ssh/config") -> list[str]:
                 pattern = os.path.expanduser(pattern)
                 files.extend(sorted(_glob.glob(pattern)))
     return [f for f in files if os.path.isfile(f)]
+
+
+def parse_ssh_target(target: str) -> tuple[str | None, str, str]:
+    """Parse ``[user@]host:/path`` into ``(user, host, remote_path)``.
+
+    Parameters
+    ----------
+    target : str
+        Target specification in the form ``[user@]host:/path``.
+
+    Raises
+    ------
+    ValueError
+        If *target* does not contain a colon separator.
+    """
+    if ":" not in target:
+        raise ValueError(
+            f"Invalid target {target!r}: expected [user@]host:/path"
+        )
+    host_part, remote_path = target.split(":", 1)
+    if "@" in host_part:
+        user, host = host_part.split("@", 1)
+    else:
+        user, host = None, host_part
+    return user, host, remote_path
+
+
+@dataclass
+class SSHConfig:
+    """How to reach an SSH host: the settings of an :class:`SSHPool`, as one
+    picklable value (passed to ``copy-ssh`` worker processes)."""
+
+    host: str
+    user: str | None = None
+    port: int = 22
+    key_path: str | None = None
+    connections: int = 2
+    encryption_algs: list[str] | None = None
+
+    def pool(self) -> "SSHPool":
+        """A new (unconnected) pool to the host."""
+        return SSHPool(self.host, self.port, self.user, self.key_path,
+                       self.connections, self.encryption_algs)
 
 
 class SSHPool:
@@ -281,3 +325,64 @@ async def walk_remote(sftp, remote_path: str) -> list[tuple[str, int]]:
 
     await _walk(remote_path.rstrip("/"), "")
     return files
+
+
+async def read_file(sftp, remote_path: str, local_path: str) -> None:
+    """Download *remote_path* to *local_path* via SFTP.
+
+    Written to ``<name>.<8hex>.tmp`` next to *local_path* and renamed into
+    place, so an interrupted download never leaves a partial file under the
+    final name (the same pattern :func:`write_file` uses remotely).
+
+    Parameters
+    ----------
+    sftp :
+        asyncssh SFTP client.
+    remote_path : str
+        Remote source file path (POSIX).
+    local_path : str
+        Local destination file path.
+    """
+    directory = os.path.dirname(local_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    name = os.path.basename(local_path)
+    tmp_path = os.path.join(directory, f"{name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        await sftp.get(remote_path, tmp_path)
+        # Like every other download: 0644 regardless of the umask.
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, local_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+async def walk_remote_tree(sftp, remote_path: str) -> tuple[list[tuple[str, int]], list[str]]:
+    """Everything under the remote directory *remote_path*, for a delete.
+
+    Returns ``(entries, dirs)``: ``entries`` are the absolute paths and sizes
+    of every non-directory (regular files, symlinks — never followed — and
+    anything else), ``dirs`` the sub-directories deepest first, so removing
+    ``entries`` then ``dirs`` in order empties the tree.  *remote_path*
+    itself is not included.
+    """
+    entries: list[tuple[str, int]] = []
+    dirs: list[str] = []
+
+    async def _walk(path: str) -> None:
+        for entry in await sftp.readdir(path):
+            if entry.filename in (".", ".."):
+                continue
+            child = f"{path}/{entry.filename}"
+            mode = entry.attrs.permissions or 0
+            if stat.S_ISDIR(mode):
+                await _walk(child)
+                dirs.append(child)
+            else:
+                entries.append((child, entry.attrs.size or 0))
+
+    await _walk(remote_path.rstrip("/"))
+    return entries, dirs

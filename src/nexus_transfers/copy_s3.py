@@ -5,40 +5,29 @@ Usage::
     nexus-transfers copy-to-s3 --source /data/dataset.zarr --target s3://bucket/datasets/dataset.zarr
     nexus-transfers copy-from-s3 --source s3://bucket/datasets/dataset.zarr --target /data/dataset.zarr
 
-Credentials and endpoint come from the ``NEXUS_TRANSFER_S3_*`` environment
+Credentials and endpoint come from the ``NEXUS_TRANSFERS_S3_*`` environment
 variables (or the config file); the ``s3://bucket/...`` argument overrides
 only the bucket name. Already-present files with a matching size are
 skipped, so an interrupted copy can be resumed by re-running the command.
 """
 
-import argparse
 import asyncio
 import logging
 import os
 import sys
-import threading
 import uuid
 from pathlib import PurePosixPath
 from typing import Callable
 
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
-
 from nexus_transfers import s3
 from nexus_transfers._progress import (
-    _BinarySpeedColumn,
-    _CountOrBytesColumn,
-    _fmt_binary,
+    CopyStats,
+    make_console,
+    make_progress,
     setup_cli_logging,
 )
-from nexus_transfers.client import Client
-from nexus_transfers.config import cli_default
+from nexus_transfers._run import Monitor, run_workers, ticking
+from nexus_transfers._cli import CommandParser
 
 _logger = logging.getLogger(__name__)
 
@@ -181,31 +170,33 @@ async def _copy_s3(
     direction: str,
     source: str,
     target: str,
-    broker_url: str | None,
-    name: str,
-    site: str | None,
-    max_concurrent: int,
-    track_bytes: bool,
-    ssl_verify: bool,
+    *,
+    broker_url: str | None = None,
+    name: str | None = None,
+    site: str | None = None,
+    max_concurrent: int = 8,
+    track_bytes: bool = False,
+    ssl_verify: bool = True,
     on_monitor: Callable | None = None,
     quiet: bool = False,
     steal: bool = False,
     stat_concurrency: int = DEFAULT_STAT_CONCURRENCY,
 ) -> None:
-    """Copy between the local disk and S3 (shared body of both commands).
+    """Copy between the local disk and S3: the body of :func:`copy_to_s3`
+    and :func:`copy_from_s3`.
 
     Parameters
     ----------
     direction : str
         ``"up"`` (local -> S3) or ``"down"`` (S3 -> local).
     source : str
-        Local path (up) or ``s3://`` URL (down).
+        Local file or directory (up) or ``s3://bucket/key-or-prefix`` (down).
     target : str
-        ``s3://`` URL (up) or local path (down).
+        ``s3://bucket[/prefix]`` (up) or local file or directory (down).
     broker_url : str or None
         Relay WebSocket URL for monitoring only; ``None`` disables monitoring.
-    name : str
-        Client name on the relay.
+    name : str or None
+        Client name on the relay (default: ``<site or s3-copy>-<8hex>``).
     site : str or None
         Site label for monitor messages.
     max_concurrent : int
@@ -222,433 +213,145 @@ async def _copy_s3(
     steal : bool
         If True, kill any client already registered under ``name`` (soft kill,
         then hard kill) and take over the name before connecting.  A no-op
-        without ``broker_url``.  Key ``name`` on the unit of work for a
-        per-task interlock.
+        without ``broker_url``.  Key ``name`` on the unit of work
+        (``nexus-location-<location_uuid>``) for a per-transfer interlock.
     stat_concurrency : int
         Depth of the resume scan: the maximum number of concurrent target
         existence/size checks (S3 ``HEAD`` for uploads, local ``stat`` for
         downloads). Runs far deeper than ``max_concurrent`` so latency-bound
         checks overlap with the bandwidth-bound transfers.
     """
-    console = Console(quiet=quiet)
+    name = name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}"
+    console = make_console(quiet=quiet)
     loop = asyncio.get_running_loop()
 
     if direction == "up":
         source = os.path.expanduser(source)
         label = os.path.basename(source.rstrip("/")) or source
-        dest_label = target
+        bucket = s3.parse_s3_url(target)[0]
     else:
         target = os.path.expanduser(target)
-        label = PurePosixPath(s3.parse_s3_url(source)[1] or "bucket").name
-        dest_label = target
-    if not quiet:
-        console.print(
-            f"Copying [yellow]{source}[/yellow] -> [yellow]{target}[/yellow]"
-        )
+        bucket, key = s3.parse_s3_url(source)
+        label = PurePosixPath(key).name if key else bucket
+    console.print(
+        f"Copying [yellow]{source}[/yellow] -> [yellow]{target}[/yellow]"
+    )
 
-    if steal:
-        from nexus_transfers.claim import claim_name
+    def _needs_transfer(item: _Item) -> bool:
+        """Resume check against the target (runs in an executor thread).
 
-        await claim_name(
-            name, broker_url, ssl_verify=ssl_verify, kill_existing=True,
-        )
-
-    monitor_client: Client | None = None
-    if broker_url:
+        For uploads this ``HEAD``s the destination object; for downloads it
+        ``stat``s the local file. A size mismatch (or a missing target)
+        means the file must be transferred.
+        """
+        local_path, key, size = item
+        if direction == "up":
+            return s3.head_object(bucket, key) != size
         try:
-            # Monitoring is best-effort: keep retrying forever so a dropped
-            # relay connection silently reconnects instead of permanently
-            # losing live progress for the rest of the copy.
-            monitor_client = Client(
-                name, broker_url, dispatch={},
-                ssl_verify=ssl_verify, reconnect_retries=-1,
-            )
-            await monitor_client.connect()
-        except Exception as exc:
-            _logger.warning(
-                "Relay unavailable (%s), continuing without monitor", exc,
-            )
-            monitor_client = None
+            return os.path.getsize(local_path) != size
+        except OSError:
+            return True
 
-    async def _emit(message, status=None, **kw):
-        if monitor_client is not None:
-            try:
-                await monitor_client.monitor(message, status=status, **kw)
-            except Exception as exc:
-                _logger.warning("Failed to send monitor event: %s", exc)
-        if on_monitor is not None:
-            try:
-                await on_monitor(message, status=status, **kw)
-            except Exception as exc:
-                _logger.warning("on_monitor callback failed: %s", exc)
+    def _transfer(item: _Item) -> None:
+        """Move one file (runs in an executor thread).
 
-    await _emit(
-        f"{name}: starting copy {source} -> {target}",
-        status="progress",
-    )
+        Uploads put the object straight at its final key (S3 ``PUT`` is
+        atomic). Downloads stream to a ``<name>.<hex>.tmp`` file next to
+        the destination and ``os.replace`` it into place, so a partial
+        download never appears as a complete file.
+        """
+        local_path, key, size = item
+        if direction == "up":
+            s3.upload_file(local_path, s3_key=key, bucket=bucket)
+        else:
+            tmp = s3.download_file(key, target_path=local_path, bucket=bucket)
+            os.replace(tmp, local_path)
 
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        _CountOrBytesColumn(),
-        _BinarySpeedColumn(),
-        TimeRemainingColumn(),
-        transient=True,
-        disable=quiet,
-    )
+    async with await Monitor.connect(
+        name, broker_url, ssl_verify=ssl_verify, steal=steal,
+        on_monitor=on_monitor,
+    ) as monitor:
+        await monitor.emit(
+            f"{name}: starting copy {source} -> {target}", status="progress",
+        )
 
-    start = loop.time()
-    total_bytes = 0
-    done_count = 0
-    skipped = 0
-    skipped_bytes = 0
-    total_size = 0
-    total_items = 0
-    lock = threading.Lock()
+        progress = make_progress(quiet)
+        stats = CopyStats(name, label, progress, track_bytes=track_bytes)
+        progress.start()
 
-    unit = "bytes" if track_bytes else "files"
-    walk_task_id = progress.add_task(
-        f"[magenta]Listing {label}[/magenta]", total=None, unit="files",
-    )
-    copy_task_id = progress.add_task(
-        f"[cyan]Copying {label}[/cyan]", total=None, unit=unit,
-    )
-    progress.start()
-
-    # Resolve the bucket up front (a cheap URL parse, no network/listing) so the
-    # transfer workers can reference it before the streamed listing has produced
-    # any items.
-    bucket = s3.parse_s3_url(target if direction == "up" else source)[0]
-
-    try:
-        def _advance(is_skip: bool, n_bytes: int, n_files: int) -> None:
-            """Update shared counters and the rich bar (thread-safe)."""
-            nonlocal total_bytes, done_count, skipped, skipped_bytes
-            with lock:
-                if is_skip:
-                    skipped += n_files
-                    skipped_bytes += n_bytes
-                else:
-                    total_bytes += n_bytes
-                    done_count += n_files
-                if track_bytes:
-                    progress.advance(copy_task_id, n_bytes)
-                else:
-                    progress.update(copy_task_id, completed=done_count + skipped)
-                if skipped:
-                    progress.update(
-                        copy_task_id,
-                        description=(
-                            f"[cyan]Copying {label}[/cyan] "
-                            f"[dim]({skipped} skipped)[/dim]"
-                        ),
-                    )
-
-        def _payload() -> tuple[float, dict]:
-            with lock:
-                elapsed = loop.time() - start
-                rate = total_bytes / elapsed if elapsed > 0 else 0
-                return rate, {
-                    "label": f"{name}: {done_count} files",
-                    "value": total_bytes + skipped_bytes,
-                    "maximum": total_size or None,
-                    "unit": "byte",
-                    "total_transferred": total_bytes + skipped_bytes,
-                    "files_done": done_count,
-                    "files_skipped": skipped,
-                    "rate": rate,
-                }
-
-        async def _ticker(stop_event: asyncio.Event) -> None:
-            """Emit aggregated progress every 30s until *stop_event* is set."""
-            while True:
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=30)
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                rate, payload = _payload()
-                skip_suffix = (
-                    f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
-                    if skipped else ""
-                )
-                await _emit(
-                    f"{name}: {done_count} files "
-                    f"({_fmt_binary(total_bytes)}, {_fmt_binary(rate)}/s)"
-                    + skip_suffix,
-                    status="progress",
-                    progress=payload,
-                )
-
-        def _needs_transfer(item: _Item) -> bool:
-            """Resume check against the target (runs in an executor thread).
-
-            For uploads this ``HEAD``s the destination object; for downloads it
-            ``stat``s the local file. A size mismatch (or a missing target)
-            means the file must be transferred.
-            """
-            local_path, key, size = item
-            if direction == "up":
-                return s3.head_object(bucket, key) != size
-            try:
-                return os.path.getsize(local_path) != size
-            except OSError:
-                return True
-
-        def _transfer(item: _Item) -> None:
-            """Move one file (runs in an executor thread).
-
-            Uploads put the object straight at its final key (S3 ``PUT`` is
-            atomic). Downloads stream to a ``<name>.<hex>.tmp`` file next to
-            the destination and ``os.replace`` it into place, so a partial
-            download never appears as a complete file.
-            """
-            local_path, key, size = item
-            if direction == "up":
-                s3.upload_file(local_path, s3_key=key, bucket=bucket)
-            else:
-                tmp = s3.download_file(key, target_path=local_path, bucket=bucket)
-                os.replace(tmp, local_path)
-
-        # Two-stage pipeline, mirroring copy_ssh: the producer lists the source
-        # in batches of up to _BATCH_SIZE and feeds a small batch queue; a
-        # classifier explodes each batch and checks the target at
-        # stat_concurrency depth, handing the files that need transfer to a
-        # transfer queue drained by max_concurrent workers.
-        batch_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
-        transfer_queue: asyncio.Queue = asyncio.Queue(maxsize=max_concurrent * 4)
+        # Two-stage pipeline, mirroring copy_ssh: the source is listed in
+        # batches of up to _BATCH_SIZE into a small batch queue; a classifier
+        # checks each batch against the target at stat_concurrency depth and
+        # hands the files that need transfer to max_concurrent workers.
         stat_sem = asyncio.Semaphore(stat_concurrency)
 
-        async def _producer() -> None:
-            """List the source in batches and feed the batch queue."""
-            nonlocal total_size, total_items
-            try:
-                if direction == "up":
-                    batches = _iter_upload_batches(source, target)
-                else:
-                    batches = _iter_download_batches(source, target)
-                async for batch in batches:
-                    for _, _, size in batch:
-                        total_items += 1
-                        total_size += size
-                    progress.update(walk_task_id, advance=len(batch))
-                    progress.update(
-                        copy_task_id,
-                        total=total_size if track_bytes else total_items,
-                    )
-                    await batch_queue.put(batch)
-            finally:
-                progress.remove_task(walk_task_id)
-                # Single sentinel for the single classifier; placed in the
-                # finally so the classifier always terminates, even if the
-                # listing raised (e.g. a missing source).
-                await batch_queue.put(None)
+        async def _batches():
+            if direction == "up":
+                batches = _iter_upload_batches(source, target)
+            else:
+                batches = _iter_download_batches(source, target)
+            async for batch in batches:
+                stats.add_total(len(batch), sum(size for *_, size in batch))
+                progress.update(stats.walk_task, advance=len(batch))
+                yield batch
+            stats.listed()
 
-        async def _classify(item: _Item) -> None:
+        async def _classify(item: _Item, put) -> None:
             async with stat_sem:
                 needs = await loop.run_in_executor(None, _needs_transfer, item)
             if needs:
-                await transfer_queue.put(item)
+                await put(item)
             else:
                 _logger.debug("Skipping %s (size matches)", item[1])
-                _advance(True, item[2], 1)
+                stats.advance(True, item[2])
 
-        async def _classifier() -> None:
-            """Check each listed file against the target, at stat depth."""
-            try:
-                while True:
-                    batch = await batch_queue.get()
-                    if batch is None:
-                        return
-                    await asyncio.gather(*[_classify(it) for it in batch])
-            finally:
-                # Stop the transfer workers once every batch is classified.
-                for _ in range(max_concurrent):
-                    await transfer_queue.put(None)
+        async def _list_and_classify(put) -> None:
+            async def _classify_batch(batch: list[_Item]) -> None:
+                await asyncio.gather(*[_classify(it, put) for it in batch])
 
-        async def _transfer_worker() -> None:
-            while True:
-                item = await transfer_queue.get()
-                if item is None:
-                    return
-                await loop.run_in_executor(None, _transfer, item)
-                _advance(False, item[2], 1)
+            await run_workers(_batches(), _classify_batch, 1, maxsize=2)
 
-        stop_event = asyncio.Event()
-        ticker = asyncio.create_task(_ticker(stop_event))
-        # Immediate heartbeat entering the listing phase so the catalogue is
-        # refreshed before a (potentially long) listing, not only once the
-        # first 30s tick fires.
-        await _emit(
-            f"{name}: listing {label}",
-            status="progress",
-            progress=_payload()[1],
-        )
-        tasks = [
-            asyncio.create_task(_producer()),
-            asyncio.create_task(_classifier()),
-            *[asyncio.create_task(_transfer_worker())
-              for _ in range(max_concurrent)],
-        ]
+        async def _transfer_one(item: _Item) -> None:
+            await loop.run_in_executor(None, _transfer, item)
+            stats.advance(False, item[2])
+
         try:
-            await asyncio.gather(*tasks)
-        except BaseException:
-            # On any failure (e.g. a missing source surfaced by the producer)
-            # cancel the rest of the pipeline and let it settle before
-            # re-raising, so no task is left pending.
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+            async with ticking(30, lambda: stats.heartbeat(monitor)):
+                # Immediate heartbeat entering the listing phase so the
+                # catalogue is refreshed before a (potentially long) listing,
+                # not only once the first 30s tick fires.
+                await monitor.emit(
+                    f"{name}: listing {label}", status="progress",
+                    progress=stats.payload(),
+                )
+                await run_workers(
+                    _list_and_classify, _transfer_one, max_concurrent,
+                    maxsize=max_concurrent * 4,
+                )
         finally:
-            stop_event.set()
-            await ticker
-    finally:
-        progress.stop()
+            progress.stop()
 
-    if skipped:
-        _logger.info(
-            "Skipped %d already-complete file(s) (%s)",
-            skipped, _fmt_binary(skipped_bytes),
-        )
-        if not quiet:
-            console.print(
-                f"Skipped [bold]{skipped}[/bold] already-complete file(s) "
-                f"([bold]{_fmt_binary(skipped_bytes)}[/bold])"
-            )
-
-    elapsed = loop.time() - start
-    rate = total_bytes / elapsed if elapsed > 0 else 0
-    skip_suffix = (
-        f" [{skipped} skipped, {_fmt_binary(skipped_bytes)}]"
-        if skipped else ""
-    )
-    summary = (
-        f"Transferred {_fmt_binary(total_bytes)} "
-        f"in {elapsed:.1f}s ({_fmt_binary(rate)}/s)" + skip_suffix
-    )
-    if not quiet:
-        console.print(
-            f"Transferred [bold]{_fmt_binary(total_bytes)}[/bold] "
-            f"in [bold]{elapsed:.1f}s[/bold] "
-            f"([bold]{_fmt_binary(rate)}/s[/bold])"
-        )
-
-    await _emit(
-        f"{name}: {summary}",
-        status="ok",
-        progress=_payload()[1],
-    )
-
-    if monitor_client:
-        await monitor_client.close()
+        await stats.finish(monitor, console)
 
 
-async def copy_to_s3(
-    source: str,
-    target: str,
-    *,
-    broker_url: str | None = None,
-    name: str | None = None,
-    site: str | None = None,
-    max_concurrent: int = 8,
-    track_bytes: bool = False,
-    ssl_verify: bool = True,
-    on_monitor: Callable | None = None,
-    quiet: bool = False,
-    steal: bool = False,
-    stat_concurrency: int = DEFAULT_STAT_CONCURRENCY,
-) -> None:
-    """Copy the local *source* file or directory to the S3 *target*.
+async def copy_to_s3(source: str, target: str, **kwargs) -> None:
+    """Copy the local *source* file or directory to the S3 *target*
+    ``s3://bucket[/prefix]``, resumably (objects already there with the same
+    size are skipped).
 
-    Parameters
-    ----------
-    source : str
-        Local file or directory to copy.
-    target : str
-        Destination ``s3://bucket[/prefix]`` URL.
-    broker_url : str or None
-        Relay WebSocket URL for monitoring only; ``None`` disables monitoring.
-    name : str or None
-        Client name on the relay (auto-generated when None).
-    site : str or None
-        Site label for monitor messages.
-    max_concurrent : int
-        Number of parallel S3 uploads.
-    track_bytes : bool
-        Show byte-based progress instead of file count.
-    ssl_verify : bool
-        Verify TLS certificate for the relay connection.
-    on_monitor : callable, optional
-        Async callback invoked for every monitor event.
-    quiet : bool
-        If True, suppress rich console output (monitor events still fire).
-    steal : bool
-        If True, kill any client already registered under ``name`` and take
-        over the name before connecting (requires ``broker_url``).
-    stat_concurrency : int
-        Depth of the resume scan (concurrent destination ``HEAD`` checks).
+    Keyword arguments: those of :func:`_copy_s3`.
     """
-    await _copy_s3(
-        "up", source, target, broker_url,
-        name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}", site,
-        max_concurrent, track_bytes, ssl_verify, on_monitor, quiet, steal,
-        stat_concurrency,
-    )
+    await _copy_s3("up", source, target, **kwargs)
 
 
-async def copy_from_s3(
-    source: str,
-    target: str,
-    *,
-    broker_url: str | None = None,
-    name: str | None = None,
-    site: str | None = None,
-    max_concurrent: int = 8,
-    track_bytes: bool = False,
-    ssl_verify: bool = True,
-    on_monitor: Callable | None = None,
-    quiet: bool = False,
-    steal: bool = False,
-    stat_concurrency: int = DEFAULT_STAT_CONCURRENCY,
-) -> None:
-    """Copy the S3 *source* object or prefix to the local *target*.
+async def copy_from_s3(source: str, target: str, **kwargs) -> None:
+    """Copy the S3 *source* object or prefix ``s3://bucket/key-or-prefix`` to
+    the local *target* file or directory, resumably (local files already
+    there with the same size are skipped).
 
-    Parameters
-    ----------
-    source : str
-        Source ``s3://bucket/key-or-prefix`` URL.
-    target : str
-        Local destination file or directory.
-    broker_url : str or None
-        Relay WebSocket URL for monitoring only; ``None`` disables monitoring.
-    name : str or None
-        Client name on the relay (auto-generated when None).
-    site : str or None
-        Site label for monitor messages.
-    max_concurrent : int
-        Number of parallel S3 downloads.
-    track_bytes : bool
-        Show byte-based progress instead of file count.
-    ssl_verify : bool
-        Verify TLS certificate for the relay connection.
-    on_monitor : callable, optional
-        Async callback invoked for every monitor event.
-    quiet : bool
-        If True, suppress rich console output (monitor events still fire).
-    steal : bool
-        If True, kill any client already registered under ``name`` and take
-        over the name before connecting (requires ``broker_url``).
-    stat_concurrency : int
-        Depth of the resume scan (concurrent local ``stat`` checks).
+    Keyword arguments: those of :func:`_copy_s3`.
     """
-    await _copy_s3(
-        "down", source, target, broker_url,
-        name or f"{site or 's3-copy'}-{uuid.uuid4().hex[:8]}", site,
-        max_concurrent, track_bytes, ssl_verify, on_monitor, quiet, steal,
-        stat_concurrency,
-    )
+    await _copy_s3("down", source, target, **kwargs)
 
 
 def _main(direction: str) -> None:
@@ -662,66 +365,29 @@ def _main(direction: str) -> None:
         source_help = "Source: s3://bucket/key-or-prefix"
         target_help = "Local destination file or directory"
 
-    parser = argparse.ArgumentParser(description=description)
+    parser = CommandParser("copy_s3", description=description)
     parser.add_argument("--source", required=True, help=source_help)
     parser.add_argument("--target", required=True, help=target_help)
-    parser.add_argument(
-        "--broker-url",
-        default=cli_default("broker_url", "copy_s3", default=None),
-        help="Relay WebSocket URL for monitoring (default: none — monitoring disabled)",
-    )
-    parser.add_argument(
-        "--name", default=cli_default("name", "copy_s3", default=None),
-        help="Client name on the relay (default: auto-generated)",
-    )
-    parser.add_argument(
-        "--site", default=cli_default("site", "copy_s3", default=None),
-        help="Site label for monitor messages",
-    )
-    parser.add_argument(
-        "--max-concurrent", type=int,
-        default=cli_default("max_concurrent", "copy_s3", default=8, type_fn=int),
-        help="Number of parallel S3 transfers (default: 8)",
-    )
-    parser.add_argument(
-        "--stat-concurrency", type=int,
-        default=cli_default(
-            "stat_concurrency", "copy_s3",
-            default=DEFAULT_STAT_CONCURRENCY, type_fn=int,
-        ),
-        help=(
-            "Max concurrent target existence/size checks during the resume "
-            f"scan (default: {DEFAULT_STAT_CONCURRENCY})"
-        ),
-    )
-    parser.add_argument(
-        "--size", action="store_true",
-        default=cli_default("size", "copy_s3", default=False),
-        help="Show byte-based progress instead of file count",
-    )
-    parser.add_argument(
-        "--quiet", action="store_true",
-        default=cli_default("quiet", "copy_s3", default=False),
-        help="Suppress console output (monitor events still fire)",
-    )
-    parser.add_argument(
-        "--no-verify", action="store_true",
-        default=cli_default("no_verify", "copy_s3", default=False),
-        help="Skip TLS verification for the relay connection",
-    )
-    parser.add_argument(
+    parser.monitor_options()
+    parser.option("--max-concurrent", type=int, default=8,
+                  help="Number of parallel S3 transfers (default: 8)")
+    parser.option("--stat-concurrency", type=int,
+                  default=DEFAULT_STAT_CONCURRENCY,
+                  help="Max concurrent target existence/size checks during "
+                       f"the resume scan (default: {DEFAULT_STAT_CONCURRENCY})")
+    parser.option("--size", action="store_true",
+                  help="Show byte-based progress instead of file count")
+    parser.option("--quiet", action="store_true",
+                  help="Suppress console output (monitor events still fire)")
+    parser.option(
         "--steal", action="store_true",
-        default=cli_default("steal", "copy_s3", default=False),
         help="If a client is already registered under --name, kill it (soft "
              "kill first, then hard kill if it does not exit) and take over "
-             "the name. With a task-keyed name this guarantees only one S3 "
-             "copy for the same task runs at a time. Requires --broker-url.",
+             "the name. With a name keyed on the transfer (e.g. "
+             "nexus-location-<location_uuid>) this guarantees only one S3 "
+             "copy of it runs at a time. Requires --broker-url.",
     )
-    parser.add_argument(
-        "--debug", action="store_true",
-        default=cli_default("debug", "copy_s3", default=False),
-        help="Enable debug logging",
-    )
+    parser.debug_option()
     args = parser.parse_args()
 
     setup_cli_logging(debug=args.debug)

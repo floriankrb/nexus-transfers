@@ -1,3 +1,5 @@
+> **Status (2026-09-28):** implemented — config moved to `~/.config/nexus-transfers/settings.toml` (legacy `~/.nexus-transfers.toml` still read, with a warning); sections are per subcommand. Reference: [README § Configuration](../../README.md#configuration). Names in this prompt (`NEXT_TRANSFER_`, `nexus-copy`, `[server]`) are historical.
+
 Read an optional ~/.nexus-transfers.toml
 
 Look at the code, and for all environment variables start starts with NEXT_TRANSFER_  create an equivalent entry in the config (in lowercase,
